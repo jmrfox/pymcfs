@@ -1,0 +1,3 @@
+[submodule "third_party/starlab-mcfskel"]
+	path = third_party/starlab-mcfskel
+	url = https://github.com/taiya/starlab-mcfskel
