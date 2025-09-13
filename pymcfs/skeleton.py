@@ -10,6 +10,7 @@ import networkx as nx
 import numpy as np
 from scipy.spatial import cKDTree
 import trimesh as tm
+import plotly.graph_objects as go
 
 from .mcf import mean_curvature_flow, MCFResult
 from .medial import compute_voronoi_poles
@@ -86,6 +87,127 @@ class Skeleton:
                 pid = parent_of.get(n, None)
                 p_swc = -1 if pid is None else swc_id[pid]
                 f.write(f"{swc_id[n]} {int(node_type)} {x:.6f} {y:.6f} {z:.6f} {float(default_radius):.6f} {p_swc}\n")
+
+
+    def plot_3d(
+        self,
+        mesh: tm.Trimesh | tuple[np.ndarray, np.ndarray] | None = None,
+        *,
+        show_nodes: bool = False,
+        node_size: float = 4.0,
+        node_color: str = "#d62728",
+        edge_color: str = "#1f77b4",
+        edge_width: float = 4.0,
+        mesh_color: str = "#AAAAAA",
+        mesh_opacity: float = 0.3,
+        title: str | None = None,
+        autoshow: bool = True,
+    ) -> "go.Figure":
+        """Interactive 3D visualization of the skeleton with optional mesh overlay.
+
+        Parameters
+        ----------
+        mesh : trimesh.Trimesh or (V,F) or None
+            If provided, overlays the original mesh using Plotly Mesh3d. You can pass
+            either a trimesh.Trimesh instance or a tuple (vertices, faces).
+        show_nodes : bool
+            If True, also draw node markers in addition to skeleton edges.
+        node_size : float
+            Marker size for nodes when show_nodes=True.
+        node_color : str
+            Color for node markers.
+        edge_color : str
+            Color for skeleton edges.
+        edge_width : float
+            Line width for skeleton edges.
+        mesh_color : str
+            Color for mesh surface.
+        mesh_opacity : float
+            Opacity for mesh surface in [0,1].
+        title : str or None
+            Figure title.
+        autoshow : bool
+            If True, call fig.show() before returning (useful in notebooks).
+
+        Returns
+        -------
+        plotly.graph_objects.Figure
+            The created Plotly figure.
+        """
+        traces: list[go.BaseTraceType] = []
+
+        # Optional mesh overlay
+        if mesh is not None:
+            if isinstance(mesh, tm.Trimesh):
+                V = np.asarray(mesh.vertices, dtype=float)
+                F = np.asarray(mesh.faces, dtype=int)
+            else:
+                try:
+                    V, F = mesh  # type: ignore[misc]
+                    V = np.asarray(V, dtype=float)
+                    F = np.asarray(F, dtype=int)
+                except Exception:
+                    raise TypeError("mesh must be a trimesh.Trimesh or a (V,F) tuple")
+            if V.size > 0 and F.size > 0:
+                mesh_trace = go.Mesh3d(
+                    x=V[:, 0], y=V[:, 1], z=V[:, 2],
+                    i=F[:, 0], j=F[:, 1], k=F[:, 2],
+                    color=mesh_color,
+                    opacity=float(np.clip(mesh_opacity, 0.0, 1.0)),
+                    name="mesh",
+                    flatshading=True,
+                    lighting=dict(ambient=0.6, diffuse=0.7, roughness=0.9),
+                    showscale=False,
+                )
+                traces.append(mesh_trace)
+
+        # Skeleton edges as line segments
+        P = np.asarray(self.nodes, dtype=float)
+        E = np.asarray(self.edges, dtype=int)
+        if P.size > 0 and E.size > 0:
+            xs: list[float | None] = []
+            ys: list[float | None] = []
+            zs: list[float | None] = []
+            for (a, b) in E:
+                pa = P[int(a)]
+                pb = P[int(b)]
+                xs.extend([float(pa[0]), float(pb[0]), None])
+                ys.extend([float(pa[1]), float(pb[1]), None])
+                zs.extend([float(pa[2]), float(pb[2]), None])
+            edge_trace = go.Scatter3d(
+                x=xs, y=ys, z=zs,
+                mode="lines",
+                line=dict(color=edge_color, width=float(edge_width)),
+                name="skeleton",
+            )
+            traces.append(edge_trace)
+
+        # Optional node markers
+        if show_nodes and P.size > 0:
+            node_trace = go.Scatter3d(
+                x=P[:, 0], y=P[:, 1], z=P[:, 2],
+                mode="markers",
+                marker=dict(size=float(node_size), color=node_color),
+                name="nodes",
+            )
+            traces.append(node_trace)
+
+        fig = go.Figure(data=traces)
+        fig.update_layout(
+            title=title or "Skeleton 3D",
+            scene=dict(
+                xaxis=dict(visible=True),
+                yaxis=dict(visible=True),
+                zaxis=dict(visible=True),
+                aspectmode="data",
+            ),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            margin=dict(l=0, r=0, t=40, b=0),
+        )
+
+        if autoshow:
+            fig.show()
+        return fig
 
 
 

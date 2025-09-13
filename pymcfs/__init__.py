@@ -10,7 +10,7 @@ Public API:
 from .laplacian import cotangent_laplacian, lumped_mass_matrix
 from .mcf import mean_curvature_flow
 from .skeleton import skeletonize, thin_mesh, curve_skeleton_from_mesh
-from .mesh import MeshManager
+from .mesh import MeshManager, example_mesh
 
 __all__ = [
     "cotangent_laplacian",
@@ -20,4 +20,5 @@ __all__ = [
     "thin_mesh",
     "curve_skeleton_from_mesh",
     "MeshManager",
+    "example_mesh",
 ]

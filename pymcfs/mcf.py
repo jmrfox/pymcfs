@@ -26,6 +26,7 @@ def mean_curvature_flow(
     dt: float = 1e-2,
     iterations: int = 20,
     laplacian_type: str = "cotangent",
+    laplacian_secure: bool = False,
     guidance_type: str | None = None,
     guidance_weight: float = 0.0,
     guidance_targets: np.ndarray | None = None,
@@ -56,8 +57,12 @@ def mean_curvature_flow(
         Number of implicit steps to perform.
     laplacian_type : {"cotangent", "mean_value"}, default "cotangent"
         Discrete Laplacian variant to use.
-    guidance_type : {None, "centroid"}, optional
+    laplacian_secure : bool, default False
+        When using the cotangent Laplacian, if True clamp negative cotangent
+        weights to zero for extra robustness (mirrors the reference C++ behavior).
+    guidance_type : {None, "centroid", "original"}, optional
         Convenience option to set targets T uniformly to the centroid when "centroid".
+        When "original", targets T are set to the input mesh vertices (pull-to-original).
         Ignored if ``guidance_targets`` is provided.
     guidance_weight : float, default 0.0
         Scalar guidance strength. Used only if ``guidance_targets`` is provided with
@@ -89,6 +94,7 @@ def mean_curvature_flow(
 
     V = mesh.vertices.view(np.ndarray).astype(np.float64, copy=True)
     F = mesh.faces.view(np.ndarray).astype(np.int64, copy=False)
+    V0 = V.copy()  # keep a copy of the input vertices for guidance_type="original"
 
     _log = log or logger
     if verbose:
@@ -96,7 +102,7 @@ def mean_curvature_flow(
 
     # Precompute operators
     if laplacian_type == "cotangent":
-        L = cotangent_laplacian(V, F, verbose=verbose)
+        L = cotangent_laplacian(V, F, verbose=verbose, secure=laplacian_secure)
     elif laplacian_type == "mean_value":
         L = mean_value_laplacian(V, F, verbose=verbose)
     else:
@@ -128,6 +134,8 @@ def mean_curvature_flow(
         if guidance_type == "centroid":
             centroid = V.mean(axis=0)
             T = np.tile(centroid.reshape(1, 3), (V.shape[0], 1))
+        elif guidance_type == "original":
+            T = V0
         else:
             raise ValueError(f"Unknown guidance_type: {guidance_type}")
         W = sp.identity(V.shape[0], dtype=float, format="csr") * float(guidance_weight)

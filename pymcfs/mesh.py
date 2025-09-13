@@ -17,41 +17,80 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
-def _pymeshfix_worker(
-    queue,
-    v: np.ndarray,
-    f: np.ndarray,
-    join_components: bool,
-    remove_small_components: bool,
-    verbose: bool,
-):
-    """Worker to run PyMeshFix in a separate process and return vertices/faces.
 
-    This isolates potential native crashes from bringing down the parent process.
+def example_mesh(
+    kind: str = "cylinder",
+    *,
+    # Cylinder params
+    radius: float = 0.5,
+    height: float = 2.0,
+    sections: int | None = 64,
+    # Torus params
+    major_radius: float = 1.0,
+    minor_radius: float = 0.3,
+    major_sections: int | None = 64,
+    minor_sections: int | None = 32,
+    # Common
+    transform: np.ndarray | None = None,
+    **kwargs,
+) -> trimesh.Trimesh:
+    """Create a simple demo mesh using trimesh primitives.
+
+    Parameters
+    ----------
+    kind : {"cylinder", "torus"}
+        Type of primitive to generate. Default "cylinder".
+    radius : float
+        Cylinder radius (when kind="cylinder"). Default 0.5.
+    height : float
+        Cylinder height (when kind="cylinder"). Default 2.0.
+    sections : int or None
+        Cylinder radial resolution (pie wedges). Default 64.
+    major_radius : float
+        Torus major radius (center of hole to centerline of tube). Default 1.0.
+    minor_radius : float
+        Torus minor radius (tube radius). Default 0.3.
+    major_sections : int or None
+        Torus resolution around major circle. Default 64.
+    minor_sections : int or None
+        Torus resolution around tube section. Default 32.
+    transform : (4,4) float array, optional
+        Transform applied after creation.
+    **kwargs : dict
+        Passed through to Trimesh constructor via trimesh.creation.* helpers
+        (e.g., process=False).
+
+    Returns
+    -------
+    trimesh.Trimesh
+        Generated primitive mesh.
+
+    Examples
+    --------
+    >>> m = example_mesh("cylinder", radius=0.4, height=1.5)
+    >>> t = example_mesh("torus", major_radius=1.0, minor_radius=0.25)
     """
-    try:
-        from pymeshfix import MeshFix  # type: ignore
-
-        mf = MeshFix(v, f)
-        try:
-            mf.repair(
-                verbose=verbose,
-                joincomp=bool(join_components),
-                remove_small_components=bool(remove_small_components),
-            )
-        except TypeError:
-            # Older signature without keywords
-            mf.repair()
-
-        v2 = np.asarray(getattr(mf, "v", None), dtype=np.float64)
-        f2 = np.asarray(getattr(mf, "f", None), dtype=np.int64)
-        if v2.size == 0 or f2.size == 0:
-            queue.put(("err", "PyMeshFix returned an empty mesh"))
-            return
-
-        queue.put(("ok", v2, f2))
-    except BaseException as e:  # Catch everything, including SystemExit
-        queue.put(("err", repr(e), traceback.format_exc()))
+    k = (kind or "cylinder").lower()
+    if k == "cylinder":
+        return trimesh.creation.cylinder(
+            radius=float(radius),
+            height=float(height),
+            sections=None if sections is None else int(sections),
+            transform=transform,
+            **kwargs,
+        )
+    elif k == "torus":
+        # trimesh.creation.torus parameters
+        return trimesh.creation.torus(
+            major_radius=float(major_radius),
+            minor_radius=float(minor_radius),
+            major_sections=None if major_sections is None else int(major_sections),
+            minor_sections=None if minor_sections is None else int(minor_sections),
+            transform=transform,
+            **kwargs,
+        )
+    else:
+        raise ValueError("example_mesh kind must be 'cylinder' or 'torus'")
 
 
 class MeshManager:
@@ -943,134 +982,6 @@ class MeshManager:
         self.mesh = mesh
         return mesh
 
-    def repair_mesh_pymeshfix(
-        self,
-        join_components: bool = True,
-        remove_small_components: bool = False,
-        keep_largest_component: bool = True,
-        min_component_faces: int = 30,
-        verbose: bool = True,
-        safe: bool = False,
-        timeout: float = 120.0,
-    ) -> trimesh.Trimesh:
-        """Repair current mesh using PyMeshFix.
-
-        Args:
-            join_components: Merge nearby components during repair.
-            remove_small_components: Remove very small components (PyMeshFix behavior).
-            keep_largest_component: After repair, keep only the largest connected component.
-            min_component_faces: Minimum faces to consider a component when filtering.
-            verbose: Whether to print concise summary (unused here but kept for API symmetry).
-            safe: Run PyMeshFix in a separate process to avoid hard interpreter exits.
-            timeout: Seconds to wait for PyMeshFix before aborting.
-
-        Returns:
-            Repaired mesh (also assigned to `self.mesh`).
-        """
-        if self.mesh is None:
-            raise ValueError("No mesh loaded")
-
-        try:
-            from pymeshfix import MeshFix  # type: ignore
-        except Exception as e:
-            raise ImportError(
-                "pymeshfix is required for repair_mesh_pymeshfix; install with `uv pip install pymeshfix`."
-            ) from e
-
-        m = self.mesh
-        v = np.asarray(m.vertices, dtype=np.float64)
-        f = np.asarray(m.faces, dtype=np.int64)
-
-        # Run PyMeshFix either inline (unsafe) or in a separate process (safe)
-        if safe:
-            ctx = multiprocessing.get_context("spawn")
-            queue: multiprocessing.queues.Queue = ctx.Queue()
-            proc = ctx.Process(
-                target=_pymeshfix_worker,
-                args=(
-                    queue,
-                    v,
-                    f,
-                    bool(join_components),
-                    bool(remove_small_components),
-                    bool(verbose),
-                ),
-            )
-            proc.start()
-            proc.join(timeout)
-
-            if proc.is_alive():
-                # Timed out
-                proc.terminate()
-                proc.join()
-                raise RuntimeError(f"PyMeshFix timed out after {timeout} seconds")
-
-            # Retrieve results from queue
-            if not queue.empty():
-                msg = queue.get()
-            else:
-                # Likely a hard crash in the child
-                raise RuntimeError(
-                    f"PyMeshFix crashed (exit code {proc.exitcode}) with no result"
-                )
-
-            if not msg or msg[0] != "ok":
-                # msg could be ("err", error_str, traceback)
-                detail = (
-                    msg[1]
-                    if isinstance(msg, tuple) and len(msg) > 1
-                    else "unknown error"
-                )
-                raise RuntimeError(f"PyMeshFix failed: {detail}")
-
-            _, v2, f2 = msg
-        else:
-            mf = MeshFix(v, f)
-            try:
-                mf.repair(
-                    verbose=verbose,
-                    joincomp=bool(join_components),
-                    remove_small_components=bool(remove_small_components),
-                )
-            except TypeError:
-                # Older signature without keywords
-                mf.repair()
-
-            v2 = np.asarray(getattr(mf, "v", None), dtype=np.float64)
-            f2 = np.asarray(getattr(mf, "f", None), dtype=np.int64)
-            if v2.size == 0 or f2.size == 0:
-                raise ValueError("PyMeshFix returned an empty mesh")
-
-        repaired = trimesh.Trimesh(vertices=v2, faces=f2, process=True)
-        # Post-process: fix normals, validate
-        try:
-            if not repaired.is_winding_consistent:
-                repaired.fix_normals()
-            repaired.process(validate=True)
-        except Exception:
-            pass
-
-        # Optionally keep largest component
-        if keep_largest_component:
-            try:
-                comps = repaired.split(only_watertight=False)
-                if len(comps) > 1:
-
-                    def comp_key(c: trimesh.Trimesh):
-                        vol = abs(float(getattr(c, "volume", 0.0)))
-                        return (vol, len(c.faces))
-
-                    comps_filtered = [
-                        c for c in comps if len(c.faces) >= int(min_component_faces)
-                    ]
-                    use = comps_filtered if comps_filtered else comps
-                    repaired = max(use, key=comp_key)
-                    repaired.process(validate=True)
-            except Exception:
-                pass
-
-        self.mesh = repaired
-        return repaired
 
     def visualize_mesh_3d(
         self,
@@ -1586,90 +1497,3 @@ class MeshManager:
 
         return fig
 
-    def slice_mesh_by_z(
-        self,
-        z: float,
-        cap: bool = True,
-        validate: bool = True,
-    ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh]]:
-        """
-        Slice the current mesh with the horizontal plane z = value and return
-        two new meshes partitioned along that plane.
-
-        This creates new vertices where the plane intersects the original mesh
-        and (optionally) caps the cut so both results are closed.
-
-        Args:
-            z: Z-value of the slicing plane (plane origin [0, 0, z], normal [0, 0, 1]).
-            cap: If True, seal the open cut by adding faces.
-            validate: If True, run trimesh processing/validation on the results.
-
-        Returns:
-            (below_mesh, above_mesh):
-                below_mesh contains the portion with vertices at z <= value.
-                above_mesh contains the portion with vertices at z >= value.
-                Either may be None if the plane lies completely outside the mesh.
-        """
-        if self.mesh is None:
-            raise ValueError("No mesh loaded")
-
-        plane_origin = np.array([0.0, 0.0, float(z)])
-        plane_normal = np.array([0.0, 0.0, 1.0])
-
-        below_mesh: Optional[trimesh.Trimesh]
-        above_mesh: Optional[trimesh.Trimesh]
-
-        # Positive side (normal pointing +Z) yields z >= z_plane -> above
-        try:
-            above_mesh = trimesh.intersections.slice_mesh_plane(
-                self.mesh, plane_normal=plane_normal, plane_origin=plane_origin, cap=cap
-            )
-        except Exception:
-            above_mesh = None
-
-        # Reverse normal yields z <= z_plane -> below
-        try:
-            below_mesh = trimesh.intersections.slice_mesh_plane(
-                self.mesh,
-                plane_normal=-plane_normal,
-                plane_origin=plane_origin,
-                cap=cap,
-            )
-        except Exception:
-            below_mesh = None
-
-        # Normalize empty results to None
-        if isinstance(above_mesh, trimesh.Trimesh) and (
-            len(above_mesh.faces) == 0 or len(above_mesh.vertices) == 0
-        ):
-            above_mesh = None
-        if isinstance(below_mesh, trimesh.Trimesh) and (
-            len(below_mesh.faces) == 0 or len(below_mesh.vertices) == 0
-        ):
-            below_mesh = None
-
-        # Optionally validate/process
-        if validate:
-            if isinstance(above_mesh, trimesh.Trimesh):
-                try:
-                    above_mesh.process(validate=True)
-                except Exception:
-                    pass
-            if isinstance(below_mesh, trimesh.Trimesh):
-                try:
-                    below_mesh.process(validate=True)
-                except Exception:
-                    pass
-
-        # Attach metadata
-        if isinstance(above_mesh, trimesh.Trimesh):
-            if not hasattr(above_mesh, "metadata") or above_mesh.metadata is None:
-                above_mesh.metadata = {}
-            above_mesh.metadata.update({"sliced_by_z": float(z), "side": "above"})
-
-        if isinstance(below_mesh, trimesh.Trimesh):
-            if not hasattr(below_mesh, "metadata") or below_mesh.metadata is None:
-                below_mesh.metadata = {}
-            below_mesh.metadata.update({"sliced_by_z": float(z), "side": "below"})
-
-        return below_mesh, above_mesh

@@ -54,7 +54,7 @@ def _angles_from_edges(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> tuple[np.
     return alpha, beta, gamma
 
 
-def cotangent_laplacian(V: np.ndarray, F: np.ndarray, *, verbose: bool = False) -> sp.csr_matrix:
+def cotangent_laplacian(V: np.ndarray, F: np.ndarray, *, verbose: bool = False, secure: bool = False) -> sp.csr_matrix:
     """Build symmetric cotangent Laplacian L for a triangle mesh.
 
     L(i,i) = -sum_{j!=i} L(i,j)
@@ -64,6 +64,12 @@ def cotangent_laplacian(V: np.ndarray, F: np.ndarray, *, verbose: bool = False) 
     ----------
     V : (n,3) float array
     F : (m,3) int array (triangles)
+    verbose : bool, default False
+        If True, log basic progress information.
+    secure : bool, default False
+        If True, clamp negative cotangent weights to zero for extra robustness
+        on meshes with obtuse triangles or near-degenerate configurations,
+        mirroring the behavior of the reference C++ implementation.
 
     Returns
     -------
@@ -74,6 +80,12 @@ def cotangent_laplacian(V: np.ndarray, F: np.ndarray, *, verbose: bool = False) 
         logger.info("Building cotangent Laplacian for %d vertices, %d faces", n, F.shape[0])
     a, b, c = _edge_lengths(V, F)
     cot_a, cot_b, cot_c = _cot_angles_from_edges(a, b, c)
+
+    # Optional robustness: force non-negative cotangents
+    if secure:
+        cot_a = np.maximum(cot_a, 0.0)
+        cot_b = np.maximum(cot_b, 0.0)
+        cot_c = np.maximum(cot_c, 0.0)
 
     I = []
     J = []
