@@ -1,0 +1,39 @@
+---
+description: Thoughtful logging verbosity for pymcfs modules
+globs: "pymcfs/**/*.py"
+alwaysApply: false
+---
+
+# Logging
+
+Use the standard library `logging` package so callers can control verbosity without print spam.
+
+## Module setup
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+```
+
+## Levels
+
+- `debug` — dense internals (matrix nnz, bounds, per-iteration dumps)
+- `info` — high-level progress (start/finish of major steps, summaries)
+- `warning` — recoverable issues (quality problems, skipped collapses)
+- `error` — failures that block the operation
+
+Prefer lazy `%s`-style formatting: `logger.info("Built L: nnz=%d", L.nnz)`.
+
+## Public APIs
+
+- Optional `log: logging.Logger | None = None`; default to the module logger.
+- Optional `verbose: bool = False` may bump useful progress to `info` for interactive use; do not replace proper level usage.
+- Library code must not configure the root logger or force handlers; leave that to scripts/notebooks.
+
+```python
+_log = log or logger
+_log.info("MCF: %d iterations, dt=%g", iterations, dt)
+_log.debug("System shape: %s", A.shape)
+```

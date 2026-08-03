@@ -1,0 +1,33 @@
+---
+description: pymcfs project purpose, layout, and package design
+alwaysApply: true
+---
+
+# pymcfs Project Context
+
+`pymcfs` is a Python package for mean-curvature flow (MCF) skeletonization of 3D surface meshes. Users import and call it from scripts and notebooks; there is no CLI.
+
+## Layout
+
+- `pymcfs/` — package source
+- `tests/` — pytest suite
+- `notebooks/` — Jupyter notebooks (Jupytext)
+- `data/` — input meshes and datasets
+- `scripts/` — demos and one-off scripts
+- `third_party/` — reference / vendored material (not active package code)
+
+## Design stance
+
+- Prefer a clean importable API over ad-hoc scripts.
+- No legacy compatibility burden: change APIs when that improves the library.
+- Algorithmic context lives in `ABOUT.md`; keep implementation aligned with that design.
+
+## Tooling
+
+- Package manager: **uv**. Run Python via `uv run …` (e.g. `uv run pytest`, `uv run python scripts/demo_mcfs.py`).
+- Tests: **pytest** (`uv run pytest`).
+- Notebooks: **Jupytext** under `notebooks/`.
+
+## Terminal commands
+
+When running a command in the agent terminal, wait for *that* command’s output to finish before interpreting results. Do not treat prior terminal output as the result of a newly issued command.

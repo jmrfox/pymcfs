@@ -1,0 +1,13 @@
+---
+description: Jupytext notebook conventions
+globs: "notebooks/**"
+alwaysApply: false
+---
+
+# Notebooks
+
+- All notebooks live in `notebooks/`.
+- Use **Jupytext** so notebooks stay reviewable and syncable as paired text (prefer percent `.py` or markdown pair formats when adding new notebooks).
+- Notebooks demonstrate and explore the package API; put reusable logic in `pymcfs/`, not only in notebook cells.
+- Run notebook-related commands through uv when needed (e.g. `uv run jupytext …`).
+- Keep data paths under `data/` and write outputs under `outputs/` (or another explicit output location), not scattered in the repo root.

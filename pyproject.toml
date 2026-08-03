@@ -21,6 +21,11 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[dependency-groups]
+dev = [
+    "jupytext>=1.19.5",
+]
+
 [project.optional-dependencies]
 test = [
   "pytest>=8.3.0",

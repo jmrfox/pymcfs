@@ -1,0 +1,14 @@
+---
+description: pytest conventions for pymcfs
+globs: "tests/**/*.py"
+alwaysApply: false
+---
+
+# Testing
+
+- Keep tests in `tests/`; run with `uv run pytest` (optionally a path or `-k` filter).
+- Test behavior of public functions and important helpers: shapes, invariants, and intended numerical/geometric outcomes.
+- When a test fails, fix the *implementation* (or a genuinely wrong assertion). Never weaken a test just to make it pass.
+- Prefer focused unit tests per module (`test_laplacian.py`, `test_mcf.py`, …) over one giant integration file.
+- Use small synthetic meshes (`example_mesh`, simple fixtures) when full assets are unnecessary.
+- Assert properties that matter (symmetry, zero row-sum, watertightness after repair, skeleton connectivity), not incidental formatting.

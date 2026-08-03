@@ -1,0 +1,44 @@
+---
+description: Simple, modular, expert Python for pymcfs
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python Quality
+
+Write simple, modular, expertly crafted Python. Prefer clarity over cleverness.
+
+## Structure
+
+- One clear responsibility per module/function; extract helpers when a function does several jobs.
+- Keep the public API small and stable at the package root (`pymcfs/__init__.py`); put internals in focused modules.
+- Prefer explicit parameters and typed signatures (`from __future__ import annotations`) over implicit globals.
+- Use dataclasses or small result types for multi-value returns when that aids readability.
+- Favor NumPy/SciPy sparse arrays and `trimesh` conventions already used in the package.
+
+## Style
+
+- Short functions with descriptive names; avoid deep nesting.
+- Docstrings on public functions: purpose, key parameters, shapes/units, and return values.
+- Validate inputs early with clear `ValueError`s (e.g. expected `(n, 3)` shapes).
+- No dead code, speculative abstractions, or “just in case” options.
+- Match existing module patterns before inventing new ones.
+
+## Example
+
+```python
+# ❌ BAD — mixed concerns, silent failure
+def process(mesh):
+    try:
+        L = build_L(mesh)
+        return solve(L, mesh.vertices)
+    except Exception:
+        return mesh.vertices
+
+# ✅ GOOD — focused, explicit, documented
+def contract_vertices(mesh: tm.Trimesh, *, dt: float, iterations: int) -> np.ndarray:
+    """Return contracted vertex positions after ``iterations`` MCF steps."""
+    if mesh.vertices.shape[1] != 3:
+        raise ValueError("mesh.vertices must have shape (n, 3)")
+    ...
+```
