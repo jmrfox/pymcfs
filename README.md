@@ -1,0 +1,1 @@
+My attempt at mean-curvature flow skeletonization of 3D surface meshes in Python.

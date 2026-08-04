@@ -297,68 +297,63 @@ def _map_targets_to_points(points: np.ndarray, base_points: np.ndarray, base_tar
 def skeletonize(
     mesh: Union[tm.Trimesh, object],
     *,
-    mcf_dt: float = 2e-2,
-    mcf_iters: int = 50,
-    laplacian_type: str = "cotangent",
+    max_iterations: int | None = None,
+    mcf_iters: int | None = None,
+    omega_L: float = 1.0,
+    omega_H: float = 0.1,
+    omega_P: float = 0.2,
+    is_medially_centered: bool | None = None,
     guidance_type: str | None = None,
-    guidance_weight: float = 0.0,
-    build_graph: str = "mesh",
-    knn: int = 12,
-    length_quantile: float = 0.7,
-    collapse_passes: int = 3,
-    collapse_percentile: float = 0.3,
-    preserve_branch_degree: int = 3,
-    collapse_mode: str = "percentile",
-    collapse_ratio: float = 0.1,
-    collapse_domain: str = "graph",
-    compress_chains: bool = False,
-    medial_protect: bool = False,
-    medial_protect_threshold: float = 0.5,
+    guidance_weight: float | None = None,
+    min_edge_length: float | None = None,
+    max_triangle_angle: float = 110.0,
+    area_variation_factor: float = 1e-4,
+    compress_chains: bool = True,
     resample_spacing: float | None = None,
-    graph_collapse_mode: str = "percentile",
-    graph_collapse_ratio: float = 0.1,
-    closest_pole_policy: bool = False,
-    closest_pole_tol: float = 1.05,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
+    # Deprecated kwargs accepted for call-site compatibility (ignored)
+    mcf_dt: float | None = None,
+    laplacian_type: str | None = None,
+    build_graph: str | None = None,
+    knn: int | None = None,
+    length_quantile: float | None = None,
+    collapse_passes: int | None = None,
+    collapse_percentile: float | None = None,
+    preserve_branch_degree: int | None = None,
+    collapse_mode: str | None = None,
+    collapse_ratio: float | None = None,
+    collapse_domain: str | None = None,
+    medial_protect: bool | None = None,
+    medial_protect_threshold: float | None = None,
+    graph_collapse_mode: str | None = None,
+    graph_collapse_ratio: float | None = None,
+    closest_pole_policy: bool | None = None,
+    closest_pole_tol: float | None = None,
 ) -> Skeleton:
-    """Skelcollapse-inspired skeletonization.
+    """Mean-curvature-flow skeletonization (CGAL / Tagliasacchi MCFS).
 
-    Pipeline (graph-space analogue of Skelcollapse):
-    1) Contract the surface by implicit mean curvature flow (MCF).
-    2) Use contracted vertices as candidates, optionally voxel-downsample.
-    3) Build a kNN graph in Euclidean space on candidate nodes.
-    4) Priority edge-collapse: iteratively merge shortest edges while preserving
-       junctions (avoid collapsing high-degree nodes). Update node positions to
-       midpoints. Repeat for several passes with adaptive thresholds.
-    5) Prune short leaf stubs by length quantile; allow cycles to remain.
-    6) Optionally compress degree-2 chains into single edges between junctions.
-
-    Returns a `Skeleton` with node array, edge index array, and the NetworkX graph.
+    Runs the CGAL-style loop: contract geometry, collapse short edges, split
+    obtuse faces, detect degeneracies; then convert the meso-skeleton to a
+    curve graph.
 
     Parameters
     ----------
-    mcf_dt, mcf_iters : control MCF contraction speed and iterations.
-    laplacian_type : "cotangent" | "mean_value".
-    guidance_type : optional soft guidance for MCF (e.g., "centroid").
-    guidance_weight : nonnegative weight for guidance term.
-    knn : neighbors for initial graph; later passes may rebuild with ~knn//2.
-    length_quantile : pruning threshold for leaf stubs.
-    collapse_passes : number of simplification passes.
-    collapse_percentile : edges below this length percentile are candidates for collapse (when collapse_mode="percentile").
-    collapse_mode : "percentile" (default) or "pq" (priority-order without percentile cutoff).
-    collapse_ratio : when collapse_mode="pq", collapse up to this fraction of shortest edges per pass (0..1).
-    preserve_branch_degree : skip collapsing edges incident to nodes with degree >= this value.
-    collapse_domain : "graph" (default) to run graph-space collapse, or "mesh_only" to skip graph collapse and operate only on the mesh-derived graph (closer to Skelcollapse).
-    medial_protect : if True and guidance_type=="voronoi", reduce collapses near medial targets based on pole weights.
-    medial_protect_threshold : [0..1], edges with both endpoints above this per-vertex weight are less likely to collapse.
-    graph_collapse_mode : "percentile" (default) or "pq"; controls graph-space collapse selection.
-    graph_collapse_ratio : when graph_collapse_mode="pq", collapse up to this fraction per pass.
-    closest_pole_policy : if True and guidance_type=="voronoi", prefer collapses that move nodes closer to their pole targets (skip merges that move away by too much).
-    closest_pole_tol : tolerance factor (>1) allowing small increases when evaluating distance to pole targets (1.05 means up to 5% increase allowed).
+    max_iterations, mcf_iters :
+        Maximum contraction iterations (``mcf_iters`` is an alias).
+    omega_L, omega_H, omega_P :
+        Contraction, attraction, and medial (pole) weights.
+    is_medially_centered :
+        If True, use Voronoi-pole guidance. Defaults True when
+        ``guidance_type=="voronoi"`` or when unset.
+    min_edge_length :
+        Short-edge remesh threshold; default ``0.002 * bbox_diagonal``.
+    compress_chains :
+        Compress degree-2 chains on the final 1D graph.
+    resample_spacing :
+        Optional uniform resampling spacing along curve edges.
     """
     _log = log or logger
-    # Accept either a Trimesh or a MeshManager
     if isinstance(mesh, tm.Trimesh):
         m = mesh
     else:
@@ -371,199 +366,73 @@ def skeletonize(
         else:
             raise TypeError("mesh must be a trimesh.Trimesh or MeshManager")
 
-    # 1) Contract with MCF
-    if verbose:
-        _log.info("Skeleton: MCF contraction (dt=%.3g, iters=%d)", mcf_dt, mcf_iters)
-    # Optional Voronoi medial guidance
-    g_targets = None
-    g_diag = None
-    g_type = guidance_type
-    g_weight = guidance_weight
-    pole_targets = None
-    if guidance_type == "voronoi" and guidance_weight > 0.0:
-        if verbose:
-            _log.info("Skeleton: computing Voronoi-pole medial targets")
-        targets, weights = compute_voronoi_poles(m)
-        # Scale weights by guidance_weight; they are already normalized to [0,1]
-        g_targets = targets
-        g_diag = weights * float(guidance_weight)
-        g_type = None  # disable centroid guidance path
-        pole_targets = targets
+    iters = max_iterations if max_iterations is not None else (mcf_iters if mcf_iters is not None else 50)
+    if is_medially_centered is None:
+        if guidance_type == "voronoi":
+            medial = True
+        elif guidance_type is None and (guidance_weight is None or guidance_weight > 0):
+            medial = True
+        else:
+            medial = False
+    else:
+        medial = bool(is_medially_centered)
 
-    mcf_res: MCFResult = mean_curvature_flow(
+    wP = float(omega_P)
+    if guidance_type == "voronoi" and guidance_weight is not None:
+        wP = float(guidance_weight) if guidance_weight > 0 else wP
+
+    from .mcfs import MeanCurvatureFlowSkeletonization
+
+    driver = MeanCurvatureFlowSkeletonization(
         m,
-        dt=mcf_dt,
-        iterations=mcf_iters,
-        laplacian_type=laplacian_type,
-        guidance_type=g_type,
-        guidance_weight=g_weight,
-        guidance_targets=g_targets,
-        guidance_diag=g_diag,
-        record_history=False,
+        omega_L=float(omega_L),
+        omega_H=float(omega_H),
+        omega_P=wP,
+        is_medially_centered=medial,
+        min_edge_length=min_edge_length,
+        max_triangle_angle=float(max_triangle_angle),
+        area_variation_factor=float(area_variation_factor),
+        max_iterations=int(iters),
         verbose=verbose,
         log=_log,
     )
-    X = mcf_res.vertices
-
-    # 2) Build initial graph
-    build_graph = (build_graph or "mesh").lower()
-    if build_graph not in ("mesh", "knn"):
-        raise ValueError("build_graph must be 'mesh' or 'knn'")
-
-    if build_graph == "mesh":
-        # Use all contracted vertices; build graph from mesh faces
-        # Optionally compute medial protection weights from Voronoi guidance
-        protect_w = None
-        protect_thr = None
-        if medial_protect and guidance_type == "voronoi":
-            try:
-                _, weights = compute_voronoi_poles(m)
-                protect_w = weights  # already in [0,1]
-                protect_thr = float(np.clip(medial_protect_threshold, 0.0, 1.0))
-            except Exception:
-                protect_w = None
-                protect_thr = None
-
-        V_thin, F_thin = _mesh_edge_collapse_thinning(
-            X,
-            np.asarray(m.faces, dtype=int),
-            passes=max(1, collapse_passes // 2),
-            length_percentile=collapse_percentile,
-            preserve_branch_degree=preserve_branch_degree,
-            mode=collapse_mode,
-            ratio=collapse_ratio,
-            protect_weights=protect_w,
-            protect_threshold=protect_thr,
-            protect_targets=pole_targets if closest_pole_policy else None,
-            closest_pole_policy=closest_pole_policy,
-            closest_pole_tol=closest_pole_tol,
-            _log=_log if verbose else None,
-        )
-        nodes = V_thin
-        G = _mesh_edge_graph(nodes, F_thin)
-        if verbose:
-            _log.info("Skeleton: mesh-edge graph built (nodes=%d, edges=%d)", G.number_of_nodes(), G.number_of_edges())
-    else:
-        # knn: downsample and build kNN graph
-        vox = _auto_voxel_size(m)
-        nodes = _voxel_downsample(X, voxel_size=vox)
-        if verbose:
-            _log.info("Skeleton: node candidates after voxel downsample: %d (voxel=%.3g)", nodes.shape[0], vox)
-        G = _knn_graph(nodes, k=max(3, knn))
-        if verbose:
-            _log.info("Skeleton: initial kNN graph built (k=%d, nodes=%d, edges=%d)", knn, G.number_of_nodes(), G.number_of_edges())
-
-    # 4) Optional priority edge-collapse in graph space
-    if (collapse_domain or "graph").lower() == "graph":
-        # If medial protection requested with Voronoi guidance, map weights to current nodes
-        node_protect_w = None
-        node_targets = None
-        if medial_protect and guidance_type == "voronoi":
-            try:
-                if protect_w is None:
-                    # compute from original mesh if not computed yet
-                    _, pw = compute_voronoi_poles(m)
-                else:
-                    pw = protect_w
-                pts = np.array([G.nodes[i]["pos"] for i in G.nodes])
-                node_protect_w = _map_weights_to_points(pts, np.asarray(m.vertices), pw)
-                protect_thr_val = float(np.clip(medial_protect_threshold, 0.0, 1.0))
-            except Exception:
-                node_protect_w = None
-                protect_thr_val = None
-        else:
-            protect_thr_val = None
-
-        # If closest-pole policy requested, map pole targets as well
-        if closest_pole_policy and guidance_type == "voronoi":
-            try:
-                if pole_targets is None:
-                    pt, _ = compute_voronoi_poles(m)
-                else:
-                    pt = pole_targets
-                pts = np.array([G.nodes[i]["pos"] for i in G.nodes])
-                node_targets = _map_targets_to_points(pts, np.asarray(m.vertices), np.asarray(pt))
-            except Exception:
-                node_targets = None
-
-        # Multiple passes with decreasing thresholds to progressively simplify
-        for p in range(max(1, collapse_passes)):
-            _graph_priority_edge_collapse(
-                G,
-                preserve_branch_degree=preserve_branch_degree,
-                length_percentile=collapse_percentile,
-                mode=graph_collapse_mode,
-                ratio=graph_collapse_ratio,
-                protect_weights=node_protect_w,
-                protect_threshold=protect_thr_val,
-                targets=node_targets,
-                closest_pole_policy=closest_pole_policy,
-                closest_pole_tol=closest_pole_tol,
-                verbose=verbose,
-                _log=_log,
-            )
-            # Reconnect with a fresh kNN to ensure local connectivity post merges
-            pts = np.array([G.nodes[i]["pos"] for i in G.nodes])
-            # Reindex nodes from 0..N-1 for stability
-            mapping = {n: idx for idx, n in enumerate(G.nodes)}
-            G = nx.relabel_nodes(G, mapping, copy=True)
-            for n, pos in enumerate(pts):
-                G.nodes[n]["pos"] = pos
-            # Rebuild edges based on geometry (helps prevent long cross-links)
-            # Use kNN rebuild for both modes to maintain connectivity after merges
-            G = _rebuild_knn_graph_from_existing_nodes(G, k=max(3, knn // 2))
-            if verbose:
-                _log.info("Skeleton: after collapse pass %d, nodes=%d, edges=%d", p + 1, G.number_of_nodes(), G.number_of_edges())
-
-    # 5) Prune leaves by length quantile
-    _prune_short_leaves(G, quantile=length_quantile)
     if verbose:
-        _log.info("Skeleton: after pruning (q=%.2f), edges=%d", length_quantile, G.number_of_edges())
-
-    # 6) Optionally compress degree-2 chains
-    if compress_chains:
-        G = _compress_degree_two_chains(G)
-        if verbose:
-            _log.info("Skeleton: after chain compression, nodes=%d, edges=%d", G.number_of_nodes(), G.number_of_edges())
-
-    # 7) Optional resampling of edges to approx. uniform spacing
-    if resample_spacing is not None and resample_spacing > 0:
-        G = _resample_edges_uniform(G, float(resample_spacing))
-        if verbose:
-            _log.info("Skeleton: after resample (h=%.3g), nodes=%d, edges=%d", resample_spacing, G.number_of_nodes(), G.number_of_edges())
-
-    # Pack arrays
-    node_index = {n: i for i, n in enumerate(G.nodes)}
-    nodes_arr = np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
-    edges_arr = np.array([[node_index[u], node_index[v]] for u, v in G.edges], dtype=int)
-
-    return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)
+        _log.info("Skeleton: CGAL-style MCFS (max_iters=%d, medial=%s)", iters, medial)
+    driver.contract_until_convergence()
+    return driver.convert_to_skeleton(
+        compress_chains=bool(compress_chains),
+        resample_spacing=resample_spacing,
+    )
 
 
 def thin_mesh(
     mesh: Union[tm.Trimesh, object],
     *,
-    mcf_dt: float = 2e-2,
-    mcf_iters: int = 50,
-    laplacian_type: str = "cotangent",
+    max_iterations: int | None = None,
+    mcf_iters: int | None = None,
+    omega_L: float = 1.0,
+    omega_H: float = 0.1,
+    omega_P: float = 0.2,
+    is_medially_centered: bool | None = None,
     guidance_type: str | None = None,
-    guidance_weight: float = 0.0,
-    collapse_passes: int = 2,
-    collapse_percentile: float = 0.3,
-    preserve_branch_degree: int = 3,
-    collapse_mode: str = "percentile",
-    collapse_ratio: float = 0.1,
-    medial_protect: bool = False,
-    medial_protect_threshold: float = 0.5,
+    guidance_weight: float | None = None,
+    min_edge_length: float | None = None,
+    max_triangle_angle: float = 110.0,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
+    # Deprecated / ignored
+    mcf_dt: float | None = None,
+    laplacian_type: str | None = None,
+    collapse_passes: int | None = None,
+    collapse_percentile: float | None = None,
+    preserve_branch_degree: int | None = None,
+    collapse_mode: str | None = None,
+    collapse_ratio: float | None = None,
+    medial_protect: bool | None = None,
+    medial_protect_threshold: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Contract the mesh via MCF and perform surface-based thinning by edge collapses.
-
-    Returns (V_thin, F_thin) for use in downstream skeletonization or analysis.
-    """
+    """Contract a mesh with MCFS remeshing and return the meso-skeleton ``(V, F)``."""
     _log = log or logger
-    # Normalize mesh input
     if isinstance(mesh, tm.Trimesh):
         m = mesh
     else:
@@ -576,57 +445,32 @@ def thin_mesh(
         else:
             raise TypeError("mesh must be a trimesh.Trimesh or MeshManager")
 
-    # Optional Voronoi medial guidance
-    g_targets = None
-    g_diag = None
-    g_type = guidance_type
-    g_weight = guidance_weight
-    protect_w = None
-    protect_thr = None
-    if guidance_type == "voronoi" and guidance_weight > 0.0:
-        if verbose:
-            _log.info("ThinMesh: computing Voronoi medial targets")
-        targets, weights = compute_voronoi_poles(m)
-        g_targets = targets
-        g_diag = weights * float(guidance_weight)
-        g_type = None
-        if medial_protect:
-            protect_w = weights
-            protect_thr = float(np.clip(medial_protect_threshold, 0.0, 1.0))
+    iters = max_iterations if max_iterations is not None else (mcf_iters if mcf_iters is not None else 30)
+    if is_medially_centered is None:
+        medial = guidance_type == "voronoi" or guidance_type is None
+    else:
+        medial = bool(is_medially_centered)
+    wP = float(omega_P)
+    if guidance_type == "voronoi" and guidance_weight is not None and guidance_weight > 0:
+        wP = float(guidance_weight)
 
-    # MCF contraction
-    if verbose:
-        _log.info("ThinMesh: MCF contraction (dt=%.3g, iters=%d)", mcf_dt, mcf_iters)
-    mcf_res: MCFResult = mean_curvature_flow(
+    from .mcfs import MeanCurvatureFlowSkeletonization
+
+    driver = MeanCurvatureFlowSkeletonization(
         m,
-        dt=mcf_dt,
-        iterations=mcf_iters,
-        laplacian_type=laplacian_type,
-        guidance_type=g_type,
-        guidance_weight=g_weight,
-        guidance_targets=g_targets,
-        guidance_diag=g_diag,
-        record_history=False,
+        omega_L=float(omega_L),
+        omega_H=float(omega_H),
+        omega_P=wP,
+        is_medially_centered=medial,
+        min_edge_length=min_edge_length,
+        max_triangle_angle=float(max_triangle_angle),
+        max_iterations=int(iters),
         verbose=verbose,
         log=_log,
     )
-    X = mcf_res.vertices
+    driver.contract_until_convergence()
+    return driver.V.copy(), driver.F.copy()
 
-    # Mesh-edge collapse thinning
-    V_thin, F_thin = _mesh_edge_collapse_thinning(
-        X,
-        np.asarray(m.faces, dtype=int),
-        passes=max(1, collapse_passes),
-        length_percentile=collapse_percentile,
-        preserve_branch_degree=preserve_branch_degree,
-        mode=collapse_mode,
-        ratio=collapse_ratio,
-        protect_weights=protect_w,
-        protect_threshold=protect_thr,
-        _log=_log if verbose else None,
-    )
-
-    return V_thin, F_thin
 
 def curve_skeleton_from_mesh(
     V: np.ndarray,
@@ -637,29 +481,28 @@ def curve_skeleton_from_mesh(
 ) -> Skeleton:
     """Convert a triangle mesh surface to a curve graph skeleton.
 
-    Steps:
-    1) Build a mesh-edge graph from (V, F).
-    2) Optionally compress degree-2 chains to simplify.
-    3) Optionally resample edges to an approximate uniform spacing.
+    Uses CGAL-style face-bearing edge collapse (no mesh-valence degree gate).
     """
-    if V.size == 0 or F.size == 0:
-        G = nx.Graph()
-        return Skeleton(nodes=np.zeros((0, 3), dtype=float), edges=np.zeros((0, 2), dtype=int), graph=G)
+    from .mcfs import meso_surface_to_curve_graph
 
-    G = _mesh_edge_graph(V, F.astype(int, copy=False))
-
+    G = meso_surface_to_curve_graph(V, F)
     if compress_chains:
         G = _compress_degree_two_chains(G)
-
     if resample_spacing is not None and resample_spacing > 0:
         G = _resample_edges_uniform(G, float(resample_spacing))
-
-    # Pack arrays
     node_index = {n: i for i, n in enumerate(G.nodes)}
-    nodes_arr = np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
-    edges_arr = np.array([[node_index[u], node_index[v]] for u, v in G.edges], dtype=int)
-
+    nodes_arr = (
+        np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
+        if G.number_of_nodes()
+        else np.zeros((0, 3))
+    )
+    edges_arr = (
+        np.array([[node_index[u], node_index[v]] for u, v in G.edges], dtype=int)
+        if G.number_of_edges()
+        else np.zeros((0, 2), dtype=int)
+    )
     return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)
+
 
 def _auto_voxel_size(mesh: tm.Trimesh) -> float:
     # Choose voxel size as a small fraction of bbox diagonal
