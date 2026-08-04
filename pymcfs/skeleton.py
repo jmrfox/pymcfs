@@ -88,6 +88,68 @@ class Skeleton:
                 p_swc = -1 if pid is None else swc_id[pid]
                 f.write(f"{swc_id[n]} {int(node_type)} {x:.6f} {y:.6f} {z:.6f} {float(default_radius):.6f} {p_swc}\n")
 
+    def to_polylines(self) -> list[np.ndarray]:
+        """Split the skeleton into polylines at junctions (degree ≠ 2).
+
+        Returns
+        -------
+        list of (k_i, 3) float arrays
+            Each array is an ordered sequence of 3D points along one maximal path
+            between junctions/leaves (polyline decomposition).
+        """
+        G = self.graph
+        if G.number_of_nodes() == 0:
+            return []
+        for n in G.nodes:
+            if "pos" not in G.nodes[n]:
+                # fall back to nodes array if densely indexed
+                try:
+                    G.nodes[n]["pos"] = np.asarray(self.nodes[int(n)], dtype=float)
+                except Exception:
+                    pass
+
+        deg = dict(G.degree())
+        terminals = {n for n, d in deg.items() if d != 2}
+        if not terminals:
+            # Pure cycle: emit one closed loop starting at an arbitrary node
+            start = next(iter(G.nodes))
+            cycle = nx.find_cycle(G, source=start)
+            pts = [np.asarray(G.nodes[u]["pos"], dtype=float) for u, v in cycle]
+            pts.append(np.asarray(G.nodes[cycle[0][0]]["pos"], dtype=float))
+            return [np.vstack(pts)]
+
+        polylines: list[np.ndarray] = []
+        visited: set[tuple[int, int]] = set()
+
+        def edge_key(a: int, b: int) -> tuple[int, int]:
+            return (a, b) if a < b else (b, a)
+
+        for t in terminals:
+            for nbr in G.neighbors(t):
+                ek = edge_key(t, nbr)
+                if ek in visited:
+                    continue
+                path = [t, nbr]
+                visited.add(ek)
+                prev, curr = t, nbr
+                while deg.get(curr, 0) == 2:
+                    nxts = [x for x in G.neighbors(curr) if x != prev]
+                    if not nxts:
+                        break
+                    nxt = nxts[0]
+                    visited.add(edge_key(curr, nxt))
+                    path.append(nxt)
+                    prev, curr = curr, nxt
+                pts = np.array([G.nodes[n]["pos"] for n in path], dtype=float)
+                polylines.append(pts)
+        return polylines
+
+    def write_polylines(self, filepath: str) -> None:
+        """Write polylines as text: ``N x y z x y z ...`` per line."""
+        with open(filepath, "w", encoding="utf-8") as f:
+            for pl in self.to_polylines():
+                coords = " ".join(f"{float(c):.9g}" for p in pl for c in p)
+                f.write(f"{pl.shape[0]} {coords}\n")
 
     def plot_3d(
         self,
@@ -294,64 +356,33 @@ def _map_targets_to_points(points: np.ndarray, base_points: np.ndarray, base_tar
     return np.asarray(base_targets[idx], dtype=float)
 
 
+
 def skeletonize(
     mesh: Union[tm.Trimesh, object],
     *,
-    max_iterations: int | None = None,
-    mcf_iters: int | None = None,
-    omega_L: float = 1.0,
-    omega_H: float = 0.1,
-    omega_P: float = 0.2,
-    is_medially_centered: bool | None = None,
-    guidance_type: str | None = None,
-    guidance_weight: float | None = None,
+    w_H: float = 0.1,
+    w_M: float = 0.2,
+    quality_speed_tradeoff: float | None = None,
+    medially_centered_speed_tradeoff: float | None = None,
+    max_iterations: int = 500,
+    timeout_seconds: float | None = 120.0,
     min_edge_length: float | None = None,
     max_triangle_angle: float = 110.0,
     area_variation_factor: float = 1e-4,
     compress_chains: bool = True,
     resample_spacing: float | None = None,
+    validate: bool = True,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
-    # Deprecated kwargs accepted for call-site compatibility (ignored)
-    mcf_dt: float | None = None,
-    laplacian_type: str | None = None,
-    build_graph: str | None = None,
-    knn: int | None = None,
-    length_quantile: float | None = None,
-    collapse_passes: int | None = None,
-    collapse_percentile: float | None = None,
-    preserve_branch_degree: int | None = None,
-    collapse_mode: str | None = None,
-    collapse_ratio: float | None = None,
-    collapse_domain: str | None = None,
-    medial_protect: bool | None = None,
-    medial_protect_threshold: float | None = None,
-    graph_collapse_mode: str | None = None,
-    graph_collapse_ratio: float | None = None,
-    closest_pole_policy: bool | None = None,
-    closest_pole_tol: float | None = None,
 ) -> Skeleton:
-    """Mean-curvature-flow skeletonization (CGAL / Tagliasacchi MCFS).
+    """Mean-curvature-flow skeletonization of a closed triangle mesh.
 
-    Runs the CGAL-style loop: contract geometry, collapse short edges, split
-    obtuse faces, detect degeneracies; then convert the meso-skeleton to a
-    curve graph.
+    Primary parameters:
+    - ``w_H`` / ``quality_speed_tradeoff`` (default 0.1)
+    - ``w_M`` / ``medially_centered_speed_tradeoff`` (default 0.2)
 
-    Parameters
-    ----------
-    max_iterations, mcf_iters :
-        Maximum contraction iterations (``mcf_iters`` is an alias).
-    omega_L, omega_H, omega_P :
-        Contraction, attraction, and medial (pole) weights.
-    is_medially_centered :
-        If True, use Voronoi-pole guidance. Defaults True when
-        ``guidance_type=="voronoi"`` or when unset.
-    min_edge_length :
-        Short-edge remesh threshold; default ``0.002 * bbox_diagonal``.
-    compress_chains :
-        Compress degree-2 chains on the final 1D graph.
-    resample_spacing :
-        Optional uniform resampling spacing along curve edges.
+    ``w_L`` is fixed at 1 (only weight ratios matter). Medial centering is used
+    whenever ``w_M > 0``.
     """
     _log = log or logger
     if isinstance(mesh, tm.Trimesh):
@@ -366,38 +397,30 @@ def skeletonize(
         else:
             raise TypeError("mesh must be a trimesh.Trimesh or MeshManager")
 
-    iters = max_iterations if max_iterations is not None else (mcf_iters if mcf_iters is not None else 50)
-    if is_medially_centered is None:
-        if guidance_type == "voronoi":
-            medial = True
-        elif guidance_type is None and (guidance_weight is None or guidance_weight > 0):
-            medial = True
-        else:
-            medial = False
-    else:
-        medial = bool(is_medially_centered)
-
-    wP = float(omega_P)
-    if guidance_type == "voronoi" and guidance_weight is not None:
-        wP = float(guidance_weight) if guidance_weight > 0 else wP
+    wh = float(quality_speed_tradeoff) if quality_speed_tradeoff is not None else float(w_H)
+    wm = (
+        float(medially_centered_speed_tradeoff)
+        if medially_centered_speed_tradeoff is not None
+        else float(w_M)
+    )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
 
     driver = MeanCurvatureFlowSkeletonization(
         m,
-        omega_L=float(omega_L),
-        omega_H=float(omega_H),
-        omega_P=wP,
-        is_medially_centered=medial,
+        w_H=wh,
+        w_M=wm,
         min_edge_length=min_edge_length,
         max_triangle_angle=float(max_triangle_angle),
         area_variation_factor=float(area_variation_factor),
-        max_iterations=int(iters),
+        max_iterations=int(max_iterations),
+        timeout_seconds=timeout_seconds,
+        validate=bool(validate),
         verbose=verbose,
         log=_log,
     )
     if verbose:
-        _log.info("Skeleton: CGAL-style MCFS (max_iters=%d, medial=%s)", iters, medial)
+        _log.info("Skeleton: MCFS (max_iters=%d, w_H=%.3g, w_M=%.3g)", max_iterations, wh, wm)
     driver.contract_until_convergence()
     return driver.convert_to_skeleton(
         compress_chains=bool(compress_chains),
@@ -408,30 +431,17 @@ def skeletonize(
 def thin_mesh(
     mesh: Union[tm.Trimesh, object],
     *,
-    max_iterations: int | None = None,
-    mcf_iters: int | None = None,
-    omega_L: float = 1.0,
-    omega_H: float = 0.1,
-    omega_P: float = 0.2,
-    is_medially_centered: bool | None = None,
-    guidance_type: str | None = None,
-    guidance_weight: float | None = None,
+    w_H: float = 0.1,
+    w_M: float = 0.2,
+    max_iterations: int = 500,
+    timeout_seconds: float | None = 120.0,
     min_edge_length: float | None = None,
     max_triangle_angle: float = 110.0,
+    validate: bool = True,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
-    # Deprecated / ignored
-    mcf_dt: float | None = None,
-    laplacian_type: str | None = None,
-    collapse_passes: int | None = None,
-    collapse_percentile: float | None = None,
-    preserve_branch_degree: int | None = None,
-    collapse_mode: str | None = None,
-    collapse_ratio: float | None = None,
-    medial_protect: bool | None = None,
-    medial_protect_threshold: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Contract a mesh with MCFS remeshing and return the meso-skeleton ``(V, F)``."""
+    """Contract a mesh with MCFS remeshing; return the meso-skeleton ``(V, F)``."""
     _log = log or logger
     if isinstance(mesh, tm.Trimesh):
         m = mesh
@@ -445,26 +455,17 @@ def thin_mesh(
         else:
             raise TypeError("mesh must be a trimesh.Trimesh or MeshManager")
 
-    iters = max_iterations if max_iterations is not None else (mcf_iters if mcf_iters is not None else 30)
-    if is_medially_centered is None:
-        medial = guidance_type == "voronoi" or guidance_type is None
-    else:
-        medial = bool(is_medially_centered)
-    wP = float(omega_P)
-    if guidance_type == "voronoi" and guidance_weight is not None and guidance_weight > 0:
-        wP = float(guidance_weight)
-
     from .mcfs import MeanCurvatureFlowSkeletonization
 
     driver = MeanCurvatureFlowSkeletonization(
         m,
-        omega_L=float(omega_L),
-        omega_H=float(omega_H),
-        omega_P=wP,
-        is_medially_centered=medial,
+        w_H=float(w_H),
+        w_M=float(w_M),
         min_edge_length=min_edge_length,
         max_triangle_angle=float(max_triangle_angle),
-        max_iterations=int(iters),
+        max_iterations=int(max_iterations),
+        timeout_seconds=timeout_seconds,
+        validate=bool(validate),
         verbose=verbose,
         log=_log,
     )
@@ -479,10 +480,7 @@ def curve_skeleton_from_mesh(
     compress_chains: bool = True,
     resample_spacing: float | None = None,
 ) -> Skeleton:
-    """Convert a triangle mesh surface to a curve graph skeleton.
-
-    Uses CGAL-style face-bearing edge collapse (no mesh-valence degree gate).
-    """
+    """Convert a triangle mesh surface to a curve graph skeleton."""
     from .mcfs import meso_surface_to_curve_graph
 
     G = meso_surface_to_curve_graph(V, F)
@@ -490,14 +488,16 @@ def curve_skeleton_from_mesh(
         G = _compress_degree_two_chains(G)
     if resample_spacing is not None and resample_spacing > 0:
         G = _resample_edges_uniform(G, float(resample_spacing))
-    node_index = {n: i for i, n in enumerate(G.nodes)}
+    mapping = {n: i for i, n in enumerate(G.nodes)}
+    if mapping:
+        G = nx.relabel_nodes(G, mapping, copy=True)
     nodes_arr = (
         np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
         if G.number_of_nodes()
         else np.zeros((0, 3))
     )
     edges_arr = (
-        np.array([[node_index[u], node_index[v]] for u, v in G.edges], dtype=int)
+        np.array([[u, v] for u, v in G.edges], dtype=int)
         if G.number_of_edges()
         else np.zeros((0, 2), dtype=int)
     )

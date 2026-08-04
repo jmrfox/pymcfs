@@ -153,7 +153,7 @@ class MeshManager:
     # =================================================================
 
     def load_mesh(
-        self, filepath: str, file_format: Optional[str] = None
+        self, filepath: str, file_format: Optional[str] = None, *, validate_mcfs: bool = True
     ) -> trimesh.Trimesh:
         """
         Load a mesh from file.
@@ -161,9 +161,9 @@ class MeshManager:
         Args:
             filepath: Path to mesh file
             file_format: Optional format specification (auto-detected if None)
-
-        Returns:
-            Loaded trimesh object
+            validate_mcfs: If True (default), require a single-component closed
+                watertight triangle mesh (MCFS input precondition). Set False
+                when loading meshes intended for repair.
         """
         try:
             if file_format:
@@ -182,6 +182,11 @@ class MeshManager:
 
             if not isinstance(mesh, trimesh.Trimesh):
                 raise ValueError(f"Loaded object is not a mesh: {type(mesh)}")
+
+            if validate_mcfs:
+                from .validate import validate_mcfs_mesh
+
+                validate_mcfs_mesh(mesh)
 
             self.mesh = mesh
             self.original_mesh = mesh.copy()

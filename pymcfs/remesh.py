@@ -1,4 +1,4 @@
-"""Local remeshing helpers for MCF skeletonization (CGAL / Starlab TopologyJanitor).
+"""Local remeshing helpers for MCF skeletonization.
 
 Implements short-edge collapse and obtuse-triangle splits on (V, F) triangle meshes.
 """
@@ -71,6 +71,156 @@ def _link_condition_ok(
     return common == thirds and len(thirds) <= 2
 
 
+def face_graph_components(F: np.ndarray) -> int:
+    """Number of connected components in the face 1-skeleton (vertices linked by face edges)."""
+    if F.size == 0:
+        return 0
+    used = np.unique(F.reshape(-1))
+    parent = {int(i): int(i) for i in used}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i0, i1, i2 in F:
+        a, b, c = int(i0), int(i1), int(i2)
+        union(a, b)
+        union(b, c)
+        union(c, a)
+    return len({find(int(i)) for i in used})
+
+
+def faces_after_collapse(F: np.ndarray, keep: int, drop: int) -> np.ndarray:
+    """Faces remaining after identifying ``drop`` with ``keep`` (degenerate faces removed)."""
+    Fm = np.asarray(F, dtype=int).copy()
+    Fm[Fm == drop] = keep
+    alive = (Fm[:, 0] != Fm[:, 1]) & (Fm[:, 1] != Fm[:, 2]) & (Fm[:, 2] != Fm[:, 0])
+    return Fm[alive]
+
+
+def collapse_preserves_face_connectivity(F: np.ndarray, keep: int, drop: int) -> bool:
+    """True if collapsing drop→keep does not increase face-graph component count."""
+    before = face_graph_components(F)
+    after_f = faces_after_collapse(F, keep, drop)
+    after = face_graph_components(after_f)
+    # Allow dissolving toward a curve (0 components) but never fragment.
+    if after_f.shape[0] == 0:
+        return before <= 1
+    return after <= before
+
+
+def is_vertex_degenerate(
+    v: int,
+    V: np.ndarray,
+    F: np.ndarray,
+    *,
+    radius: float,
+    neighbors: list[set[int]] | None = None,
+) -> bool:
+    """Local disk test: neighborhood within ``radius`` is not a topological disk.
+
+    Grows the set of faces whose vertices all lie inside the Euclidean ball of
+    ``radius`` around ``V[v]``, then checks Euler characteristic and border cycle
+    count. A proper disk has χ = 1 and a single boundary component.
+    """
+    v = int(v)
+    if F.size == 0:
+        return False
+    nv = V.shape[0]
+    if neighbors is None:
+        neighbors = _vertex_neighbors(F, nv)
+    if v < 0 or v >= nv or not neighbors[v]:
+        return False
+
+    center = V[v]
+    # Vertices inside the ball (always include v)
+    in_ball = np.linalg.norm(V - center, axis=1) <= radius
+    in_ball[v] = True
+    # Faces fully contained in the ball and incident to the grown region from v
+    incident = [fi for fi, face in enumerate(F) if v in map(int, face)]
+    if not incident:
+        return False
+
+    # BFS grow through faces that stay inside the ball
+    face_in: set[int] = set()
+    vert_edge: dict[int, set[int]] = defaultdict(set)
+    stack = list(incident)
+    seen_f: set[int] = set(stack)
+    # Map vertex -> incident face indices for adjacency
+    v_to_f: list[list[int]] = [[] for _ in range(nv)]
+    for fi, (a, b, c) in enumerate(F):
+        v_to_f[int(a)].append(fi)
+        v_to_f[int(b)].append(fi)
+        v_to_f[int(c)].append(fi)
+
+    while stack:
+        fi = stack.pop()
+        a, b, c = (int(x) for x in F[fi])
+        if not (in_ball[a] and in_ball[b] and in_ball[c]):
+            continue
+        face_in.add(fi)
+        for u, w in ((a, b), (b, c), (c, a)):
+            vert_edge[u].add(w)
+            vert_edge[w].add(u)
+        for u in (a, b, c):
+            for fj in v_to_f[u]:
+                if fj not in seen_f:
+                    seen_f.add(fj)
+                    stack.append(fj)
+
+    if not face_in:
+        return False
+
+    verts = set(vert_edge.keys())
+    # Count undirected edges
+    e_count = sum(len(nbrs) for nbrs in vert_edge.values()) // 2
+    f_count = len(face_in)
+    v_count = len(verts)
+    chi = v_count - e_count + f_count
+
+    # Border edges: appear in exactly one grown face
+    edge_face_count: dict[tuple[int, int], int] = defaultdict(int)
+    for fi in face_in:
+        a, b, c = (int(x) for x in F[fi])
+        for u, w in ((a, b), (b, c), (c, a)):
+            key = (u, w) if u < w else (w, u)
+            edge_face_count[key] += 1
+    border = [e for e, c in edge_face_count.items() if c == 1]
+    if not border:
+        # Closed surface component inside ball — not a disk neighborhood of a curve tip
+        return chi != 2  # sphere χ=2; anything else is degenerate
+
+    # Count border cycles
+    bord_adj: dict[int, list[int]] = defaultdict(list)
+    for u, w in border:
+        bord_adj[u].append(w)
+        bord_adj[w].append(u)
+    visited: set[int] = set()
+    cycles = 0
+    for start in bord_adj:
+        if start in visited:
+            continue
+        cycles += 1
+        stack_b = [start]
+        visited.add(start)
+        while stack_b:
+            u = stack_b.pop()
+            for w in bord_adj[u]:
+                if w not in visited:
+                    visited.add(w)
+                    stack_b.append(w)
+
+    # Disk: χ=1 and one boundary component
+    return not (chi == 1 and cycles == 1)
+
+
 def compact_mesh(
     V: np.ndarray,
     F: np.ndarray,
@@ -101,17 +251,21 @@ def collapse_short_edges(
     fixed: np.ndarray | None = None,
     poles: np.ndarray | None = None,
     max_collapses: int | None = None,
+    max_passes: int | None = None,
+    deadline: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int, np.ndarray | None, np.ndarray | None]:
     """Collapse edges shorter than ``min_edge_length`` when the link condition holds.
 
-    Matches Starlab/CGAL local remeshing: midpoint merge (closest pole kept when
-    ``poles`` is provided). Vertices with ``fixed[i]`` are never moved into a
-    collapse that would delete them if both endpoints are fixed.
+    Midpoint merge (closest pole kept when ``poles`` is provided). Vertices with
+    ``fixed[i]`` are never both deleted. Stops when no legal short edge remains,
+    or when ``max_collapses`` / ``max_passes`` / ``deadline`` is hit.
 
     Returns
     -------
     V, F, n_collapsed, fixed_out, poles_out
     """
+    import time as _time
+
     V = np.asarray(V, dtype=float).copy()
     F = np.asarray(F, dtype=int).copy()
     if F.size == 0 or V.size == 0:
@@ -125,9 +279,18 @@ def collapse_short_edges(
     if poles is not None:
         poles = np.asarray(poles, dtype=float).copy()
 
+    if max_collapses is None:
+        max_collapses = max(nv, 200)
+    if max_passes is None:
+        max_passes = max(nv, 200)
+
     total = 0
-    # Iterate until no short edge can collapse (Starlab iteratively_coolapseShortEdges)
-    while True:
+    passes = 0
+    # Iterate until no short edge can collapse
+    while passes < max_passes:
+        if deadline is not None and _time.monotonic() >= deadline:
+            break
+        passes += 1
         nv = V.shape[0]
         edges = mesh_unique_edges(F)
         if edges.size == 0:
@@ -139,6 +302,7 @@ def collapse_short_edges(
         parent = np.arange(nv, dtype=int)
         alive = np.ones(nv, dtype=bool)
         collapsed_this = 0
+        cc_before = face_graph_components(F)
 
         def find(x: int) -> int:
             while parent[x] != parent[parent[x]]:
@@ -146,7 +310,9 @@ def collapse_short_edges(
             return parent[x]
 
         for ei in order:
-            if max_collapses is not None and total + collapsed_this >= max_collapses:
+            if total + collapsed_this >= max_collapses:
+                break
+            if deadline is not None and _time.monotonic() >= deadline:
                 break
             a0, b0 = int(edges[ei, 0]), int(edges[ei, 1])
             if not alive[a0] or not alive[b0]:
@@ -173,10 +339,12 @@ def collapse_short_edges(
                 keep, drop = a, b
             # Do not dissolve the last faces during local remesh — leave that to
             # convert_to_skeleton (keeps a meso-skeleton surface for conversion).
-            Fm = F.copy()
-            Fm[Fm == drop] = keep
-            alive_f = (Fm[:, 0] != Fm[:, 1]) & (Fm[:, 1] != Fm[:, 2]) & (Fm[:, 2] != Fm[:, 0])
-            if int(alive_f.sum()) == 0 and F.shape[0] > 0:
+            Fm = faces_after_collapse(F, keep, drop)
+            if Fm.shape[0] == 0 and F.shape[0] > 0:
+                continue
+            # Refuse collapses that fragment the meso-skeleton into multiple pieces.
+            after_cc = face_graph_components(Fm)
+            if Fm.shape[0] > 0 and after_cc > cc_before:
                 continue
             if poles is not None:
                 pa, pb = poles[keep], poles[drop]
@@ -189,8 +357,7 @@ def collapse_short_edges(
             alive[drop] = False
             fixed[keep] = bool(fixed[keep] or fixed[drop])
             collapsed_this += 1
-            # One topology-changing collapse per pass (Starlab updates halfedges
-            # immediately; we rebuild adjacency on the next outer iteration).
+            # One topology-changing collapse per pass; rebuild adjacency next.
             break
 
         if collapsed_this == 0:
@@ -225,11 +392,15 @@ def split_obtuse_faces(
     fixed: np.ndarray | None = None,
     poles: np.ndarray | None = None,
     is_split: np.ndarray | None = None,
+    max_passes: int | None = None,
+    deadline: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Split edges opposite angles larger than ``max_angle_deg`` (Starlab splitter).
+    """Split edges opposite angles larger than ``max_angle_deg``.
 
     Projects the obtuse vertex onto the opposite edge and inserts a new vertex.
     """
+    import time as _time
+
     V = np.asarray(V, dtype=float).copy()
     F = np.asarray(F, dtype=int).copy()
     if F.size == 0:
@@ -247,10 +418,17 @@ def split_obtuse_faces(
     if poles is not None:
         poles = np.asarray(poles, dtype=float).copy()
 
+    if max_passes is None:
+        max_passes = max(nv, 200)
+
     thr = float(max_angle_deg) * (np.pi / 180.0)
     total = 0
+    passes = 0
 
-    while True:
+    while passes < max_passes:
+        if deadline is not None and _time.monotonic() >= deadline:
+            break
+        passes += 1
         new_faces: list[np.ndarray] = []
         splits = 0
         # Track edges already split this pass
@@ -304,7 +482,7 @@ def split_obtuse_faces(
             fixed_list.append(False)
             split_list.append(True)
             if poles_list is not None:
-                # Split verts get no medial pull (Starlab vissplit => omega_P=0);
+                # Split verts get no medial pull (is_split => w_M=0);
                 # store midpoint of endpoint poles as placeholder.
                 poles_list.append(0.5 * (poles_list[e0] + poles_list[e1]))
             split_edges.add(ek)
@@ -331,9 +509,17 @@ def collapse_ok_for_edge(
     b: int,
     V: np.ndarray,
     F: np.ndarray,
+    *,
+    check_connectivity: bool = True,
 ) -> bool:
-    """Return True if collapsing edge (a,b) satisfies the link condition."""
+    """Return True if collapsing edge (a,b) is link-legal (and optionally connectivity-safe)."""
+    a, b = int(a), int(b)
     nv = V.shape[0]
     neighbors = _vertex_neighbors(F, nv)
     edge_faces = _edge_to_faces(F)
-    return _link_condition_ok(int(a), int(b), neighbors, edge_faces, F)
+    if not _link_condition_ok(a, b, neighbors, edge_faces, F):
+        return False
+    if not check_connectivity:
+        return True
+    keep, drop = (a, b) if a < b else (b, a)
+    return collapse_preserves_face_connectivity(F, keep, drop)
