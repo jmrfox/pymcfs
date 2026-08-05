@@ -12,19 +12,23 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import trimesh as tm
 
-from .laplacian import cotangent_laplacian
+from .laplacian import starlab_cotangent_laplacian
 from .medial import compute_voronoi_poles
 from .remesh import (
     collapse_ok_for_edge,
     collapse_short_edges,
-    face_graph_components,
-    is_vertex_degenerate,
+    mesh_adjacency,
     mesh_unique_edges,
     split_obtuse_faces,
 )
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+try:
+    from sksparse.cholmod import cholesky as _cholmod_cholesky
+except ImportError:  # optional acceleration for SPD AtA
+    _cholmod_cholesky = None
 
 
 def _edge_key(u: int, v: int) -> tuple[int, int]:
@@ -64,19 +68,32 @@ def meso_surface_to_curve_graph(
     max_steps: int | None = None,
     deadline: float | None = None,
 ) -> nx.Graph:
-    """Collapse face-bearing edges of a meso-skeleton into a 1D curve graph.
+    """Convert a meso-skeleton using Starlab's sorted edge-collapse procedure.
 
-    Repeatedly collapse the shortest face-bearing edge. Final connectivity is the
-    original mesh 1-skeleton remapped through the union-find of collapses, so
-    curve topology is preserved even after all faces disappear.
+    ``surfacemesh_filter_to_skeleton`` inserts all initial edges into a priority
+    queue, visits them in their initial length order, and collapses an edge only
+    while it still bounds a face. Geometry is not moved during this loop. Each
+    surviving vertex is positioned afterward at the centroid of the original
+    meso-skeleton vertices collapsed into it.
     """
-    V = np.asarray(V, dtype=float).copy()
+    V = np.asarray(V, dtype=float)
     F = np.asarray(F, dtype=int).copy()
     n0 = V.shape[0]
     if n0 == 0:
         return nx.Graph()
 
+    initial_edges = mesh_unique_edges(F)
+    if initial_edges.size == 0:
+        return nx.Graph()
+    initial_lengths = np.linalg.norm(
+        V[initial_edges[:, 0]] - V[initial_edges[:, 1]], axis=1
+    )
+    # Starlab breaks equal-length ties by persistent edge index.
+    order = np.lexsort((np.arange(initial_edges.shape[0]), initial_lengths))
+
     parent = np.arange(n0, dtype=int)
+    position_sum = V.copy()
+    member_count = np.ones(n0, dtype=int)
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -84,80 +101,93 @@ def meso_surface_to_curve_graph(
             x = parent[x]
         return x
 
-    def union(a: int, b: int) -> int:
-        a, b = find(a), find(b)
-        if a == b:
-            return a
-        V[a] = 0.5 * (V[a] + V[b])
-        parent[b] = a
-        return a
+    # Maintain live faces with root vertex ids so has_faces(e) is an O(1) map
+    # lookup instead of remapping all faces each step.
+    face_alive = np.ones(F.shape[0], dtype=bool)
+    v_to_faces: list[set[int]] = [set() for _ in range(n0)]
+    edge_faces: dict[tuple[int, int], set[int]] = {}
 
-    # Record the initial 1-skeleton (all mesh edges)
-    initial_edges = mesh_unique_edges(F) if F.size else np.zeros((0, 2), dtype=int)
+    def _add_face(fi: int) -> None:
+        i0, i1, i2 = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+        for u, v in ((i0, i1), (i1, i2), (i2, i0)):
+            edge_faces.setdefault(_edge_key(u, v), set()).add(fi)
+        v_to_faces[i0].add(fi)
+        v_to_faces[i1].add(fi)
+        v_to_faces[i2].add(fi)
 
-    guard = 0
+    def _remove_face(fi: int) -> None:
+        i0, i1, i2 = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+        for u, v in ((i0, i1), (i1, i2), (i2, i0)):
+            key = _edge_key(u, v)
+            bucket = edge_faces.get(key)
+            if bucket is not None:
+                bucket.discard(fi)
+                if not bucket:
+                    del edge_faces[key]
+        v_to_faces[i0].discard(fi)
+        v_to_faces[i1].discard(fi)
+        v_to_faces[i2].discard(fi)
+
+    for fi in range(F.shape[0]):
+        _add_face(fi)
+
     if max_steps is None:
-        max_steps = max(20 * max(n0, 1), 2000)
-    Fcur = F.copy()
-    while Fcur.shape[0] > 0 and guard < max_steps:
+        max_steps = initial_edges.shape[0]
+
+    steps = 0
+    for edge_index in order:
+        if steps >= max_steps:
+            break
         if deadline is not None and time.monotonic() >= deadline:
             break
-        guard += 1
-        # Rewrite faces through current parents
-        Fr = np.vectorize(find, otypes=[int])(Fcur)
-        keep = (Fr[:, 0] != Fr[:, 1]) & (Fr[:, 1] != Fr[:, 2]) & (Fr[:, 2] != Fr[:, 0])
-        Fcur = Fr[keep]
-        if Fcur.shape[0] == 0:
-            break
-
-        edges = mesh_unique_edges(Fcur)
-        if edges.size == 0:
-            break
-        lengths = np.linalg.norm(V[edges[:, 0]] - V[edges[:, 1]], axis=1)
-        ei = int(np.argmin(lengths))
-        a, b = int(edges[ei, 0]), int(edges[ei, 1])
-        a, b = find(a), find(b)
+        steps += 1
+        a0, b0 = initial_edges[int(edge_index)]
+        a, b = find(int(a0)), find(int(b0))
         if a == b:
-            # Degenerate residual; drop this face edge by forcing face rewrite next
-            # round via a no-op face filter — break to avoid spinning.
-            break
-        union(a, b)
+            continue
 
-    # Build curve graph from initial edges remapped to surviving roots
+        # Equivalent to WingedgeMesh::has_faces(e).
+        if not edge_faces.get(_edge_key(a, b)):
+            continue
+
+        # Starlab deletes vertex(e, 0), keeps vertex(e, 1), and does not move
+        # geometry until the collapse loop is complete.
+        parent[a] = b
+        position_sum[b] += position_sum[a]
+        member_count[b] += member_count[a]
+
+        for fi in list(v_to_faces[a]):
+            if not face_alive[fi]:
+                continue
+            _remove_face(fi)
+            for k in range(3):
+                F[fi, k] = find(int(F[fi, k]))
+            i0, i1, i2 = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+            if i0 == i1 or i1 == i2 or i2 == i0:
+                face_alive[fi] = False
+            else:
+                _add_face(fi)
+
+    edges_set: set[tuple[int, int]] = set()
+    for a, b in initial_edges:
+        ra, rb = find(int(a)), find(int(b))
+        if ra != rb:
+            edges_set.add(_edge_key(ra, rb))
+
     G = nx.Graph()
     root_to_node: dict[int, int] = {}
-    for i in range(n0):
-        r = find(i)
-        if r not in root_to_node:
-            nid = len(root_to_node)
-            root_to_node[r] = nid
-            G.add_node(nid, pos=V[r].copy())
+    roots = sorted({find(i) for i in range(n0)})
+    for r in roots:
+        nid = len(root_to_node)
+        root_to_node[r] = nid
+        pos = position_sum[r] / float(member_count[r])
+        G.add_node(nid, pos=pos)
 
-    # Prefer remapped initial edges; also include any residual face edges
-    edge_src = initial_edges
-    if Fcur.shape[0] > 0:
-        resid = mesh_unique_edges(Fcur)
-        if resid.size:
-            edge_src = resid if edge_src.size == 0 else np.vstack([edge_src, resid])
-
-    if edge_src.size:
-        for a, b in edge_src:
-            ra, rb = find(int(a)), find(int(b))
-            if ra == rb:
-                continue
-            u, v = root_to_node[ra], root_to_node[rb]
-            w = float(np.linalg.norm(V[ra] - V[rb]))
-            if G.has_edge(u, v):
-                if w < G[u][v]["weight"]:
-                    G[u][v]["weight"] = w
-            else:
-                G.add_edge(u, v, weight=w)
-
-    isolates = [n for n, d in G.degree() if d == 0]
-    G.remove_nodes_from(isolates)
-    if G.number_of_nodes() > 0:
-        mapping = {n: i for i, n in enumerate(G.nodes)}
-        G = nx.relabel_nodes(G, mapping, copy=True)
+    for a, b in edges_set:
+        u, v = root_to_node[a], root_to_node[b]
+        pu = np.asarray(G.nodes[u]["pos"], dtype=float)
+        pv = np.asarray(G.nodes[v]["pos"], dtype=float)
+        G.add_edge(u, v, weight=float(np.linalg.norm(pu - pv)))
     return G
 
 
@@ -189,11 +219,16 @@ class MeanCurvatureFlowSkeletonization:
     F: np.ndarray = field(init=False, repr=False)
     fixed: np.ndarray = field(init=False, repr=False)
     is_split: np.ndarray = field(init=False, repr=False)
+    _constraint_fixed: np.ndarray = field(init=False, repr=False)
+    _constraint_split: np.ndarray = field(init=False, repr=False)
     poles: np.ndarray = field(init=False, repr=False)
+    pole_valid: np.ndarray = field(init=False, repr=False)
     _min_edge: float = field(init=False, repr=False)
     _area0: float = field(init=False, repr=False)
     _w_L: float = field(init=False, default=1.0, repr=False)
     _deadline: float | None = field(init=False, default=None, repr=False)
+    _iter: int = field(init=False, default=0, repr=False)
+    _bbox0: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.mesh, tm.Trimesh):
@@ -208,7 +243,10 @@ class MeanCurvatureFlowSkeletonization:
         n = self.V.shape[0]
         self.fixed = np.zeros(n, dtype=bool)
         self.is_split = np.zeros(n, dtype=bool)
+        self._constraint_fixed = np.zeros(n, dtype=bool)
+        self._constraint_split = np.zeros(n, dtype=bool)
         bb = self.V.max(axis=0) - self.V.min(axis=0)
+        self._bbox0 = bb.copy()
         diag = float(np.linalg.norm(bb))
         self._min_edge = (
             float(self.min_edge_length)
@@ -218,11 +256,22 @@ class MeanCurvatureFlowSkeletonization:
         self._area0 = self._surface_area()
         self._faces0 = int(self.F.shape[0])
         self._w_L = 1.0
-        # Medial term on whenever w_M > 0
+        self._iter = 0
+        # Starlab uses every pole returned by its bounding-box-filtered Voronoi
+        # construction. Containment is logged as a diagnostic only.
+        self.pole_valid = np.zeros(n, dtype=bool)
         if float(self.w_M) > 0.0:
             try:
                 targets, _w = compute_voronoi_poles(self.mesh)
                 self.poles = np.asarray(targets, dtype=float)
+                self.pole_valid = self._poles_inside_mesh(self.poles)
+                n_valid = int(self.pole_valid.sum())
+                if self.verbose or n_valid < n:
+                    self._log.info(
+                        "Voronoi poles: %d/%d inside mesh (diagnostic only)",
+                        n_valid,
+                        n,
+                    )
             except Exception as e:
                 self._log.warning("Voronoi poles failed (%s); setting w_M effective 0", e)
                 self.poles = self.V.copy()
@@ -230,16 +279,17 @@ class MeanCurvatureFlowSkeletonization:
         else:
             self.poles = self.V.copy()
         self._deadline = None
-        if self.verbose:
-            self._log.info(
-                "MCFS init: n=%d f=%d min_edge=%.4g area0=%.4g w_H=%.3g w_M=%.3g",
-                n,
-                self.F.shape[0],
-                self._min_edge,
-                self._area0,
-                self.w_H,
-                self.w_M,
-            )
+        self._log.info(
+            "MCFS init: n=%d f=%d min_edge=%.4g area0=%.4g bbox0=%s w_H=%.3g w_M=%.3g",
+            n,
+            self.F.shape[0],
+            self._min_edge,
+            self._area0,
+            np.array2string(self._bbox0, precision=4),
+            self.w_H,
+            self.w_M,
+        )
+        self._sanity_check_state(stage="init")
 
     def _surface_area(self) -> float:
         if self.F.size == 0:
@@ -249,68 +299,209 @@ class MeanCurvatureFlowSkeletonization:
         v2 = self.V[self.F[:, 2]]
         return float(0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1).sum())
 
+    def _bbox_extents(self) -> np.ndarray:
+        if self.V.shape[0] == 0:
+            return np.zeros(3, dtype=float)
+        return self.V.max(axis=0) - self.V.min(axis=0)
+
+    def _poles_inside_mesh(self, poles: np.ndarray) -> np.ndarray:
+        """Return boolean mask of poles that lie in the interior of ``self.mesh``.
+
+        Diagnostic only — Starlab does not gate poles on containment. Skipped
+        unless ``verbose`` is set so init stays cheap on large meshes.
+        """
+        poles = np.asarray(poles, dtype=float)
+        n = poles.shape[0]
+        if n == 0:
+            return np.zeros(0, dtype=bool)
+        if not self.verbose:
+            return np.ones(n, dtype=bool)
+        try:
+            inside = np.asarray(self.mesh.contains(poles), dtype=bool)
+            if inside.shape[0] != n:
+                return np.zeros(n, dtype=bool)
+            return inside
+        except Exception as e:
+            self._log.warning("pole inside-test failed (%s); treating all poles as valid", e)
+            return np.ones(n, dtype=bool)
+
+    def _sync_pole_valid(self) -> None:
+        """Keep ``pole_valid`` aligned with ``poles`` after remesh."""
+        n = self.V.shape[0]
+        if self.pole_valid.shape[0] != n:
+            # Remesh may have changed vertex count; containment is diagnostic only.
+            if float(self.w_M) > 0.0 and self.poles.shape[0] == n:
+                self.pole_valid = (
+                    self._poles_inside_mesh(self.poles)
+                    if self.verbose
+                    else np.ones(n, dtype=bool)
+                )
+            else:
+                self.pole_valid = np.zeros(n, dtype=bool)
+
+    def _sanity_check_state(self, *, stage: str, prev_area: float | None = None) -> None:
+        """Log geometric / numerical health of the current meso-skeleton."""
+        n, f = int(self.V.shape[0]), int(self.F.shape[0])
+        area = self._surface_area()
+        bb = self._bbox_extents()
+        fixed_n = int(self.fixed.sum()) if self.fixed.shape[0] == n else -1
+        finite = bool(np.isfinite(self.V).all()) if n else True
+        msg = (
+            "sanity[%s] iter=%d n=%d f=%d area=%.4g (%.2f%% of area0) "
+            "bbox=%s fixed=%d finite=%s"
+            % (
+                stage,
+                self._iter,
+                n,
+                f,
+                area,
+                100.0 * area / max(self._area0, 1e-30),
+                np.array2string(bb, precision=4),
+                fixed_n,
+                finite,
+            )
+        )
+        if float(self.w_M) > 0.0 and self.poles.shape[0] == n and n > 0:
+            d = np.linalg.norm(self.V - self.poles, axis=1)
+            valid = self.pole_valid if self.pole_valid.shape[0] == n else np.zeros(n, dtype=bool)
+            msg += " pole_dist(mean/max)=%.4g/%.4g valid=%d/%d" % (
+                float(d.mean()),
+                float(d.max()) if d.size else 0.0,
+                int(valid.sum()),
+                n,
+            )
+        self._log.info(msg)
+
+        if not finite:
+            self._log.error("sanity[%s]: non-finite vertex coordinates detected", stage)
+        if prev_area is not None and prev_area > 0 and area > 1.25 * prev_area:
+            self._log.warning(
+                "sanity[%s]: area increased sharply %.4g -> %.4g (possible medial overshoot)",
+                stage,
+                prev_area,
+                area,
+            )
+        if n > 0 and self._bbox0 is not None:
+            # Warn if the longest original axis collapsed much faster than others
+            # while another axis grew (classic bad medial / remesh feedback).
+            growth = bb / np.maximum(self._bbox0, 1e-12)
+            if float(growth.max()) > 1.1 and float(area) < 0.5 * self._area0:
+                self._log.warning(
+                    "sanity[%s]: bbox axis growth=%s after area drop (check poles/remesh)",
+                    stage,
+                    np.array2string(growth, precision=3),
+                )
+
     def _update_constraint_weights(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         n = self.V.shape[0]
         wL = np.full(n, float(self._w_L), dtype=float)
         wH = np.full(n, float(self.w_H), dtype=float)
         wM = np.full(n, float(self.w_M), dtype=float)
-        wL[self.fixed] = 0.0
-        wH[self.fixed] = 1.0 / max(self.zero_TH, 1e-16)
-        wM[self.fixed] = 0.0
-        wM[self.is_split] = 0.0
+        wL[self._constraint_fixed] = 0.0
+        wH[self._constraint_fixed] = 1.0 / max(self.zero_TH, 1e-16)
+        wM[self._constraint_fixed] = 0.0
+        wM[self._constraint_split] = 0.0
         return wL, wH, wM
 
     def contract_geometry(self) -> None:
-        """One contraction solve; reassembles Laplacian from current connectivity."""
+        """Run Starlab's stacked least-squares geometry contraction."""
         if self.V.shape[0] == 0 or self.F.shape[0] == 0:
             return
-        L = cotangent_laplacian(self.V, self.F, secure=self.laplacian_secure)
+        self._sync_pole_valid()
+        V_before = self.V.copy()
         wL, wH, wM = self._update_constraint_weights()
-        A = (sp.diags(wL) @ L + sp.diags(wH) + sp.diags(wM)).tocsc()
-        rhs = sp.diags(wH) @ self.V + sp.diags(wM) @ self.poles
+
+        # EigenContractionHelper::createLHS builds:
+        #
+        #     [ W_L L ]
+        # A = [  W_H  ],  B = [0; W_H V; W_P P]
+        #     [  W_P  ]
+        #
+        # and solves min ||A X - B||² through A.T @ A. Starlab multiplies
+        # off-diagonal Laplacian entries by the source vertex's omega_L but
+        # leaves the diagonal as the unweighted negative edge-weight sum.
+        L = starlab_cotangent_laplacian(self.V, self.F).tocsr()
+        # Starlab: scale off-diagonals by omega_L, leave diagonal as the
+        # unweighted negative edge-weight sum. Avoid LIL round-trips.
+        diag = np.asarray(L.diagonal()).ravel()
+        L_off = L - sp.diags(diag, format="csr", shape=L.shape)
+        L_weighted = (sp.diags(wL) @ L_off) + sp.diags(diag, format="csr")
+        WH = sp.diags(wH, format="csr")
+        WP = sp.diags(wM, format="csr")
+        A = sp.vstack([L_weighted, WH, WP], format="csc")
+        rhs = np.vstack(
+            [
+                np.zeros_like(self.V),
+                wH[:, None] * self.V,
+                wM[:, None] * self.poles,
+            ]
+        )
+        AtA = (A.T @ A).tocsc()
+        At_rhs = A.T @ rhs
         try:
-            solver = spla.factorized(A)
-            for c in range(3):
-                self.V[:, c] = solver(rhs[:, c])
+            # Optional CHOLMOD (scikit-sparse) for SPD AtA; else SciPy SuperLU.
+            if _cholmod_cholesky is not None:
+                try:
+                    factor = _cholmod_cholesky(AtA)
+                    for c in range(3):
+                        self.V[:, c] = np.asarray(
+                            factor(np.asarray(At_rhs[:, c]).ravel())
+                        ).ravel()
+                except Exception:
+                    solver = spla.factorized(AtA)
+                    for c in range(3):
+                        self.V[:, c] = solver(np.asarray(At_rhs[:, c]).ravel())
+            else:
+                solver = spla.factorized(AtA)
+                for c in range(3):
+                    self.V[:, c] = solver(np.asarray(At_rhs[:, c]).ravel())
         except Exception as e:
-            self._log.warning("MCFS contract_geometry solve failed: %s; using lstsq", e)
-            AtA = (A.T @ A).tocsc()
+            self._log.warning("MCFS contract_geometry factorization failed: %s; using spsolve", e)
             for c in range(3):
-                self.V[:, c] = spla.spsolve(AtA, A.T @ rhs[:, c])
+                self.V[:, c] = spla.spsolve(AtA, np.asarray(At_rhs[:, c]).ravel())
+        if not np.isfinite(self.V).all():
+            self._log.error("contract_geometry produced non-finite vertices; reverting step")
+            self.V = V_before
+            return
+        disp = np.linalg.norm(self.V - V_before, axis=1)
+        self._log.debug(
+            "contract_geometry: disp mean=%.4g max=%.4g wM_active=%d/%d",
+            float(disp.mean()),
+            float(disp.max()) if disp.size else 0.0,
+            int((wM > 0).sum()),
+            int(wM.shape[0]),
+        )
 
     def collapse_edges(self) -> int:
         """Collapse edges shorter than ``min_edge_length``."""
-        # Keep enough faces for a meaningful meso-skeleton; conversion handles the rest.
-        if self.F.shape[0] <= max(4, self._faces0 // 100):
-            return 0
         n_before = self.V.shape[0]
-        per_iter_cap = max(50, self.V.shape[0] // 2)
+        flags = {"is_split": self.is_split}
         V2, F2, n, fixed2, poles2 = collapse_short_edges(
             self.V,
             self.F,
             min_edge_length=self._min_edge,
             fixed=self.fixed,
             poles=self.poles,
-            max_collapses=per_iter_cap,
-            max_passes=per_iter_cap,
+            vertex_flags=flags,
             deadline=self._deadline,
         )
         if n > 0 or V2.shape[0] != n_before:
             self.V, self.F = V2, F2
             self.fixed = fixed2 if fixed2 is not None else np.zeros(V2.shape[0], dtype=bool)
             self.poles = poles2 if poles2 is not None else self.V.copy()
-            # Resize is_split (collapsed verts removed; new count)
-            if self.is_split.shape[0] != self.V.shape[0]:
-                self.is_split = np.zeros(self.V.shape[0], dtype=bool)
-        if self.verbose and n:
+            self.is_split = np.asarray(
+                flags.get("is_split", np.zeros(V2.shape[0], dtype=bool)),
+                dtype=bool,
+            )
+            self._sync_pole_valid()
+        if n:
             self._log.info(
-                "collapse_edges: %d collapses → n=%d f=%d", n, self.V.shape[0], self.F.shape[0]
+                "collapse_edges: %d collapses -> n=%d f=%d", n, self.V.shape[0], self.F.shape[0]
             )
         return int(n)
 
     def split_faces(self) -> int:
         """Split faces with an angle larger than ``max_triangle_angle``."""
-        per_iter_cap = max(50, self.V.shape[0] // 2)
         V2, F2, n, fixed2, poles2, split2 = split_obtuse_faces(
             self.V,
             self.F,
@@ -319,7 +510,6 @@ class MeanCurvatureFlowSkeletonization:
             fixed=self.fixed,
             poles=self.poles,
             is_split=self.is_split,
-            max_passes=per_iter_cap,
             deadline=self._deadline,
         )
         if n > 0:
@@ -327,9 +517,10 @@ class MeanCurvatureFlowSkeletonization:
             self.fixed = fixed2 if fixed2 is not None else np.zeros(V2.shape[0], dtype=bool)
             self.poles = poles2 if poles2 is not None else self.V.copy()
             self.is_split = split2 if split2 is not None else np.zeros(V2.shape[0], dtype=bool)
-        if self.verbose and n:
+            self._sync_pole_valid()
+        if n:
             self._log.info(
-                "split_faces: %d splits → n=%d f=%d", n, self.V.shape[0], self.F.shape[0]
+                "split_faces: %d splits -> n=%d f=%d", n, self.V.shape[0], self.F.shape[0]
             )
         return int(n)
 
@@ -337,53 +528,42 @@ class MeanCurvatureFlowSkeletonization:
         return self._deadline is not None and time.monotonic() >= self._deadline
 
     def detect_degeneracies(self) -> int:
-        """Pin vertices whose local neighborhood is no longer a disk."""
+        """Apply Starlab's non-collapsible-short-edge degeneracy test."""
         if self.V.shape[0] == 0 or self.F.shape[0] == 0:
             return 0
         elength_fixed = self._min_edge / 10.0
-        disk_radius = self._min_edge
         edges = mesh_unique_edges(self.F)
-        from .remesh import _vertex_neighbors
-
-        neighbors = _vertex_neighbors(self.F, self.V.shape[0])
-        # Only consider vertices that touch at least one short edge (cheap filter).
-        short_touch = np.zeros(self.V.shape[0], dtype=bool)
+        neighbors, edge_faces = mesh_adjacency(self.F, self.V.shape[0])
         incident: list[list[tuple[int, int]]] = [[] for _ in range(self.V.shape[0])]
         for a, b in edges:
             a, b = int(a), int(b)
             incident[a].append((a, b))
             incident[b].append((a, b))
-            d = float(np.linalg.norm(self.V[a] - self.V[b]))
-            if d < disk_radius:
-                short_touch[a] = True
-                short_touch[b] = True
 
         newly = 0
         for v in range(self.V.shape[0]):
             if self._timed_out():
                 break
-            if self.fixed[v] or not short_touch[v]:
+            if self.fixed[v]:
                 continue
             bad = 0
             for a, b in incident[v]:
                 d = float(np.linalg.norm(self.V[a] - self.V[b]))
                 # Link-only check (halfedge is_collapse_ok); skip connectivity scan.
                 if d < elength_fixed and not collapse_ok_for_edge(
-                    a, b, self.V, self.F, check_connectivity=False
+                    a,
+                    b,
+                    self.V,
+                    self.F,
+                    check_connectivity=False,
+                    neighbors=neighbors,
+                    edge_faces=edge_faces,
                 ):
                     bad += 1
-            disk_bad = False
-            if bad < 2 and neighbors[v]:
-                try:
-                    disk_bad = is_vertex_degenerate(
-                        v, self.V, self.F, radius=disk_radius, neighbors=neighbors
-                    )
-                except Exception:
-                    disk_bad = False
-            if bad >= 2 or disk_bad:
+            if bad >= 2:
                 self.fixed[v] = True
                 newly += 1
-        if self.verbose and newly:
+        if newly:
             self._log.info(
                 "detect_degeneracies: pinned %d (total fixed=%d)", newly, int(self.fixed.sum())
             )
@@ -397,9 +577,16 @@ class MeanCurvatureFlowSkeletonization:
         self.collapse_edges()
         if self._timed_out():
             return
-        self.split_faces()
+        new_splits = self.split_faces()
         if self._timed_out():
             return
+        # Skelcollapse::updateConstraints runs after geometry but before topology.
+        # These snapshots therefore exclude vertices fixed by the detection below,
+        # and newly created split vertices retain default weights for one solve.
+        self._constraint_fixed = self.fixed.copy()
+        self._constraint_split = self.is_split.copy()
+        if new_splits:
+            self._constraint_split[-new_splits:] = False
         self.detect_degeneracies()
 
     def contract_until_convergence(self) -> int:
@@ -412,68 +599,39 @@ class MeanCurvatureFlowSkeletonization:
         last_it = 0
         for it in range(1, int(self.max_iterations) + 1):
             last_it = it
+            self._iter = it
             if self._timed_out():
-                if self.verbose:
-                    self._log.info(
-                        "stopping: timeout after %.3gs at iter %d",
-                        float(self.timeout_seconds or 0.0),
-                        it - 1,
-                    )
+                self._log.info(
+                    "stopping: timeout after %.3gs at iter %d",
+                    float(self.timeout_seconds or 0.0),
+                    it - 1,
+                )
                 break
             self.contract()
             if self._timed_out():
-                if self.verbose:
-                    self._log.info(
-                        "stopping: timeout after %.3gs during iter %d",
-                        float(self.timeout_seconds or 0.0),
-                        it,
-                    )
+                self._log.info(
+                    "stopping: timeout after %.3gs during iter %d",
+                    float(self.timeout_seconds or 0.0),
+                    it,
+                )
                 break
             area = self._surface_area()
+            # Always log a compact progress line; detailed sanity every ~10%.
+            log_every = max(1, int(self.max_iterations) // 10)
+            if self.verbose or it == 1 or it % log_every == 0:
+                self._sanity_check_state(stage="iter", prev_area=prev_area)
+            elif area > 1.25 * prev_area > 0:
+                self._sanity_check_state(stage="iter-area-jump", prev_area=prev_area)
+
             if prev_area > 0 and abs(prev_area - area) < self.area_variation_factor * max(
                 self._area0, 1e-30
             ):
-                if self.verbose:
-                    self._log.info("converged at iter %d area=%.4g", it, area)
-                break
-            # Soft floor: only stop on tiny area once some vertices are pinned.
-            if (
-                self._area0 > 0
-                and area < 1e-4 * self._area0
-                and int(self.fixed.sum()) > 0
-            ):
-                if self.verbose:
-                    self._log.info(
-                        "stopping: area collapsed (%.4g) with %d fixed at iter %d",
-                        area,
-                        int(self.fixed.sum()),
-                        it,
-                    )
-                break
-            if self.F.shape[0] <= max(4, self._faces0 // 100):
-                if self.verbose:
-                    self._log.info("stopping: few faces left (%d) at iter %d", self.F.shape[0], it)
-                break
-            if face_graph_components(self.F) > 1:
-                if self.verbose:
-                    self._log.info(
-                        "stopping: meso-skeleton fragmented (%d face components) at iter %d",
-                        face_graph_components(self.F),
-                        it,
-                    )
+                self._log.info("converged at iter %d area=%.4g", it, area)
                 break
             prev_area = area
             if self.F.shape[0] == 0:
                 break
-            if self.verbose and (it % max(1, self.max_iterations // 10) == 0):
-                self._log.info(
-                    "iter %d: n=%d f=%d area=%.4g fixed=%d",
-                    it,
-                    self.V.shape[0],
-                    self.F.shape[0],
-                    area,
-                    int(self.fixed.sum()),
-                )
+        self._sanity_check_state(stage="final", prev_area=prev_area)
         return last_it
 
     def meso_skeleton_mesh(self) -> tm.Trimesh:
@@ -482,41 +640,65 @@ class MeanCurvatureFlowSkeletonization:
     def convert_to_skeleton(
         self,
         *,
-        compress_chains: bool = True,
+        refine: bool | str = False,
+        refine_spacing: float | None = None,
+        refine_spacing_frac: float | None = None,
+        compress_chains: bool = False,
         resample_spacing: float | None = None,
-        keep_largest_component: bool = True,
+        keep_largest_component: bool = False,
     ):
         """Convert the meso-skeleton surface into a 1D curve ``Skeleton``."""
-        from .skeleton import Skeleton, _compress_degree_two_chains, _resample_edges_uniform
-
-        G = meso_surface_to_curve_graph(
-            self.V, self.F, deadline=self._deadline
+        from .skeleton import (
+            Skeleton,
+            _resolve_refine_options,
+            refine_skeleton_graph,
         )
-        if G.number_of_nodes() > 1 and nx.number_connected_components(G) > 1:
-            G = _stitch_skeleton_components(G, max_bridge=float(np.linalg.norm(
-                self.V.max(axis=0) - self.V.min(axis=0)
-            )) * 0.05)
-            if self.verbose:
-                self._log.info(
-                    "convert_to_skeleton: after stitch cc=%d nodes=%d",
-                    nx.number_connected_components(G) if G.number_of_nodes() else 0,
-                    G.number_of_nodes(),
-                )
+
+        self._log.info(
+            "convert_to_skeleton: meso n=%d f=%d bbox=%s",
+            self.V.shape[0],
+            self.F.shape[0],
+            np.array2string(self._bbox_extents(), precision=4),
+        )
+        # Starlab's surface-to-skeleton conversion is a separate complete stage;
+        # do not inherit an expired contraction deadline and return a partial
+        # triangulated graph.
+        G = meso_surface_to_curve_graph(self.V, self.F)
+        self._log.info(
+            "convert_to_skeleton: raw curve nodes=%d edges=%d cc=%d",
+            G.number_of_nodes(),
+            G.number_of_edges(),
+            nx.number_connected_components(G) if G.number_of_nodes() else 0,
+        )
         if keep_largest_component and G.number_of_nodes() > 0:
             comps = list(nx.connected_components(G))
             if len(comps) > 1:
                 largest = max(comps, key=len)
-                if self.verbose:
-                    self._log.info(
-                        "convert_to_skeleton: keeping largest of %d components (%d nodes)",
-                        len(comps),
-                        len(largest),
-                    )
+                self._log.info(
+                    "convert_to_skeleton: keeping largest of %d components (%d nodes)",
+                    len(comps),
+                    len(largest),
+                )
                 G = G.subgraph(largest).copy()
-        if compress_chains and G.number_of_nodes() > 0:
-            G = _compress_degree_two_chains(G)
-        if resample_spacing is not None and resample_spacing > 0 and G.number_of_edges() > 0:
-            G = _resample_edges_uniform(G, float(resample_spacing))
+
+        mode, spacing, spacing_frac = _resolve_refine_options(
+            refine=refine,
+            refine_spacing=refine_spacing,
+            refine_spacing_frac=refine_spacing_frac,
+            compress_chains=compress_chains,
+            resample_spacing=resample_spacing,
+        )
+        if mode is not None and G.number_of_nodes() > 0:
+            n_before = G.number_of_nodes()
+            G = refine_skeleton_graph(
+                G, mode=mode, spacing=spacing, spacing_frac=spacing_frac
+            )
+            self._log.info(
+                "convert_to_skeleton: refine mode=%s %d -> %d nodes",
+                mode,
+                n_before,
+                G.number_of_nodes(),
+            )
 
         # Dense relabel
         mapping = {n: i for i, n in enumerate(G.nodes)}
@@ -532,4 +714,19 @@ class MeanCurvatureFlowSkeletonization:
             if G.number_of_edges()
             else np.zeros((0, 2), dtype=int)
         )
+        if nodes_arr.shape[0] > 0 and edges_arr.shape[0] > 0:
+            total_len = float(
+                sum(
+                    np.linalg.norm(nodes_arr[int(u)] - nodes_arr[int(v)])
+                    for u, v in edges_arr
+                )
+            )
+            self._log.info(
+                "convert_to_skeleton: final nodes=%d edges=%d total_length=%.4g",
+                nodes_arr.shape[0],
+                edges_arr.shape[0],
+                total_len,
+            )
+        else:
+            self._log.warning("convert_to_skeleton: empty skeleton")
         return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)

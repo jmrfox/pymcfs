@@ -2,7 +2,12 @@ import numpy as np
 import scipy.sparse as sp
 import trimesh as tm
 
-from pymcfs.laplacian import cotangent_laplacian, mean_value_laplacian, lumped_mass_matrix
+from pymcfs.laplacian import (
+    cotangent_laplacian,
+    lumped_mass_matrix,
+    mean_value_laplacian,
+    starlab_cotangent_laplacian,
+)
 
 
 def test_laplacian_basic_properties():
@@ -39,3 +44,23 @@ def test_mean_value_laplacian_properties():
     # Row-sum should be ~0
     rowsum = np.array(L.sum(axis=1)).ravel()
     assert np.allclose(rowsum, 0.0, atol=1e-8)
+
+
+def test_starlab_cotangent_laplacian_matches_reference_scale():
+    # Regular tetrahedron: every opposite angle is 60 degrees, so Starlab's
+    # unhalved interior-edge weight is 2*cot(60) = 2/sqrt(3).
+    V = np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+        ]
+    )
+    F = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]])
+    L = starlab_cotangent_laplacian(V, F)
+    expected_weight = 2.0 / np.sqrt(3.0)
+    dense = L.toarray()
+    assert np.allclose(dense[np.triu_indices(4, k=1)], expected_weight)
+    assert np.allclose(np.diag(dense), -3.0 * expected_weight)
+    assert np.allclose(np.asarray(L.sum(axis=1)).ravel(), 0.0)

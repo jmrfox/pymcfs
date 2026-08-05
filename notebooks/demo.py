@@ -7,567 +7,475 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.5
 #   kernelspec:
-#     display_name: .venv
+#     display_name: Python 3
 #     language: python
 #     name: python3
 # ---
 
-# %%
-import os
-import numpy as np
-import trimesh as tm
+# %% [markdown]
+# # pymcfs demo: detailed MCFS run
+#
+# Walk through mean-curvature-flow skeletonization for one closed triangle mesh:
+#
+# 1. load / validate the input
+# 2. inspect Voronoi medial poles
+# 3. contract with the Starlab-style MCFS driver (geometry + remesh + pinning)
+# 4. convert the meso-skeleton surface to a curve graph
+# 5. optional curve-graph refinement (downsample / even spacing)
+# 6. quality check and export
+#
+# Change `MESH_PATH` (or use `example_mesh`) below to try another shape.
 
-from pymcfs.mesh import MeshManager, example_mesh
-from pymcfs.mcf import mean_curvature_flow
-from pymcfs.medial import compute_voronoi_poles
-from pymcfs.laplacian import cotangent_laplacian, mean_value_laplacian
-from pymcfs.skeleton import thin_mesh, skeletonize, curve_skeleton_from_mesh
+# %%
+from __future__ import annotations
 
 import logging
-logging.basicConfig(level=logging.INFO)
+from collections import Counter
+from pathlib import Path
 
-# mesh = example_mesh("cylinder", radius=1, height=10, sections=32)
-mesh = example_mesh("torus", major_radius=1.0, minor_radius=0.3, major_sections=32, minor_sections=8)
+import networkx as nx
+import numpy as np
+import plotly.graph_objects as go
+import trimesh as tm
+
+from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
+from pymcfs.medial import compute_voronoi_poles
+from pymcfs.mesh import MeshManager, example_mesh
+from pymcfs.quality import analyze_skeleton
+from pymcfs.skeleton import Skeleton, refine_skeleton, skeletonize
+from pymcfs.validate import validate_mcfs_mesh
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("pymcfs.demo")
+
+ROOT = Path("..").resolve() if Path.cwd().name == "notebooks" else Path.cwd()
+DATA = ROOT / "data" / "mesh"
+OUT = ROOT / "outputs" / "demo"
+OUT.mkdir(parents=True, exist_ok=True)
+
+# Pick one mesh: a file under data/mesh/, or set MESH_PATH = None and use EXAMPLE.
+MESH_PATH: Path | None = DATA / "cylinder.obj"
+EXAMPLE: str | None = None  # e.g. "cylinder" / "torus" when MESH_PATH is None
+
+# MCFS weights (Starlab / CGAL defaults)
+W_H = 0.1   # attraction to current positions
+W_M = 0.2   # attraction to Voronoi poles (0 disables medial term)
+MAX_ITERS = 500
+TIMEOUT_S = 120.0
+SNAPSHOT_EVERY = 25  # save meso-surface every N contraction iterations
+
+print(f"ROOT={ROOT}")
+print(f"OUT={OUT}")
+
+# %% [markdown]
+# ## 1. Load and validate
 
 # %%
-mm = MeshManager(mesh)
+if MESH_PATH is not None:
+    mesh_path = Path(MESH_PATH)
+    if not mesh_path.is_file():
+        raise FileNotFoundError(f"Mesh not found: {mesh_path}")
+    mm = MeshManager(verbose=True)
+    mesh = mm.load_mesh(str(mesh_path), validate_mcfs=True)
+    mesh_name = mesh_path.stem
+    print(f"Loaded {mesh_path}")
+else:
+    kind = EXAMPLE or "cylinder"
+    mesh = example_mesh(kind)
+    mm = MeshManager(mesh, verbose=True)
+    mesh_name = kind
+    print(f"Built example_mesh({kind!r})")
+
+validate_mcfs_mesh(mesh)  # raises if not a closed watertight triangle mesh
 mm.print_mesh_analysis()
-mm.visualize_mesh_3d()
-
+print(
+    f"n={len(mesh.vertices)} f={len(mesh.faces)} "
+    f"watertight={mesh.is_watertight} volume={float(mesh.volume):.4g}"
+)
 
 # %%
-V = np.asarray(mesh.vertices)
+fig_input = mm.visualize_mesh_3d(title=f"Input: {mesh_name}", backend="plotly")
+fig_input
+
+# %% [markdown]
+# ## 2. Voronoi medial poles
+#
+# Each vertex gets an inner Voronoi pole used by the `w_M` term. MCFS stores these
+# on the driver; here we compute them once for visualization.
+
+# %%
+poles, pole_weights = compute_voronoi_poles(mesh)
+offsets = np.linalg.norm(poles - np.asarray(mesh.vertices), axis=1)
+print(
+    f"poles: shape={poles.shape} weight_range=[{pole_weights.min():.3g}, {pole_weights.max():.3g}] "
+    f"offset mean={offsets.mean():.4g} max={offsets.max():.4g}"
+)
+
+# Subsample pole segments so the plot stays readable.
+rng = np.random.default_rng(0)
+n_show = min(200, len(mesh.vertices))
+idx = rng.choice(len(mesh.vertices), size=n_show, replace=False)
+V = np.asarray(mesh.vertices, dtype=float)
 F = np.asarray(mesh.faces, dtype=int)
 
-# Cotangent Laplacian (robust mode clamps negative cot weights)
-L_cot = cotangent_laplacian(V, F, secure=True)
-print("Cotangent L: shape=", L_cot.shape, "nnz=", L_cot.nnz)
+xs, ys, zs = [], [], []
+for i in idx:
+    p, q = V[i], poles[i]
+    xs += [p[0], q[0], None]
+    ys += [p[1], q[1], None]
+    zs += [p[2], q[2], None]
 
-# Mean-value Laplacian
-L_mvl = mean_value_laplacian(V, F)
-print("Mean-value L: shape=", L_mvl.shape, "nnz=", L_mvl.nnz)
+fig_poles = go.Figure(
+    data=[
+        go.Mesh3d(
+            x=V[:, 0], y=V[:, 1], z=V[:, 2],
+            i=F[:, 0], j=F[:, 1], k=F[:, 2],
+            color="#AAAAAA", opacity=0.25, name="mesh", flatshading=True,
+        ),
+        go.Scatter3d(
+            x=xs, y=ys, z=zs, mode="lines",
+            line=dict(color="#d62728", width=2), name="pole rays",
+        ),
+        go.Scatter3d(
+            x=poles[idx, 0], y=poles[idx, 1], z=poles[idx, 2],
+            mode="markers",
+            marker=dict(size=2, color="#ff7f0e"), name="poles",
+        ),
+    ]
+)
+fig_poles.update_layout(title=f"Voronoi poles ({n_show}/{len(V)} shown)", scene_aspectmode="data")
+fig_poles
+
+# %% [markdown]
+# ## 3. MCFS contraction (step by step)
+#
+# Each `contract()` iteration is:
+#
+# `contract_geometry → collapse_edges → split_faces → detect_degeneracies`
+#
+# We run the loop ourselves so we can snapshot area / topology along the way.
+# (`contract_until_convergence()` does the same stopping criteria internally.)
 
 # %%
-# Unguided implicit MCF (cotangent, secure weights)
-mcf_res = mean_curvature_flow(
+driver = MeanCurvatureFlowSkeletonization(
     mesh,
-    dt=1e-3,
-    iterations=300,
-    laplacian_type="cotangent",
-    laplacian_secure=True,
+    w_H=W_H,
+    w_M=W_M,
+    max_iterations=MAX_ITERS,
+    timeout_seconds=TIMEOUT_S,
+    verbose=True,
+    log=log,
 )
 
-V_after = mcf_res.vertices
-mesh_after = tm.Trimesh(vertices=V_after, faces=mesh.faces, process=False)
-print("Volume: before=", mesh.volume, " after=", mesh_after.volume)
-mm_after = MeshManager(mesh_after)
-mm_after.visualize_mesh_3d()
-
-# %%
-# "original" guidance pulls vertices back towards the initial shape during flow
-mcf_guided = mean_curvature_flow(
-    mesh,
-    dt=2e-3,
-    iterations=5000,
-    laplacian_type="cotangent",
-    laplacian_secure=True,
-    guidance_type="original",
-    guidance_weight=0.1,  # increase to preserve more shape
+history: list[dict] = []
+prev_area = float(driver._surface_area())
+area0 = float(driver._area0)
+print(
+    f"start: n={driver.V.shape[0]} f={driver.F.shape[0]} "
+    f"area0={area0:.4g} min_edge={driver._min_edge:.4g} "
+    f"w_H={W_H} w_M={W_M}"
 )
 
-V_guid = mcf_guided.vertices
-mesh_guid = tm.Trimesh(vertices=V_guid, faces=mesh.faces, process=False)
-print("Volume (guided): before=", mesh.volume, " after=", mesh_guid.volume)
-mm_guid = MeshManager(mesh_guid)
-mm_guid.visualize_mesh_3d()
+if driver.timeout_seconds is not None and driver.timeout_seconds > 0:
+    import time as _time
+    driver._deadline = _time.monotonic() + float(driver.timeout_seconds)
+else:
+    driver._deadline = None
+
+last_it = 0
+for it in range(1, int(driver.max_iterations) + 1):
+    last_it = it
+    driver._iter = it
+    if driver._timed_out():
+        print(f"timeout at iter {it - 1}")
+        break
+
+    driver.contract()
+    area = float(driver._surface_area())
+    record = {
+        "iter": it,
+        "n": int(driver.V.shape[0]),
+        "f": int(driver.F.shape[0]),
+        "area": area,
+        "d_area": abs(prev_area - area),
+        "fixed": int(driver.fixed.sum()),
+        "split": int(driver.is_split.sum()),
+    }
+    history.append(record)
+
+    if it == 1 or it % SNAPSHOT_EVERY == 0:
+        print(
+            f"iter {it:4d}: n={record['n']:5d} f={record['f']:5d} "
+            f"area={area:.4g} dA={record['d_area']:.4g} "
+            f"fixed={record['fixed']} split={record['split']}"
+        )
+
+    if prev_area > 0 and abs(prev_area - area) < driver.area_variation_factor * max(area0, 1e-30):
+        print(f"converged at iter {it} area={area:.4g}")
+        break
+    prev_area = area
+    if driver.F.shape[0] == 0:
+        break
+
+print(f"finished after {last_it} iterations; meso n={driver.V.shape[0]} f={driver.F.shape[0]}")
 
 # %%
-# Compute per-vertex medial targets and weights
-targets, weights = compute_voronoi_poles(mesh)  # targets: (n,3), weights in [0,1]
-print("Voronoi targets/weights:", targets.shape, weights.shape)
-
-# Run MCF with per-vertex diagonal guidance
-mcf_medial = mean_curvature_flow(
-    mesh,
-    dt=1e-2,
-    iterations=10,
-    laplacian_type="cotangent",
-    laplacian_secure=True,
-    guidance_targets=targets,
-    guidance_diag=weights * 0.5,  # scale weights for overall effect
+iters = [h["iter"] for h in history]
+fig_hist = go.Figure()
+fig_hist.add_trace(go.Scatter(x=iters, y=[h["area"] for h in history], name="area"))
+fig_hist.add_trace(go.Scatter(x=iters, y=[h["n"] for h in history], name="#vertices", yaxis="y2"))
+fig_hist.add_trace(go.Scatter(x=iters, y=[h["fixed"] for h in history], name="#fixed", yaxis="y2"))
+fig_hist.update_layout(
+    title="Contraction progress",
+    xaxis_title="iteration",
+    yaxis=dict(title="surface area"),
+    yaxis2=dict(title="count", overlaying="y", side="right"),
+    legend=dict(orientation="h"),
 )
-V_medial = mcf_medial.vertices
+fig_hist
+
+# %% [markdown]
+# ## 4. Meso-skeleton surface
+#
+# After convergence the mesh is a thin “sheet” around the medial axis (still a surface).
 
 # %%
-V_thin, F_thin = thin_mesh(
+meso = driver.meso_skeleton_mesh()
+print(f"meso-skeleton: n={len(meso.vertices)} f={len(meso.faces)}")
+mm_meso = MeshManager(meso, verbose=False)
+fig_meso = mm_meso.visualize_mesh_3d(title="Meso-skeleton surface", backend="plotly")
+fig_meso
+
+# %% [markdown]
+# ## 5. Convert to curve skeleton (raw)
+#
+# Starlab collapses remaining face-bearing edges in length-priority order. Survivors
+# sit at the centroid of collapsed meso-skeleton vertices.
+#
+# Refinement is **off** here so you see the dense, often irregular raw curve graph.
+
+# %%
+def _summarize_skeleton(skel: Skeleton, label: str) -> dict:
+    G = skel.graph
+    deg = Counter(dict(G.degree()).values())
+    n_cc = nx.number_connected_components(G) if G.number_of_nodes() else 0
+    cyclomatic = (
+        int(G.number_of_edges() - G.number_of_nodes() + n_cc) if G.number_of_nodes() else 0
+    )
+    lengths = (
+        np.array([float(d.get("weight", 0.0)) for _, _, d in G.edges(data=True)], dtype=float)
+        if G.number_of_edges()
+        else np.zeros(0)
+    )
+    info = {
+        "label": label,
+        "nodes": skel.nodes.shape[0],
+        "edges": skel.edges.shape[0],
+        "components": n_cc,
+        "cyclomatic": cyclomatic,
+        "degree": dict(sorted(deg.items())),
+        "leaves": deg.get(1, 0),
+        "junctions": sum(c for d, c in deg.items() if d >= 3),
+        "edge_len_mean": float(lengths.mean()) if lengths.size else 0.0,
+        "edge_len_std": float(lengths.std()) if lengths.size else 0.0,
+        "edge_len_min": float(lengths.min()) if lengths.size else 0.0,
+        "edge_len_max": float(lengths.max()) if lengths.size else 0.0,
+        "lengths": lengths,
+    }
+    print(
+        f"{label}: nodes={info['nodes']} edges={info['edges']} "
+        f"cc={n_cc} cyclomatic={cyclomatic}"
+    )
+    print(f"  degree histogram: {info['degree']}")
+    print(
+        f"  leaves={info['leaves']} junctions={info['junctions']} | "
+        f"edge length mean={info['edge_len_mean']:.4g} std={info['edge_len_std']:.4g} "
+        f"[{info['edge_len_min']:.4g}, {info['edge_len_max']:.4g}]"
+    )
+    return info
+
+
+skel_raw = driver.convert_to_skeleton(refine=False)
+raw_info = _summarize_skeleton(skel_raw, "raw")
+
+# %%
+fig_raw = skel_raw.plot_3d(
     mesh,
-    mcf_dt=2e-2,
-    mcf_iters=30,
-    laplacian_type="cotangent",
-    guidance_type=None,       # or "voronoi" with guidance_weight>0 for medial protection
-    guidance_weight=0.0,
-    collapse_passes=2,
-    collapse_percentile=0.3,
-    preserve_branch_degree=3,
-    collapse_mode="percentile",  # or "pq" / "pq_heap"
-    collapse_ratio=0.1,
-    medial_protect=False,     # set True with "voronoi" to protect near-pole edges
-    medial_protect_threshold=0.5,
+    show_nodes=True,
+    node_size=3,
+    mesh_opacity=0.15,
+    title=f"Raw skeleton: {mesh_name}",
+    autoshow=False,
+)
+fig_raw
+
+# %% [markdown]
+# ## 6. Optional refinement
+#
+# MCFS often produces more sample points than needed, with uneven spacing along the
+# medial axis. Refinement is a **non-core** post-step (`refine=False` by default):
+#
+# | option | behavior |
+# |---|---|
+# | `refine=True` / `"uniform"` | arc-length resample chains between junctions/leaves |
+# | `refine_spacing=...` | absolute target segment length |
+# | `refine_spacing_frac=...` | spacing as a fraction of skeleton bbox diagonal |
+# | `refine="compress"` | keep only junctions and leaves (drop all degree-2 nodes) |
+#
+# Default uniform spacing is `2 × median edge length` (mild downsample + evening).
+# Junctions/leaves stay fixed; curvature along chains is preserved.
+
+# %%
+# Mild default refine (also available as skeletonize(..., refine=True)).
+skel_uniform = refine_skeleton(skel_raw, mode="uniform")
+uniform_info = _summarize_skeleton(skel_uniform, "uniform (default spacing)")
+
+# Explicit spacing relative to bbox diagonal (~2% → coarser).
+skel_frac = refine_skeleton(skel_raw, mode="uniform", spacing_frac=0.02)
+frac_info = _summarize_skeleton(skel_frac, "uniform (spacing_frac=0.02)")
+
+# Junction-only compress (aggressive).
+skel_compress = refine_skeleton(skel_raw, mode="compress")
+compress_info = _summarize_skeleton(skel_compress, "compress")
+
+# Use the default uniform refine for the rest of the notebook.
+skel = skel_uniform
+
+# %%
+# Edge-length histograms: raw vs refined.
+fig_len = go.Figure()
+for info, color in (
+    (raw_info, "#1f77b4"),
+    (uniform_info, "#2ca02c"),
+    (frac_info, "#ff7f0e"),
+):
+    if info["lengths"].size == 0:
+        continue
+    fig_len.add_trace(
+        go.Histogram(
+            x=info["lengths"],
+            name=info["label"],
+            opacity=0.55,
+            marker_color=color,
+            nbinsx=30,
+        )
+    )
+fig_len.update_layout(
+    barmode="overlay",
+    title="Edge length distribution: raw vs refined",
+    xaxis_title="edge length",
+    yaxis_title="count",
+    legend=dict(orientation="h"),
+)
+fig_len
+
+# %%
+def _overlay_skeletons(
+    mesh: tm.Trimesh,
+    skels: list[tuple[Skeleton, str, str]],
+    *,
+    title: str,
+) -> go.Figure:
+    """Plot several skeletons on the same mesh (different colors)."""
+    V = np.asarray(mesh.vertices, dtype=float)
+    F = np.asarray(mesh.faces, dtype=int)
+    traces: list = [
+        go.Mesh3d(
+            x=V[:, 0], y=V[:, 1], z=V[:, 2],
+            i=F[:, 0], j=F[:, 1], k=F[:, 2],
+            color="#CCCCCC", opacity=0.12, name="mesh", flatshading=True,
+        )
+    ]
+    for sk, name, color in skels:
+        P = np.asarray(sk.nodes, dtype=float)
+        E = np.asarray(sk.edges, dtype=int)
+        xs, ys, zs = [], [], []
+        for a, b in E:
+            pa, pb = P[int(a)], P[int(b)]
+            xs += [float(pa[0]), float(pb[0]), None]
+            ys += [float(pa[1]), float(pb[1]), None]
+            zs += [float(pa[2]), float(pb[2]), None]
+        traces.append(
+            go.Scatter3d(
+                x=xs, y=ys, z=zs, mode="lines",
+                line=dict(color=color, width=5), name=f"{name} edges",
+            )
+        )
+        traces.append(
+            go.Scatter3d(
+                x=P[:, 0], y=P[:, 1], z=P[:, 2], mode="markers",
+                marker=dict(size=3, color=color), name=f"{name} nodes",
+            )
+        )
+    fig = go.Figure(data=traces)
+    fig.update_layout(title=title, scene_aspectmode="data", legend=dict(orientation="h"))
+    return fig
+
+
+fig_compare = _overlay_skeletons(
+    mesh,
+    [
+        (skel_raw, "raw", "#1f77b4"),
+        (skel_uniform, "uniform", "#2ca02c"),
+    ],
+    title=f"Raw vs uniform refine: {mesh_name}",
+)
+fig_compare
+
+# %%
+fig_compress = skel_compress.plot_3d(
+    mesh,
+    show_nodes=True,
+    node_size=5,
+    edge_color="#d62728",
+    mesh_opacity=0.15,
+    title=f"compress mode (junctions/leaves only): {mesh_name}",
+    autoshow=False,
+)
+fig_compress
+
+# %% [markdown]
+# ## 7. Quality report and export
+#
+# Exports use the default **uniform** refined skeleton from above.
+
+# %%
+report = analyze_skeleton(mesh, skel)
+print(report.summary())
+
+out_dir = OUT / mesh_name
+out_dir.mkdir(parents=True, exist_ok=True)
+skel_raw.write_swc(str(out_dir / "skeleton_raw.swc"))
+skel.write_swc(str(out_dir / "skeleton.swc"))
+skel.write_polylines(str(out_dir / "skeleton.polylines.txt"))
+meso.export(str(out_dir / "meso_skeleton.obj"))
+fig_compare.write_html(str(out_dir / "skeleton_refine_compare.html"))
+print(f"wrote outputs under {out_dir}")
+
+# %% [markdown]
+# ## 8. One-liner equivalent
+#
+# `skeletonize(..., refine=True)` runs contraction + conversion + default uniform
+# refine in one call.
+
+# %%
+skel_quick = skeletonize(
+    mesh,
+    w_H=W_H,
+    w_M=W_M,
+    max_iterations=MAX_ITERS,
+    timeout_seconds=TIMEOUT_S,
+    refine=True,
     verbose=False,
 )
-print("Thinned mesh V/F:", V_thin.shape, F_thin.shape)
-
-# %%
-# DEBUG: Analyze edge length distributions before skeletonization
-import matplotlib.pyplot as plt
-from scipy.spatial.distance import pdist, squareform
-
-# First run MCF to get contracted mesh
-mcf_debug = mean_curvature_flow(
-    mesh,
-    dt=2e-2,
-    iterations=50,
-    laplacian_type="cotangent",
-    laplacian_secure=True,
-    guidance_type=None,
+print(
+    f"skeletonize(refine=True): nodes={skel_quick.nodes.shape[0]} edges={skel_quick.edges.shape[0]} "
+    f"(notebook uniform: {skel.nodes.shape[0]} / {skel.edges.shape[0]}; "
+    f"raw: {skel_raw.nodes.shape[0]} / {skel_raw.edges.shape[0]})"
 )
-
-V_contracted = mcf_debug.vertices
-mesh_contracted = tm.Trimesh(vertices=V_contracted, faces=mesh.faces, process=False)
-
-# Analyze edge lengths on contracted mesh
-edges = mesh_contracted.edges_unique
-edge_lengths = np.linalg.norm(V_contracted[edges[:, 0]] - V_contracted[edges[:, 1]], axis=1)
-
-print(f"Contracted mesh edges: {len(edges)}")
-print(f"Edge length stats: min={edge_lengths.min():.6f}, max={edge_lengths.max():.6f}, mean={edge_lengths.mean():.6f}")
-print(f"Edge length percentiles: 25%={np.percentile(edge_lengths, 25):.6f}, 50%={np.percentile(edge_lengths, 50):.6f}, 75%={np.percentile(edge_lengths, 75):.6f}")
-
-# Test different collapse thresholds
-test_thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
-for q in test_thresholds:
-    threshold = np.percentile(edge_lengths, q)
-    count_below = np.sum(edge_lengths < threshold)
-    print(f"Threshold at {q*100:.0f} percentile: {threshold:.6f} (affects {count_below} edges)")
-
-plt.figure(figsize=(10, 4))
-plt.subplot(1, 2, 1)
-plt.hist(edge_lengths, bins=50, alpha=0.7)
-plt.xlabel('Edge Length')
-plt.ylabel('Count')
-plt.title('Edge Length Distribution')
-plt.subplot(1, 2, 2)
-plt.boxplot(edge_lengths, vert=False)
-plt.xlabel('Edge Length')
-plt.title('Edge Length Boxplot')
-plt.tight_layout()
-plt.show()
-
-# Visualize contracted mesh
-mm_debug = MeshManager(mesh_contracted)
-mm_debug.visualize_mesh_3d()
-
-
-# %%
-# DEBUG: Test different collapse strategies and parameters
-def test_collapse_strategy(params, name):
-    print(f"\n=== Testing {name} ===")
-    skel_test = skeletonize(
-        mesh,
-        mcf_dt=2e-2,
-        mcf_iters=50,
-        laplacian_type="cotangent",
-        guidance_type=None,
-        build_graph="mesh",
-        knn=12,
-        length_quantile=0.7,
-        collapse_passes=3,
-        # preserve_branch_degree=3,
-        verbose=False,
-        **params
-    )
-    print(f"Result: nodes={skel_test.nodes.shape[0]}, edges={skel_test.edges.shape[0]}")
-    return skel_test
-
-# Test 1: More aggressive percentile threshold
-skel_aggressive = test_collapse_strategy({
-    'collapse_mode': 'percentile',
-    'collapse_percentile': 0.1,  # Much lower threshold
-}, 'Aggressive Percentile (10%)')
-
-# Test 2: PQ mode with higher ratio
-skel_pq = test_collapse_strategy({
-    'collapse_mode': 'pq',
-    'collapse_ratio': 0.3,  # Higher collapse ratio
-}, 'PQ Mode (30% ratio)')
-
-# Test 3: PQ heap mode
-skel_heap = test_collapse_strategy({
-    'collapse_mode': 'pq_heap',
-    'collapse_ratio': 0.2,
-}, 'PQ Heap Mode (20% ratio)')
-
-# Test 4: Lower preserve_branch_degree
-skel_low_degree = test_collapse_strategy({
-    'collapse_mode': 'percentile',
-    'collapse_percentile': 0.2,
-    'preserve_branch_degree': 2,  # Allow collapsing at degree-2 nodes
-}, 'Low Degree Preservation (degree 2)')
-
-# Visualize comparisons
-fig = plt.figure(figsize=(15, 10))
-results = [
-    (skel_aggressive, 'Aggressive Percentile'),
-    (skel_pq, 'PQ Mode'),
-    (skel_heap, 'PQ Heap'),
-    (skel_low_degree, 'Low Degree')
-]
-
-for i, (skel_result, title) in enumerate(results, 1):
-    ax = fig.add_subplot(2, 2, i, projection='3d')
-    # Plot skeleton edges
-    for edge in skel_result.edges:
-        points = skel_result.nodes[edge]
-        ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'b-', linewidth=1)
-    # Plot nodes
-    ax.scatter(skel_result.nodes[:, 0], skel_result.nodes[:, 1], skel_result.nodes[:, 2], 
-              c='red', s=20, alpha=0.6)
-    ax.set_title(f'{title}\n({skel_result.nodes.shape[0]} nodes, {skel_result.edges.shape[0]} edges)')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-
-plt.tight_layout()
-plt.show()
-
-# %%
-# DEBUG: Test different mesh types for comparison
-print("=== Testing Different Mesh Types ===")
-
-def test_mesh_skeletonization(mesh_obj, name):
-    print(f"\n--- Testing {name} ---")
-    print(f"Original mesh: {mesh_obj.vertices.shape[0]} vertices, {mesh_obj.faces.shape[0]} faces")
-    
-    # Analyze original mesh
-    mm_test = MeshManager(mesh_obj)
-    
-    # Test skeletonization with adjusted parameters
-    skel_test = skeletonize(
-        mesh_obj,
-        mcf_dt=1e-2,  # Smaller dt for stability
-        mcf_iters=30,  # Fewer iterations
-        laplacian_type="cotangent",
-        guidance_type="original",  # Use guidance to preserve shape
-        guidance_weight=0.05,
-        build_graph="mesh",
-        knn=8,  # Smaller kNN
-        collapse_passes=2,
-        collapse_mode="percentile",
-        collapse_percentile=0.15,  # More aggressive
-        preserve_branch_degree=2,  # Allow more collapse
-        verbose=False,
-    )
-    
-    print(f"Result: {skel_test.nodes.shape[0]} nodes, {skel_test.edges.shape[0]} edges")
-    return skel_test, mesh_obj
-
-# Test different primitive meshes
-mesh_sphere = tm.primitives.Sphere(radius=1.0, subdivisions=2)
-mesh_cylinder = tm.primitives.Cylinder(radius=0.5, height=2.0, sections=16)
-mesh_cube = tm.primitives.Box(extents=[1, 1, 1])
-
-# Run tests
-skel_sphere, sphere_mesh = test_mesh_skeletonization(mesh_sphere, "Sphere")
-skel_cylinder, cylinder_mesh = test_mesh_skeletonization(mesh_cylinder, "Cylinder") 
-skel_cube, cube_mesh = test_mesh_skeletonization(mesh_cube, "Cube")
-
-# Visualize all results
-fig = plt.figure(figsize=(15, 10))
-meshes_and_skeletons = [
-    (sphere_mesh, skel_sphere, "Sphere"),
-    (cylinder_mesh, skel_cylinder, "Cylinder"),
-    (cube_mesh, skel_cube, "Cube")
-]
-
-for i, (mesh_vis, skel_vis, name) in enumerate(meshes_and_skeletons, 1):
-    ax = fig.add_subplot(2, 3, i, projection='3d')
-    # Plot mesh (semi-transparent)
-    ax.plot_trisurf(mesh_vis.vertices[:, 0], mesh_vis.vertices[:, 1], mesh_vis.vertices[:, 2],
-                   triangles=mesh_vis.faces, alpha=0.3, color='lightblue')
-    # Plot skeleton
-    for edge in skel_vis.edges:
-        points = skel_vis.nodes[edge]
-        ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'r-', linewidth=2)
-    ax.scatter(skel_vis.nodes[:, 0], skel_vis.nodes[:, 1], skel_vis.nodes[:, 2],
-              c='red', s=30, alpha=0.8)
-    ax.set_title(f'{name}\nSkeleton: {skel_vis.nodes.shape[0]} nodes')
-
-plt.tight_layout()
-plt.show()
-
-# %%
-# DEBUG: Manual edge collapse analysis
-print("=== Manual Edge Collapse Analysis ===")
-
-# Get contracted mesh
-mcf_manual = mean_curvature_flow(
+skel_quick.plot_3d(
     mesh,
-    dt=2e-2,
-    iterations=50,
-    laplacian_type="cotangent",
-    laplacian_secure=True,
+    show_nodes=True,
+    title=f"skeletonize(refine=True): {mesh_name}",
+    autoshow=False,
 )
-V_contracted = mcf_manual.vertices
-mesh_contracted = tm.Trimesh(vertices=V_contracted, faces=mesh.faces, process=False)
-
-# Build mesh-edge graph manually
-edges = mesh_contracted.edges_unique
-edge_lengths = np.linalg.norm(V_contracted[edges[:, 0]] - V_contracted[edges[:, 1]], axis=1)
-
-# Sort edges by length
-sorted_indices = np.argsort(edge_lengths)
-sorted_edges = edges[sorted_indices]
-sorted_lengths = edge_lengths[sorted_indices]
-
-print(f"Total edges: {len(edges)}")
-print(f"Shortest 10 edges:")
-for i in range(min(10, len(sorted_edges))):
-    e = sorted_edges[i]
-    length = sorted_lengths[i]
-    print(f"  {i+1}: edge {e}, length = {length:.6f}")
-
-# Analyze vertex degrees
-vertex_degrees = np.zeros(V_contracted.shape[0], dtype=int)
-for edge in edges:
-    vertex_degrees[edge[0]] += 1
-    vertex_degrees[edge[1]] += 1
-
-print(f"\nVertex degree distribution:")
-unique_degrees, counts = np.unique(vertex_degrees, return_counts=True)
-for deg, count in zip(unique_degrees, counts):
-    print(f"  Degree {deg}: {count} vertices")
-
-# Test manual collapse with different thresholds
-thresholds = [0.01, 0.02, 0.05, 0.1, 0.2]
-for thresh in thresholds:
-    collapsible_edges = []
-    for i, (edge, length) in enumerate(zip(sorted_edges, sorted_lengths)):
-        if length > thresh:
-            break
-        # Check if either endpoint has high degree (>= 3)
-        if vertex_degrees[edge[0]] >= 3 or vertex_degrees[edge[1]] >= 3:
-            continue
-        collapsible_edges.append(i)
-    
-    print(f"Threshold {thresh:.3f}: {len(collapsible_edges)} edges can collapse (out of {len(edges)} total)")
-
-# Visualize shortest edges
-fig = plt.figure(figsize=(10, 4))
-ax1 = fig.add_subplot(1, 2, 1)
-ax1.plot(sorted_lengths[:50], 'bo-')
-ax1.set_xlabel('Edge Rank (by length)')
-ax1.set_ylabel('Edge Length')
-ax1.set_title('Shortest 50 Edge Lengths')
-ax1.grid(True)
-
-ax2 = fig.add_subplot(1, 2, 2)
-ax2.hist(edge_lengths, bins=30, alpha=0.7)
-ax2.axvline(x=np.percentile(edge_lengths, 30), color='red', linestyle='--', label='30th percentile')
-ax2.axvline(x=np.percentile(edge_lengths, 10), color='orange', linestyle='--', label='10th percentile')
-ax2.set_xlabel('Edge Length')
-ax2.set_ylabel('Count')
-ax2.set_title('Edge Length Distribution with Percentiles')
-ax2.legend()
-
-plt.tight_layout()
-plt.show()
-
-# %%
-# DEBUG: Test Voronoi guidance impact on skeletonization
-print("=== Testing Voronoi Guidance Impact ===")
-
-# Compute Voronoi poles
-targets, weights = compute_voronoi_poles(mesh)
-print(f"Voronoi analysis: {targets.shape[0]} poles computed")
-print(f"Weight stats: min={weights.min():.3f}, max={weights.max():.3f}, mean={weights.mean():.3f}")
-
-# Test skeletonization with different guidance strategies
-def test_guidance_strategy(guidance_type, guidance_weight, name):
-    print(f"\n--- Testing {name} ---")
-    skel_guided = skeletonize(
-        mesh,
-        mcf_dt=2e-2,
-        mcf_iters=50,
-        laplacian_type="cotangent",
-        guidance_type=guidance_type,
-        guidance_weight=guidance_weight,
-        build_graph="mesh",
-        knn=12,
-        collapse_passes=3,
-        collapse_mode="percentile",
-        collapse_percentile=0.2,  # More aggressive to see differences
-        preserve_branch_degree=3,
-        medial_protect=(guidance_type == "voronoi"),
-        medial_protect_threshold=0.5,
-        verbose=False,
-    )
-    print(f"Result: {skel_guided.nodes.shape[0]} nodes, {skel_guided.edges.shape[0]} edges")
-    return skel_guided
-
-# Compare guidance strategies
-skel_none = test_guidance_strategy(None, 0.0, "No guidance")
-skel_original = test_guidance_strategy("original", 0.1, "Original guidance (w=0.1)")
-skel_centroid = test_guidance_strategy("centroid", 0.05, "Centroid guidance (w=0.05)")
-skel_voronoi = test_guidance_strategy("voronoi", 0.5, "Voronoi guidance (w=0.5)")
-
-# Visualize comparison
-fig = plt.figure(figsize=(12, 8))
-results = [
-    (skel_none, 'No Guidance'),
-    (skel_original, 'Original Guidance'),
-    (skel_centroid, 'Centroid Guidance'),
-    (skel_voronoi, 'Voronoi Guidance')
-]
-
-for i, (skel_result, title) in enumerate(results, 1):
-    ax = fig.add_subplot(2, 2, i, projection='3d')
-    # Plot skeleton
-    for edge in skel_result.edges:
-        points = skel_result.nodes[edge]
-        ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'b-', linewidth=1)
-    ax.scatter(skel_result.nodes[:, 0], skel_result.nodes[:, 1], skel_result.nodes[:, 2], 
-              c='red', s=15, alpha=0.6)
-    ax.set_title(f'{title}\n({skel_result.nodes.shape[0]} nodes, {skel_result.edges.shape[0]} edges)')
-
-plt.tight_layout()
-plt.show()
-
-
-# %%
-# DEBUG: Test different MCF contraction levels
-def test_mcf_contraction(dt, iters, name):
-    print(f"\n=== Testing MCF: {name} ===")
-    mcf_test = mean_curvature_flow(
-        mesh,
-        dt=dt,
-        iterations=iters,
-        laplacian_type="cotangent",
-        laplacian_secure=True,
-    )
-    V_test = mcf_test.vertices
-    mesh_test = tm.Trimesh(vertices=V_test, faces=mesh.faces, process=False)
-    
-    print(f"Volume: {mesh.volume:.6f} -> {mesh_test.volume:.6f} (ratio: {mesh_test.volume/mesh.volume:.6f})")
-    
-    # Analyze geometry
-    bounds = mesh_test.bounds
-    size = bounds[1] - bounds[0]
-    print(f"Bounds size: [{size[0]:.6f}, {size[1]:.6f}, {size[2]:.6f}]")
-    
-    return V_test, mesh_test
-
-# Test different contraction levels
-V_mild, mesh_mild = test_mcf_contraction(1e-2, 10, "Mild (dt=0.01, 10 iters)")
-V_moderate, mesh_moderate = test_mcf_contraction(2e-2, 25, "Moderate (dt=0.02, 25 iters)")
-V_aggressive, mesh_aggressive = test_mcf_contraction(2e-2, 50, "Aggressive (dt=0.02, 50 iters)")
-
-# Visualize contraction levels
-fig = plt.figure(figsize=(15, 5))
-meshes = [(mesh_mild, 'Mild'), (mesh_moderate, 'Moderate'), (mesh_aggressive, 'Aggressive')]
-
-for i, (mesh_vis, title) in enumerate(meshes, 1):
-    ax = fig.add_subplot(1, 3, i, projection='3d')
-    ax.plot_trisurf(mesh_vis.vertices[:, 0], mesh_vis.vertices[:, 1], mesh_vis.vertices[:, 2], 
-                   triangles=mesh_vis.faces, alpha=0.7, color='lightblue')
-    ax.set_title(f'{title}\nVolume: {mesh_vis.volume:.6f}')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-
-plt.tight_layout()
-plt.show()
-
-
-# %%
-# DEBUG: Test kNN graph construction vs mesh-edge graph (FIXED)
-def test_graph_construction(build_graph_type, knn_k=12):
-    print(f"\n=== Testing {build_graph_type} graph ===")
-    
-    # Run MCF first to get contracted points
-    mcf_knn = mean_curvature_flow(
-        mesh,
-        dt=2e-2,
-        iterations=50,
-        laplacian_type="cotangent",
-        laplacian_secure=True,
-    )
-    V_contracted = mcf_knn.vertices
-    
-    if build_graph_type == "mesh":
-        # Mesh-edge graph
-        mesh_contracted = tm.Trimesh(vertices=V_contracted, faces=mesh.faces, process=False)
-        edges = mesh_contracted.edges_unique
-        edge_lengths = np.linalg.norm(V_contracted[edges[:, 0]] - V_contracted[edges[:, 1]], axis=1)
-        print(f"Mesh-edge graph: {V_contracted.shape[0]} nodes, {edges.shape[0]} edges")
-        print(f"Edge length range: [{edge_lengths.min():.6f}, {edge_lengths.max():.6f}]")
-    else:
-        # kNN graph - build manually since _knn_graph is private
-        from scipy.spatial import cKDTree
-        import networkx as nx
-        
-        tree = cKDTree(V_contracted)
-        G_knn = nx.Graph()
-        
-        # Add nodes with positions
-        for i, point in enumerate(V_contracted):
-            G_knn.add_node(i, pos=point)
-        
-        # Add kNN edges
-        for i, point in enumerate(V_contracted):
-            distances, indices = tree.query(point, k=knn_k+1)  # +1 to include self
-            for j, neighbor_idx in enumerate(indices):
-                if neighbor_idx != i:  # Skip self
-                    dist = distances[j]
-                    if not G_knn.has_edge(i, neighbor_idx):
-                        G_knn.add_edge(i, neighbor_idx, weight=dist)
-        
-        edges_knn = np.array(list(G_knn.edges()))
-        node_positions = V_contracted
-        edge_lengths = np.linalg.norm(node_positions[edges_knn[:, 0]] - node_positions[edges_knn[:, 1]], axis=1)
-        print(f"kNN graph (k={knn_k}): {node_positions.shape[0]} nodes, {edges_knn.shape[0]} edges")
-        print(f"Edge length range: [{edge_lengths.min():.6f}, {edge_lengths.max():.6f}]")
-    
-    return edge_lengths
-
-# Compare graph types
-mesh_lengths = test_graph_construction("mesh")
-knn_lengths_6 = test_graph_construction("knn", knn_k=6)
-knn_lengths_12 = test_graph_construction("knn", knn_k=12)
-knn_lengths_20 = test_graph_construction("knn", knn_k=20)
-
-# Plot edge length distributions
-plt.figure(figsize=(12, 4))
-plt.subplot(1, 3, 1)
-plt.hist(mesh_lengths, bins=30, alpha=0.7, label='Mesh edges')
-plt.xlabel('Edge Length')
-plt.ylabel('Count')
-plt.title('Mesh-Edge Graph')
-plt.legend()
-
-plt.subplot(1, 3, 2)
-plt.hist(knn_lengths_6, bins=30, alpha=0.7, label='kNN k=6', color='orange')
-plt.hist(knn_lengths_12, bins=30, alpha=0.7, label='kNN k=12', color='green')
-plt.xlabel('Edge Length')
-plt.title('kNN Graphs')
-plt.legend()
-
-plt.subplot(1, 3, 3)
-plt.hist(knn_lengths_20, bins=30, alpha=0.7, label='kNN k=20', color='red')
-plt.xlabel('Edge Length')
-plt.title('kNN k=20')
-plt.legend()
-
-plt.tight_layout()
-plt.show()
-
-# %%

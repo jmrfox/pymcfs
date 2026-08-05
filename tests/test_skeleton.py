@@ -1,8 +1,12 @@
-import numpy as np
 import networkx as nx
+import numpy as np
 import trimesh as tm
 
-from pymcfs.skeleton import skeletonize
+from pymcfs.skeleton import (
+    skeletonize,
+    refine_skeleton,
+    _resample_polyline_arc_length,
+)
 from pymcfs.quality import analyze_skeleton
 
 
@@ -21,8 +25,8 @@ def test_skeletonize_resample_spacing():
         tor,
         max_iterations=20,
         w_M=0.0,
-        compress_chains=True,
-        resample_spacing=h,
+        refine=True,
+        refine_spacing=h,
     )
     assert skel.edges.shape[0] > 0
     G = skel.graph
@@ -30,9 +34,72 @@ def test_skeletonize_resample_spacing():
     assert max_w <= h * 1.05
 
 
+def test_skeletonize_refine_downsamples_and_evens():
+    # Axially sampled cylinder (trimesh.creation.cylinder only has end rings).
+    radial, stacks, radius, height = 24, 12, 0.5, 2.0
+    verts = []
+    for i in range(stacks + 1):
+        z = -0.5 * height + height * (i / stacks)
+        for j in range(radial):
+            th = 2.0 * np.pi * j / radial
+            verts.append([radius * np.cos(th), radius * np.sin(th), z])
+    verts.append([0.0, 0.0, -0.5 * height])
+    verts.append([0.0, 0.0, 0.5 * height])
+    bottom_c, top_c = len(verts) - 2, len(verts) - 1
+    faces = []
+    for i in range(stacks):
+        for j in range(radial):
+            a = i * radial + j
+            b = i * radial + (j + 1) % radial
+            c = (i + 1) * radial + j
+            d = (i + 1) * radial + (j + 1) % radial
+            faces.extend([[a, b, d], [a, d, c]])
+    for j in range(radial):
+        a, b = j, (j + 1) % radial
+        faces.append([bottom_c, b, a])
+        a = stacks * radial + j
+        b = stacks * radial + (j + 1) % radial
+        faces.append([top_c, a, b])
+    mesh = tm.Trimesh(vertices=np.asarray(verts), faces=np.asarray(faces), process=True)
+
+    raw = skeletonize(mesh, max_iterations=40, w_M=0.2, refine=False)
+    refined = skeletonize(mesh, max_iterations=40, w_M=0.2, refine=True)
+    assert refined.nodes.shape[0] <= raw.nodes.shape[0]
+    assert refined.edges.shape[0] > 0
+    G = refined.graph
+    assert nx.number_connected_components(G) == 1
+    deg = dict(G.degree())
+    assert sum(1 for d in deg.values() if d == 1) == 2
+
+
+def test_refine_skeleton_compress_and_spacing_frac():
+    mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    skel = skeletonize(mesh, max_iterations=20, w_M=0.0, refine=False)
+    compressed = refine_skeleton(skel, mode="compress")
+    assert compressed.nodes.shape[0] <= skel.nodes.shape[0]
+    assert all(d != 2 for _, d in compressed.graph.degree()) or compressed.graph.number_of_nodes() <= 2
+
+    even = refine_skeleton(skel, mode="uniform", spacing_frac=0.05)
+    assert even.nodes.shape[0] > 0
+    lengths = [float(d["weight"]) for _, _, d in even.graph.edges(data=True)]
+    if lengths:
+        diag = float(np.linalg.norm(even.nodes.max(0) - even.nodes.min(0)))
+        assert max(lengths) <= 0.05 * diag * 1.05 + 1e-9
+
+
+def test_resample_polyline_preserves_endpoints():
+    pts = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.15, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    out = _resample_polyline_arc_length(pts, spacing=0.25, closed=False)
+    assert out.shape[0] >= 2
+    assert np.allclose(out[0], pts[0])
+    assert np.allclose(out[-1], pts[-1])
+    segs = np.linalg.norm(out[1:] - out[:-1], axis=1)
+    assert segs.max() <= 0.25 + 1e-9
+
+
 def test_skeletonize_sphere():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
-    skel = skeletonize(mesh, max_iterations=25, w_M=0.0, compress_chains=True)
+    skel = skeletonize(mesh, max_iterations=25, w_M=0.0, refine="compress")
     assert skel.nodes.shape[0] >= 1
     assert skel.edges.shape[0] >= 0
     assert skel.nodes.shape[0] < len(mesh.vertices)
@@ -40,13 +107,18 @@ def test_skeletonize_sphere():
 
 def test_skeletonize_torus_runs():
     tor = tm.creation.torus(major_radius=2.0, minor_radius=0.5, major_sections=48, minor_sections=12)
-    skel = skeletonize(tor, max_iterations=25, w_M=0.0, compress_chains=False)
+    skel = skeletonize(tor, max_iterations=25, w_M=0.0, refine=False)
     assert skel.nodes.shape[0] > 0
+    G = skel.graph
+    assert nx.number_connected_components(G) == 1
+    cyclomatic = G.number_of_edges() - G.number_of_nodes() + 1
+    assert cyclomatic == 1
+    assert set(dict(G.degree()).values()) == {2}
 
 
 def test_skeletonize_with_medial_weight():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
-    skel = skeletonize(mesh, w_H=0.1, w_M=0.2, max_iterations=15, compress_chains=True)
+    skel = skeletonize(mesh, w_H=0.1, w_M=0.2, max_iterations=15, refine=True)
     assert skel.nodes.shape[0] > 0
 
 

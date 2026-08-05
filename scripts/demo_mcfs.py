@@ -99,7 +99,7 @@ def main():
         w_M=args.w_M,
         max_iterations=args.iters,
         timeout_seconds=timeout,
-        compress_chains=True,
+        refine=True,
         verbose=True,
     )
     print(f"Skeleton: {skel.nodes.shape[0]} nodes, {skel.edges.shape[0]} edges")

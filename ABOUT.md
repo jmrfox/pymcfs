@@ -30,8 +30,8 @@ This document explains the main algorithms implemented in `pymcfs`, which follow
 `pymcfs` turns a watertight triangle mesh into a 1D curve network called a "skeleton". 
 
 1. **Contract** the surface with a weighted mean-curvature solve (optional Voronoi-pole medial term).
-2. **Remesh locally**: collapse edges shorter than `min_edge_length`, then split faces with angles larger than `max_triangle_angle`.
-3. **Detect degeneracies**: pin vertices whose local neighborhood is no longer a topological disk.
+2. **Remesh locally**: collapse edges shorter than `min_edge_length`, then split shared edges whose two opposite angles exceed `max_triangle_angle`.
+3. **Detect degeneracies**: pin vertices incident to at least two ultra-short, non-collapsible edges.
 4. Repeat until the surface area change is small.
 5. **Convert** the contracted meso-skeleton into a curve graph by collapsing remaining face-bearing edges.
 
@@ -51,6 +51,11 @@ For an interior edge `(i, j)` shared by two triangles, the off-diagonal weight i
 - `L[i, j] = -1/2 * (cot α + cot β)`
 
 with diagonal `L[i, i] = -Σ_{j ≠ i} L[i, j]` (zero row-sum). See `pymcfs.laplacian.cotangent_laplacian(V, F)`. With `secure=True`, negative cotangents are clamped to zero.
+
+The MCFS contraction uses the separate Starlab-compatible operator
+`starlab_cotangent_laplacian`: its off-diagonal weight is the unhalved
+`cot α + cot β`, angle cosines are clamped to `[-0.999, 0.999]`, and only a
+negative summed edge weight is clamped to zero.
 
 ### Mean-value Laplacian
 
@@ -83,7 +88,18 @@ or `max_iterations` is reached. Then `convert_to_skeleton()` builds the curve gr
 
 ### Contraction system
 
-Per iteration we rebuild the cotangent Laplacian on the **current** `(V, F)` (connectivity changes after remesh) and solve a weighted system in the spirit of Tagliasacchi / CGAL / Starlab:
+Per iteration we rebuild the Starlab cotangent Laplacian on the **current**
+`(V, F)` and solve the same stacked least-squares system as
+`EigenContractionHelper`:
+
+```
+        [ W_L L ]             [    0    ]
+min_X ‖ [  W_H  ] X - [ W_H V_t ] ‖²
+        [  W_P  ]             [ W_P P  ]
+```
+
+The implementation solves the normal equations `(AᵀA)X = AᵀB`, matching the
+reference Eigen implementation.
 
 - `ω_L` — contraction (Laplacian) weight  
 - `ω_H` — attraction to current positions  
@@ -96,7 +112,7 @@ Fixed (pinned) vertices use `ω_L = 0`, `ω_H = 1/zero_TH`, `ω_P = 0`. Split ve
 Implemented in `pymcfs.remesh`:
 
 - **collapse_edges**: collapse edges with length `< min_edge_length` (default `0.002 × bbox_diagonal`) when the manifold link condition holds; midpoint merge; optional closest-pole update.
-- **split_faces**: if a triangle angle exceeds `max_triangle_angle` (default 110°), project the obtuse vertex onto the opposite edge and split.
+- **split_faces**: split an interior edge only when the angles opposite it in both incident triangles exceed `max_triangle_angle` (default 110°). The split updates both faces, preserving the closed manifold.
 
 This is the consolidation step as the surface shrinks—**not** a post-hoc graph degree filter.
 
@@ -106,7 +122,23 @@ Starlab/CGAL do **not** skip collapses based on mesh valence (typical valence is
 
 ### Convert meso-skeleton to curve
 
-After convergence, repeatedly collapse the shortest **face-bearing** edge until faces are gone (or residual surface edges remain as the curve). Edges that no longer bound faces are curve segments and are not collapsed. Optional post-process on the 1D NetworkX graph: compress degree-2 chains and uniform resample.
+After convergence, process edges in Starlab's length-priority order and collapse
+an edge only while it still has incident faces. Surviving graph vertices are
+placed at the centroid of the meso-skeleton vertices collapsed into them.
+
+Optional, non-core post-processing can refine the curve graph (disabled by
+default via `refine=False` on `skeletonize` / `convert_to_skeleton`):
+
+- `refine=True` / `"uniform"` — arc-length resample each chain between
+  junctions/leaves (and closed cycles) to a more even spacing. Default spacing
+  is `2 × median edge length` (mild downsample). Override with absolute
+  `refine_spacing` or relative `refine_spacing_frac` (fraction of skeleton bbox
+  diagonal).
+- `refine="compress"` — drop all degree-2 nodes; keep only junctions and leaves.
+
+Legacy `compress_chains` / `resample_spacing` map onto this path. Prefer
+chain-aware uniform refine over compress-then-chord-subdivide, which flattens
+curved medial paths.
 
 `skeletonize()` is a thin wrapper around this driver. `thin_mesh()` returns the meso-skeleton `(V, F)` without curve conversion.
 
@@ -147,7 +179,10 @@ CGAL’s published C++ API is the algorithmic guide; this package reimplements i
   CGAL-style driver: `contract_geometry`, `collapse_edges`, `split_faces`, `detect_degeneracies`, `contract`, `contract_until_convergence`, `convert_to_skeleton`.
 
 - `pymcfs.skeleton.skeletonize(mesh, ...) -> Skeleton`  
-  Full MCFS pipeline wrapper.
+  Full MCFS pipeline wrapper. Optional `refine=True` / `"uniform"` / `"compress"`.
+
+- `pymcfs.skeleton.refine_skeleton(skel, ...)` / `Skeleton.refine(...)`  
+  Post-hoc curve-graph refinement (arc-length resample or compress).
 
 - `pymcfs.skeleton.thin_mesh(mesh, ...) -> (V, F)`  
   Meso-skeleton surface after contraction + remesh.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union, Tuple, Dict, Iterable
+from typing import Literal, Optional, Union, Tuple, Dict, Iterable
 
 import logging
 import heapq
@@ -17,6 +17,9 @@ from .medial import compute_voronoi_poles
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+RefineMode = Literal["uniform", "compress"]
+
 
 @dataclass
 class Skeleton:
@@ -271,6 +274,20 @@ class Skeleton:
             fig.show()
         return fig
 
+    def refine(
+        self,
+        *,
+        mode: RefineMode = "uniform",
+        spacing: float | None = None,
+        spacing_frac: float | None = None,
+    ) -> "Skeleton":
+        """Return a copy with optional chain merge / arc-length resampling.
+
+        See :func:`refine_skeleton`.
+        """
+        return refine_skeleton(
+            self, mode=mode, spacing=spacing, spacing_frac=spacing_frac
+        )
 
 
 def _spanning_forest_by_mst(G: nx.Graph) -> tuple[nx.Graph, list[tuple[int, int]]]:
@@ -369,7 +386,10 @@ def skeletonize(
     min_edge_length: float | None = None,
     max_triangle_angle: float = 110.0,
     area_variation_factor: float = 1e-4,
-    compress_chains: bool = True,
+    refine: bool | RefineMode = False,
+    refine_spacing: float | None = None,
+    refine_spacing_frac: float | None = None,
+    compress_chains: bool = False,
     resample_spacing: float | None = None,
     validate: bool = True,
     verbose: bool = False,
@@ -383,6 +403,17 @@ def skeletonize(
 
     ``w_L`` is fixed at 1 (only weight ratios matter). Medial centering is used
     whenever ``w_M > 0``.
+
+    Optional post-conversion refinement (non-core; off by default):
+    - ``refine=True`` / ``"uniform"``: arc-length resample chains between
+      junctions/leaves to even spacing (mild downsample by default).
+    - ``refine="compress"``: drop all degree-2 nodes, keep only junctions/leaves.
+    - ``refine_spacing``: absolute target edge length for ``uniform``.
+    - ``refine_spacing_frac``: target spacing as a fraction of the skeleton bbox
+      diagonal (used when ``refine_spacing`` is omitted).
+
+    Legacy aliases: ``compress_chains`` and ``resample_spacing`` map onto the
+    same refine path when ``refine`` is left False.
     """
     _log = log or logger
     if isinstance(mesh, tm.Trimesh):
@@ -423,6 +454,9 @@ def skeletonize(
         _log.info("Skeleton: MCFS (max_iters=%d, w_H=%.3g, w_M=%.3g)", max_iterations, wh, wm)
     driver.contract_until_convergence()
     return driver.convert_to_skeleton(
+        refine=refine,
+        refine_spacing=refine_spacing,
+        refine_spacing_frac=refine_spacing_frac,
         compress_chains=bool(compress_chains),
         resample_spacing=resample_spacing,
     )
@@ -477,17 +511,27 @@ def curve_skeleton_from_mesh(
     V: np.ndarray,
     F: np.ndarray,
     *,
-    compress_chains: bool = True,
+    refine: bool | RefineMode = False,
+    refine_spacing: float | None = None,
+    refine_spacing_frac: float | None = None,
+    compress_chains: bool = False,
     resample_spacing: float | None = None,
 ) -> Skeleton:
     """Convert a triangle mesh surface to a curve graph skeleton."""
     from .mcfs import meso_surface_to_curve_graph
 
     G = meso_surface_to_curve_graph(V, F)
-    if compress_chains:
-        G = _compress_degree_two_chains(G)
-    if resample_spacing is not None and resample_spacing > 0:
-        G = _resample_edges_uniform(G, float(resample_spacing))
+    mode, spacing, spacing_frac = _resolve_refine_options(
+        refine=refine,
+        refine_spacing=refine_spacing,
+        refine_spacing_frac=refine_spacing_frac,
+        compress_chains=compress_chains,
+        resample_spacing=resample_spacing,
+    )
+    if mode is not None:
+        G = refine_skeleton_graph(
+            G, mode=mode, spacing=spacing, spacing_frac=spacing_frac
+        )
     mapping = {n: i for i, n in enumerate(G.nodes)}
     if mapping:
         G = nx.relabel_nodes(G, mapping, copy=True)
@@ -1103,6 +1147,8 @@ def _resample_edges_uniform(G_in: nx.Graph, spacing: float) -> nx.Graph:
 
     Builds a new graph with new node IDs. Original junction node positions are
     preserved; intermediate nodes are inserted along edges at uniform steps.
+    Chord-based only (does not follow multi-edge chains). Prefer
+    :func:`_resample_chains_uniform` for skeleton refinement.
     """
     if G_in.number_of_edges() == 0:
         return G_in
@@ -1149,3 +1195,273 @@ def _resample_edges_uniform(G_in: nx.Graph, spacing: float) -> nx.Graph:
         NG.add_edge(prev, b, weight=float(np.linalg.norm(step)))
 
     return NG
+
+
+def _edge_euclidean(G: nx.Graph, u: int, v: int) -> float:
+    data = G[u][v]
+    if "weight" in data:
+        return float(data["weight"])
+    pu = np.asarray(G.nodes[u]["pos"], dtype=float)
+    pv = np.asarray(G.nodes[v]["pos"], dtype=float)
+    return float(np.linalg.norm(pu - pv))
+
+
+def _median_edge_length(G: nx.Graph) -> float:
+    if G.number_of_edges() == 0:
+        return 1.0
+    lengths = [_edge_euclidean(G, u, v) for u, v in G.edges()]
+    med = float(np.median(lengths))
+    return med if med > 0 else float(np.mean(lengths) or 1.0)
+
+
+def _skeleton_bbox_diagonal(G: nx.Graph) -> float:
+    if G.number_of_nodes() == 0:
+        return 1.0
+    P = np.asarray([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
+    return float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
+
+
+def _iter_skeleton_chains(G: nx.Graph) -> list[tuple[list[int], bool]]:
+    """Yield ``(node_path, closed)`` chains between terminals, or closed cycles."""
+    if G.number_of_nodes() == 0:
+        return []
+    deg = dict(G.degree())
+    terminals = {n for n, d in deg.items() if d != 2}
+    chains: list[tuple[list[int], bool]] = []
+    visited: set[tuple[int, int]] = set()
+
+    def edge_key(a: int, b: int) -> tuple[int, int]:
+        return (a, b) if a < b else (b, a)
+
+    if not terminals:
+        # Pure cycle component(s): emit one closed loop per connected component.
+        for comp in nx.connected_components(G):
+            sub = G.subgraph(comp)
+            if sub.number_of_edges() == 0:
+                continue
+            start = next(iter(sub.nodes))
+            cycle_edges = nx.find_cycle(sub, source=start)
+            path = [u for u, _v in cycle_edges]
+            chains.append((path, True))
+        return chains
+
+    for t in terminals:
+        for nbr in G.neighbors(t):
+            ek = edge_key(t, nbr)
+            if ek in visited:
+                continue
+            path = [t, nbr]
+            visited.add(ek)
+            prev, curr = t, nbr
+            while deg.get(curr, 0) == 2:
+                nxts = [x for x in G.neighbors(curr) if x != prev]
+                if not nxts:
+                    break
+                nxt = nxts[0]
+                visited.add(edge_key(curr, nxt))
+                path.append(nxt)
+                prev, curr = curr, nxt
+            chains.append((path, False))
+    return chains
+
+
+def _resample_polyline_arc_length(
+    points: np.ndarray,
+    spacing: float,
+    *,
+    closed: bool = False,
+) -> np.ndarray:
+    """Resample a polyline (or closed loop) to roughly uniform arc-length spacing."""
+    P = np.asarray(points, dtype=float)
+    if P.ndim != 2 or P.shape[0] == 0:
+        return P.copy()
+    if P.shape[0] == 1:
+        return P.copy()
+    if spacing <= 0:
+        raise ValueError("spacing must be positive")
+
+    if closed:
+        segs = np.linalg.norm(np.vstack([P[1:], P[:1]]) - P, axis=1)
+    else:
+        segs = np.linalg.norm(P[1:] - P[:-1], axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(segs)])
+    total = float(cum[-1])
+    if total <= 1e-15:
+        return P[:1].copy() if not closed else P[:1].copy()
+
+    if closed:
+        n_segs = max(3, int(np.ceil(total / spacing - 1e-12)))
+        targets = (np.arange(n_segs, dtype=float) * (total / n_segs)) % total
+    else:
+        n_segs = max(1, int(np.ceil(total / spacing - 1e-12)))
+        targets = np.linspace(0.0, total, n_segs + 1)
+
+    # Extend for interpolation lookup on open curves; for closed, wrap.
+    if closed:
+        P_ext = np.vstack([P, P[0]])
+        cum_ext = cum  # already includes full loop length at end
+    else:
+        P_ext = P
+        cum_ext = cum
+
+    out = np.empty((targets.shape[0], 3), dtype=float)
+    for i, t in enumerate(targets):
+        # Find segment with cum_ext[j] <= t <= cum_ext[j+1]
+        j = int(np.searchsorted(cum_ext, t, side="right") - 1)
+        j = max(0, min(j, len(cum_ext) - 2))
+        t0, t1 = cum_ext[j], cum_ext[j + 1]
+        if t1 <= t0:
+            out[i] = P_ext[j]
+            continue
+        alpha = (t - t0) / (t1 - t0)
+        out[i] = (1.0 - alpha) * P_ext[j] + alpha * P_ext[j + 1]
+    if not closed:
+        out[0] = P[0]
+        out[-1] = P[-1]
+    return out
+
+
+def _resample_chains_uniform(G: nx.Graph, spacing: float) -> nx.Graph:
+    """Resample each junction-to-junction chain by arc length at target ``spacing``.
+
+    Junctions and leaves keep their positions; degree-2 samples are rebuilt so
+    spacing is more even and typically slightly coarser than the raw MCFS curve.
+    """
+    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+        return G
+    spacing = float(spacing)
+    if spacing <= 0:
+        raise ValueError("spacing must be positive")
+
+    chains = _iter_skeleton_chains(G)
+    if not chains:
+        return G
+
+    NG = nx.Graph()
+    node_map: dict[int, int] = {}
+
+    def ensure_terminal(n: int) -> int:
+        if n in node_map:
+            return node_map[n]
+        nid = NG.number_of_nodes()
+        NG.add_node(nid, pos=np.asarray(G.nodes[n]["pos"], dtype=float).copy())
+        node_map[n] = nid
+        return nid
+
+    for path, closed in chains:
+        pts = np.asarray([G.nodes[n]["pos"] for n in path], dtype=float)
+        sampled = _resample_polyline_arc_length(pts, spacing, closed=closed)
+        if closed:
+            ids = []
+            for pos in sampled:
+                nid = NG.number_of_nodes()
+                NG.add_node(nid, pos=np.asarray(pos, dtype=float))
+                ids.append(nid)
+            for a, b in zip(ids, ids[1:] + ids[:1]):
+                w = float(np.linalg.norm(NG.nodes[a]["pos"] - NG.nodes[b]["pos"]))
+                NG.add_edge(a, b, weight=w)
+            continue
+
+        ids: list[int] = []
+        for i, pos in enumerate(sampled):
+            if i == 0:
+                ids.append(ensure_terminal(path[0]))
+            elif i == len(sampled) - 1:
+                ids.append(ensure_terminal(path[-1]))
+            else:
+                nid = NG.number_of_nodes()
+                NG.add_node(nid, pos=np.asarray(pos, dtype=float))
+                ids.append(nid)
+        for a, b in zip(ids[:-1], ids[1:]):
+            if a == b:
+                continue
+            w = float(np.linalg.norm(NG.nodes[a]["pos"] - NG.nodes[b]["pos"]))
+            NG.add_edge(a, b, weight=w)
+
+    return NG
+
+
+def _resolve_refine_options(
+    *,
+    refine: bool | RefineMode = False,
+    refine_spacing: float | None = None,
+    refine_spacing_frac: float | None = None,
+    compress_chains: bool = False,
+    resample_spacing: float | None = None,
+) -> tuple[RefineMode | None, float | None, float | None]:
+    """Map public refine / legacy flags to ``(mode, spacing, spacing_frac)``."""
+    if refine is True:
+        return "uniform", refine_spacing, refine_spacing_frac
+    if isinstance(refine, str):
+        if refine not in ("uniform", "compress"):
+            raise ValueError(f"unknown refine mode: {refine!r}")
+        return refine, refine_spacing, refine_spacing_frac  # type: ignore[return-value]
+    # Legacy aliases when refine is left off.
+    if resample_spacing is not None and float(resample_spacing) > 0:
+        return "uniform", float(resample_spacing), None
+    if compress_chains:
+        return "compress", None, None
+    return None, None, None
+
+
+def refine_skeleton_graph(
+    G: nx.Graph,
+    *,
+    mode: RefineMode = "uniform",
+    spacing: float | None = None,
+    spacing_frac: float | None = None,
+) -> nx.Graph:
+    """Refine a skeleton curve graph in-place-style (returns a new graph).
+
+    Parameters
+    ----------
+    mode :
+        ``"uniform"`` resample chains by arc length (default), or ``"compress"``
+        to keep only junctions/leaves.
+    spacing :
+        Absolute target segment length for ``uniform``. If omitted, uses
+        ``spacing_frac * bbox_diag``, else ``2 * median_edge_length``.
+    spacing_frac :
+        Relative spacing as a fraction of the skeleton axis-aligned bbox diagonal.
+    """
+    if G.number_of_nodes() == 0:
+        return G
+    if mode == "compress":
+        return _compress_degree_two_chains(G)
+    if mode != "uniform":
+        raise ValueError(f"unknown refine mode: {mode!r}")
+
+    if spacing is not None and spacing > 0:
+        target = float(spacing)
+    elif spacing_frac is not None and spacing_frac > 0:
+        target = float(spacing_frac) * _skeleton_bbox_diagonal(G)
+    else:
+        target = 2.0 * _median_edge_length(G)
+    return _resample_chains_uniform(G, target)
+
+
+def refine_skeleton(
+    skeleton: Skeleton,
+    *,
+    mode: RefineMode = "uniform",
+    spacing: float | None = None,
+    spacing_frac: float | None = None,
+) -> Skeleton:
+    """Refine a :class:`Skeleton` curve graph; returns a new instance."""
+    G = refine_skeleton_graph(
+        skeleton.graph, mode=mode, spacing=spacing, spacing_frac=spacing_frac
+    )
+    mapping = {n: i for i, n in enumerate(G.nodes)}
+    if mapping:
+        G = nx.relabel_nodes(G, mapping, copy=True)
+    nodes_arr = (
+        np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
+        if G.number_of_nodes()
+        else np.zeros((0, 3))
+    )
+    edges_arr = (
+        np.array([[u, v] for u, v in G.edges], dtype=int)
+        if G.number_of_edges()
+        else np.zeros((0, 2), dtype=int)
+    )
+    return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)

@@ -7,7 +7,13 @@ Primary entry point::
 """
 
 from .mcfs import MeanCurvatureFlowSkeletonization
-from .skeleton import skeletonize, thin_mesh, curve_skeleton_from_mesh, Skeleton
+from .skeleton import (
+    skeletonize,
+    thin_mesh,
+    curve_skeleton_from_mesh,
+    Skeleton,
+    refine_skeleton,
+)
 from .mesh import MeshManager, example_mesh
 from .quality import analyze_skeleton, SkeletonQualityReport
 from .validate import validate_mcfs_mesh
@@ -20,6 +26,7 @@ __all__ = [
     "skeletonize",
     "MeanCurvatureFlowSkeletonization",
     "Skeleton",
+    "refine_skeleton",
     "analyze_skeleton",
     "SkeletonQualityReport",
     "validate_mcfs_mesh",

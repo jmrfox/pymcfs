@@ -6,22 +6,18 @@ from scipy.spatial import Voronoi
 
 
 def compute_voronoi_poles(mesh: tm.Trimesh, *, use_vertex_normals: bool = True) -> tuple[np.ndarray, np.ndarray]:
-    """Approximate Voronoi-pole medial targets for each vertex of a mesh.
+    """Compute the Voronoi poles used by Starlab ``mcfskel``.
 
-    For each input vertex p with normal n, we compute the Voronoi region of p
-    in 3D and select the farthest finite Voronoi vertex lying in the -n direction
-    ("inner" pole). If none lie in -n, we select the farthest finite vertex.
-
-    The returned target is the midpoint between p and the chosen pole, which
-    approximates a medial position. A per-vertex weight is set inversely to
-    the distance to the pole (clipped) to avoid over-weighting very close poles.
+    This mirrors ``QhullVoronoiHelper``: retain finite Voronoi loci inside the
+    input bounding box, then choose the locus in each vertex's Voronoi cell with
+    the most negative projection along the surface normal.
 
     Returns
     -------
     targets : (n,3) float
-        Medial target positions for each vertex.
+        Medial target positions (inner Voronoi poles) for each vertex.
     weights : (n,) float
-        Suggested diagonal guidance weights per vertex.
+        Suggested diagonal guidance weights per vertex in ``[0, 1]``.
     """
     if not isinstance(mesh, tm.Trimesh):
         raise TypeError("compute_voronoi_poles expects a trimesh.Trimesh")
@@ -33,71 +29,65 @@ def compute_voronoi_poles(mesh: tm.Trimesh, *, use_vertex_normals: bool = True) 
 
     # Vertex normals (unit)
     if use_vertex_normals and mesh.vertex_normals is not None:
-        N = np.asarray(mesh.vertex_normals, dtype=float)
-        # Normalize just in case
-        norms = np.linalg.norm(N, axis=1)
-        norms = np.where(norms > 0, norms, 1.0)
-        N = N / norms[:, None]
+        N = np.asarray(mesh.vertex_normals, dtype=float).copy()
     else:
-        # Fallback: approximate normals via PCA of neighborhood is overkill; use face normals average (trimesh default)
-        N = mesh.vertex_normals
-        norms = np.linalg.norm(N, axis=1)
-        norms = np.where(norms > 0, norms, 1.0)
-        N = N / norms[:, None]
+        N = np.asarray(mesh.vertex_normals, dtype=float).copy()
+    norms = np.linalg.norm(N, axis=1)
+    norms = np.where(norms > 0, norms, 1.0)
+    N = N / norms[:, None]
 
-    # Build 3D Voronoi diagram of point set
     vor = Voronoi(P)
 
     targets = P.copy()
     weights = np.zeros(n, dtype=float)
 
     eps = 1e-9
-    Vverts = vor.vertices  # (m,3)
+    Vverts = vor.vertices
     point_region = vor.point_region
     regions = vor.regions
+    bounds_min = P.min(axis=0)
+    bounds_max = P.max(axis=0)
+    locus_valid = np.all(
+        (Vverts >= bounds_min[None, :]) & (Vverts <= bounds_max[None, :]),
+        axis=1,
+    )
+    valid_loci = np.flatnonzero(locus_valid)
+    fallback_pole = Vverts[valid_loci[0]] if valid_loci.size else None
 
     for i in range(n):
-        r_idx = point_region[i]
-        if r_idx == -1 or r_idx >= len(regions):
+        r_idx = int(point_region[i])
+        if r_idx < 0 or r_idx >= len(regions):
             continue
         reg = regions[r_idx]
-        # Filter out infinite regions
-        if reg is None or len(reg) == 0:
+        if not reg:
             continue
-        if any(v_idx == -1 for v_idx in reg):
-            # Keep only finite vertices
-            finite = [v_idx for v_idx in reg if v_idx != -1 and 0 <= v_idx < len(Vverts)]
-            if len(finite) == 0:
-                continue
-            reg = finite
-        else:
-            reg = [v_idx for v_idx in reg if 0 <= v_idx < len(Vverts)]
-            if len(reg) == 0:
-                continue
+        # Filter finite, in-bounds loci without a Python inner try/branch forest.
+        finite = [v_idx for v_idx in reg if v_idx >= 0 and locus_valid[v_idx]]
+        if not finite:
+            if fallback_pole is not None:
+                targets[i] = fallback_pole
+            continue
 
-        C = Vverts[np.asarray(reg, dtype=int)]  # candidate Voronoi vertices
-        diffs = C - P[i]
-        dists = np.linalg.norm(diffs, axis=1)
-        # Inner direction (opposite normal)
-        dots = diffs @ N[i]
-        inner = np.where(dots < 0)[0]
-        if inner.size > 0:
-            idx = inner[np.argmax(dists[inner])]
+        C = Vverts[np.asarray(finite, dtype=int)]
+        projections = (C - P[i]) @ N[i]
+        inner = projections < 0
+        if np.any(inner):
+            idx = int(np.argmin(np.where(inner, projections, np.inf)))
+            pole = C[idx]
+        elif fallback_pole is not None:
+            # Starlab initializes the pole index to zero if no negative locus is
+            # found, which corresponds to the first retained global locus.
+            pole = fallback_pole
         else:
-            idx = int(np.argmax(dists))
-        pole = C[idx]
+            continue
 
-        # Target: midpoint between point and its (inner) pole
-        tgt = 0.5 * (P[i] + pole)
-        targets[i] = tgt
-        # Weight inversely proportional to distance to pole, capped
+        targets[i] = pole
         d = max(eps, float(np.linalg.norm(pole - P[i])))
         weights[i] = 1.0 / d
 
-    # Normalize weights to a reasonable scale
     if np.any(weights > 0):
-        wmax = np.max(weights)
+        wmax = float(np.max(weights))
         if wmax > 0:
-            weights = weights / wmax  # in [0,1]
+            weights = weights / wmax
 
     return targets, weights

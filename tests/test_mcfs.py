@@ -2,9 +2,12 @@
 import time
 import numpy as np
 import networkx as nx
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 import trimesh as tm
 import pytest
 
+from pymcfs.laplacian import starlab_cotangent_laplacian
 from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
 from pymcfs.remesh import collapse_short_edges, split_obtuse_faces
 from pymcfs.skeleton import skeletonize, thin_mesh
@@ -24,12 +27,22 @@ def test_collapse_short_edges_reduces_vertices():
 
 
 def test_split_obtuse_faces_runs():
-    V = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.01, 0.0]], dtype=float)
-    F = np.array([[0, 1, 2]], dtype=int)
+    # Starlab splits an interior edge only when both incident triangles have
+    # large opposite angles.
+    V = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, 0.01, 0.0],
+            [0.5, -0.01, 0.0],
+        ],
+        dtype=float,
+    )
+    F = np.array([[0, 1, 2], [1, 0, 3]], dtype=int)
     V2, F2, n, *_ = split_obtuse_faces(V, F, max_angle_deg=90.0)
     assert n >= 1
     assert V2.shape[0] > V.shape[0]
-    assert F2.shape[0] >= 2
+    assert F2.shape[0] >= 4
 
 
 def test_mcfs_contract_reduces_area_and_vertices():
@@ -47,6 +60,43 @@ def test_mcfs_contract_reduces_area_and_vertices():
     assert mcs._surface_area() < a0
     assert mcs.V.shape[0] <= n0
     assert mcs.V.shape[0] < n0 or mcs.fixed.any()
+
+
+def test_contract_geometry_uses_starlab_stacked_least_squares():
+    """Guard against regressing to the amalgamated n×n system.
+
+    Starlab / CGAL / the paper solve the stacked overdetermined system
+
+        [W_L L; W_H; W_P] X ≈ [0; W_H V; W_P P]
+
+    via normal equations. The older square amalgam
+
+        (W_L L + W_H + W_P) X = W_H V + W_P P
+
+    is a different operator and must stay rejected.
+    """
+    mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
+    mcs = MeanCurvatureFlowSkeletonization(mesh, w_H=0.1, w_M=0.2, verbose=False)
+    V0 = mcs.V.copy()
+    wL, wH, wM = mcs._update_constraint_weights()
+    L = starlab_cotangent_laplacian(mcs.V, mcs.F).tocsr()
+    diag = np.asarray(L.diagonal()).ravel()
+    L_off = L - sp.diags(diag, format="csr", shape=L.shape)
+    L_weighted = (sp.diags(wL) @ L_off) + sp.diags(diag, format="csr")
+    A = sp.vstack([L_weighted, sp.diags(wH), sp.diags(wM)], format="csc")
+    B = np.vstack([np.zeros_like(V0), wH[:, None] * V0, wM[:, None] * mcs.poles])
+    assert A.shape == (3 * V0.shape[0], V0.shape[0])
+
+    AtA = (A.T @ A).tocsc()
+    AtB = A.T @ B
+    amalgam = (sp.diags(wL) @ L + sp.diags(wH) + sp.diags(wM)).tocsc()
+    # The two operators are not the same matrix.
+    assert (AtA - amalgam).nnz > 0
+
+    expected = np.column_stack([spla.spsolve(AtA, AtB[:, c]) for c in range(3)])
+    mcs.contract_geometry()
+    assert np.allclose(mcs.V, expected, atol=1e-9)
+    assert float(mcs._surface_area()) < float(mesh.area)
 
 
 def test_skeletonize_sphere_is_sparse():
@@ -105,3 +155,52 @@ def test_validate_rejects_open_mesh():
     )
     with pytest.raises(ValueError):
         validate_mcfs_mesh(mesh)
+
+
+def _closed_cylinder(radius=0.5, height=2.0, radial=24, stacks=12):
+    """Axially sampled watertight cylinder (trimesh's only has end rings)."""
+    angles = np.linspace(0.0, 2.0 * np.pi, radial, endpoint=False)
+    zs = np.linspace(-0.5 * height, 0.5 * height, stacks)
+    ring = np.column_stack([radius * np.cos(angles), radius * np.sin(angles)])
+    verts = [[float(x), float(y), float(z)] for z in zs for x, y in ring]
+    top_c, bot_c = len(verts), len(verts) + 1
+    verts.append([0.0, 0.0, 0.5 * height])
+    verts.append([0.0, 0.0, -0.5 * height])
+    faces: list[list[int]] = []
+    for i in range(stacks - 1):
+        for j in range(radial):
+            j2 = (j + 1) % radial
+            a, b = i * radial + j, i * radial + j2
+            c, d = (i + 1) * radial + j2, (i + 1) * radial + j
+            faces.extend([[a, b, c], [a, c, d]])
+    base = (stacks - 1) * radial
+    for j in range(radial):
+        j2 = (j + 1) % radial
+        faces.append([base + j, base + j2, top_c])
+        faces.append([j2, j, bot_c])
+    mesh = tm.Trimesh(vertices=np.asarray(verts, float), faces=np.asarray(faces, int), process=True)
+    if not mesh.is_watertight:
+        mesh.fix_normals()
+    return mesh
+
+
+def test_cylinder_skeleton_is_long_and_centered():
+    mesh = _closed_cylinder()
+    assert mesh.is_watertight
+    skel = skeletonize(mesh, max_iterations=80, w_H=0.1, w_M=0.2, timeout_seconds=60)
+    assert skel.nodes.shape[0] >= 2
+    assert skel.edges.shape[0] >= 1
+    total_len = float(
+        sum(np.linalg.norm(skel.nodes[u] - skel.nodes[v]) for u, v in skel.edges)
+    )
+    # Expect a substantial fraction of the cylinder height (2.0)
+    assert total_len > 0.8
+    # Nodes should lie near the axis
+    rad = np.linalg.norm(skel.nodes[:, :2], axis=1)
+    assert float(rad.mean()) < 0.15
+    G = skel.graph
+    assert nx.number_connected_components(G) == 1
+    assert G.number_of_edges() - G.number_of_nodes() + 1 == 0
+    degrees = list(dict(G.degree()).values())
+    assert degrees.count(1) == 2
+    assert all(degree in (1, 2) for degree in degrees)
