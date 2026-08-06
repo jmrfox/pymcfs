@@ -57,7 +57,7 @@ def mesh_adjacency(
 def _faces_incident_to_vertex(
     v: int,
     neighbors: list[set[int]],
-    edge_faces: dict[tuple[int, int], list[int]],
+    edge_faces: dict[tuple[int, int], set[int]] | dict[tuple[int, int], list[int]],
 ) -> set[int]:
     """Face indices incident to ``v`` via the edge→faces map."""
     out: set[int] = set()
@@ -70,7 +70,7 @@ def _link_condition_ok(
     a: int,
     b: int,
     neighbors: list[set[int]],
-    edge_faces: dict[tuple[int, int], list[int]],
+    edge_faces: dict[tuple[int, int], set[int]] | dict[tuple[int, int], list[int]],
     F: np.ndarray,
 ) -> bool:
     """Manifold link condition for collapsing edge (a, b).
@@ -81,7 +81,7 @@ def _link_condition_ok(
     scanning the full mesh (O(degree) rather than O(|F|)).
     """
     key = _edge_key(a, b)
-    faces = edge_faces.get(key, [])
+    faces = list(edge_faces.get(key, ()))
     if len(faces) == 0:
         return False
     thirds: set[int] = set()
@@ -287,26 +287,58 @@ def compact_mesh(
     return Vn, Fn, out_extra
 
 
-def _apply_collapse_topology(
+def _unlink_face(
+    fi: int,
+    F: np.ndarray,
+    edge_faces: dict[tuple[int, int], set[int]],
+) -> None:
+    a, b, c = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+    for u, v in ((a, b), (b, c), (c, a)):
+        key = _edge_key(u, v)
+        bucket = edge_faces.get(key)
+        if bucket is not None:
+            bucket.discard(fi)
+            if not bucket:
+                del edge_faces[key]
+
+
+def _link_face(
+    fi: int,
+    F: np.ndarray,
+    edge_faces: dict[tuple[int, int], set[int]],
+) -> None:
+    a, b, c = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+    for u, v in ((a, b), (b, c), (c, a)):
+        edge_faces.setdefault(_edge_key(u, v), set()).add(fi)
+
+
+def _apply_collapse_local(
     keep: int,
     drop: int,
     F: np.ndarray,
+    face_alive: np.ndarray,
     neighbors: list[set[int]],
-    edge_faces: dict[tuple[int, int], list[int]],
-) -> np.ndarray:
-    """Identify ``drop`` with ``keep`` and patch adjacency in-place. Returns new F."""
-    # Remap / drop faces in the face array.
-    Fm = F.copy()
-    Fm[Fm == drop] = keep
-    alive = (Fm[:, 0] != Fm[:, 1]) & (Fm[:, 1] != Fm[:, 2]) & (Fm[:, 2] != Fm[:, 0])
-    new_faces = Fm[alive]
+    edge_faces: dict[tuple[int, int], set[int]],
+) -> None:
+    """Collapse ``drop``→``keep`` with O(degree) adjacency updates (tombstone faces)."""
+    faces_drop = _faces_incident_to_vertex(drop, neighbors, edge_faces)
+    removed = set(edge_faces.get(_edge_key(keep, drop), ()))
 
-    # Rebuild edge_faces from surviving faces (O(|F|) per collapse; link checks
-    # stay O(degree)). Neighbor sets are patched locally.
-    edge_faces.clear()
-    for fi, (a, b, c) in enumerate(new_faces):
-        for u, v in ((a, b), (b, c), (c, a)):
-            edge_faces[_edge_key(int(u), int(v))].append(fi)
+    for fi in faces_drop:
+        if not face_alive[fi]:
+            continue
+        _unlink_face(fi, F, edge_faces)
+        if fi in removed:
+            face_alive[fi] = False
+            continue
+        for k in range(3):
+            if int(F[fi, k]) == drop:
+                F[fi, k] = keep
+        a, b, c = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+        if a == b or b == c or c == a:
+            face_alive[fi] = False
+        else:
+            _link_face(fi, F, edge_faces)
 
     drop_nbrs = set(neighbors[drop])
     drop_nbrs.discard(keep)
@@ -316,8 +348,6 @@ def _apply_collapse_topology(
         neighbors[keep].add(v)
     neighbors[keep].discard(drop)
     neighbors[drop].clear()
-
-    return new_faces
 
 
 def collapse_short_edges(
@@ -369,7 +399,7 @@ def collapse_short_edges(
 
     total = 0
     passes = 0
-    alive = np.ones(nv, dtype=bool)
+    vert_alive = np.ones(nv, dtype=bool)
 
     while passes < max_passes and total < max_collapses:
         if deadline is not None and _time.monotonic() >= deadline:
@@ -378,21 +408,27 @@ def collapse_short_edges(
         if F.size == 0:
             break
 
-        edges = mesh_unique_edges(F)
-        if edges.size == 0:
-            break
         # Starlab scans mesh edge order; it does not sort local-remesh collapses.
         neighbors = _vertex_neighbors(F, V.shape[0])
-        edge_faces = _edge_to_faces(F)
+        edge_faces: dict[tuple[int, int], set[int]] = {
+            k: set(v) for k, v in _edge_to_faces(F).items()
+        }
+        if not edge_faces:
+            break
+        # Snapshot keys once per pass (avoids np.unique on faces).
+        edges = list(edge_faces.keys())
+        face_alive = np.ones(F.shape[0], dtype=bool)
         collapsed_this = 0
 
-        for ei in range(edges.shape[0]):
+        for a, b in edges:
             if total + collapsed_this >= max_collapses:
                 break
             if deadline is not None and _time.monotonic() >= deadline:
                 break
-            a, b = int(edges[ei, 0]), int(edges[ei, 1])
-            if not alive[a] or not alive[b]:
+            if not vert_alive[a] or not vert_alive[b]:
+                continue
+            # Edge may have been removed by an earlier collapse in this pass.
+            if _edge_key(a, b) not in edge_faces:
                 continue
             d = float(np.linalg.norm(V[a] - V[b]))
             if d >= min_edge_length:
@@ -410,14 +446,15 @@ def collapse_short_edges(
                 else:
                     poles[keep] = pb
             V[keep] = mid
-            alive[drop] = False
-            F = _apply_collapse_topology(keep, drop, F, neighbors, edge_faces)
+            vert_alive[drop] = False
+            _apply_collapse_local(keep, drop, F, face_alive, neighbors, edge_faces)
             collapsed_this += 1
 
         if collapsed_this == 0:
             break
 
-        # Compact dead vertices after a productive scan.
+        # Compact dead faces/vertices after a productive scan.
+        F = F[face_alive]
         used = np.unique(F.reshape(-1)) if F.size else np.zeros(0, dtype=int)
         remap = -np.ones(V.shape[0], dtype=int)
         remap[used] = np.arange(used.shape[0], dtype=int)
@@ -428,13 +465,91 @@ def collapse_short_edges(
             poles = poles[used]
         for name in flags:
             flags[name] = flags[name][used]
-        alive = np.ones(V.shape[0], dtype=bool)
+        vert_alive = np.ones(V.shape[0], dtype=bool)
         total += collapsed_this
 
     if vertex_flags is not None:
         vertex_flags.clear()
         vertex_flags.update(flags)
     return V, F, total, fixed, poles
+
+
+def _obtuse_split_candidates(
+    V: np.ndarray,
+    F: np.ndarray,
+    *,
+    thr: float,
+    short_edge: float,
+) -> list[tuple[int, int, int, int, int]]:
+    """Return (u, v, face0, face1, split_side) for interior edges with both opposite angles > thr.
+
+    Corner angles are computed in bulk with NumPy; edge pairing is a linear
+    scan over sorted halfedges.
+    """
+    m = F.shape[0]
+    if m == 0:
+        return []
+
+    v0 = V[F[:, 0]]
+    v1 = V[F[:, 1]]
+    v2 = V[F[:, 2]]
+    len01 = np.linalg.norm(v1 - v0, axis=1)
+    len12 = np.linalg.norm(v2 - v1, axis=1)
+    len20 = np.linalg.norm(v0 - v2, axis=1)
+    short = (len01 < short_edge) | (len12 < short_edge) | (len20 < short_edge)
+
+    def corner_angle(adj_a: np.ndarray, adj_b: np.ndarray, opp: np.ndarray) -> np.ndarray:
+        denom = np.maximum(2.0 * adj_a * adj_b, 1e-30)
+        cosine = np.clip((adj_a * adj_a + adj_b * adj_b - opp * opp) / denom, -1.0, 1.0)
+        ang = np.arccos(cosine)
+        ang[short] = -1.0
+        return ang
+
+    # Angle at vertex k is opposite the edge that does not touch k.
+    ang0 = corner_angle(len01, len20, len12)  # opposite edge (1,2)
+    ang1 = corner_angle(len12, len01, len20)  # opposite edge (2,0)
+    ang2 = corner_angle(len20, len12, len01)  # opposite edge (0,1)
+
+    # Halfedge records: undirected edge endpoints + owning face + opposite angle/vertex.
+    f01 = F[:, [0, 1]]
+    f12 = F[:, [1, 2]]
+    f20 = F[:, [2, 0]]
+    e_min = np.minimum(
+        np.concatenate([f01[:, 0], f12[:, 0], f20[:, 0]]),
+        np.concatenate([f01[:, 1], f12[:, 1], f20[:, 1]]),
+    )
+    e_max = np.maximum(
+        np.concatenate([f01[:, 0], f12[:, 0], f20[:, 0]]),
+        np.concatenate([f01[:, 1], f12[:, 1], f20[:, 1]]),
+    )
+    face_ids = np.concatenate([np.arange(m), np.arange(m), np.arange(m)])
+    # Opposite vertex / angle for edges (0,1), (1,2), (2,0) are verts 2, 0, 1.
+    opp_ang = np.concatenate([ang2, ang0, ang1])
+    opp_vert = np.concatenate([F[:, 2], F[:, 0], F[:, 1]])
+
+    order = np.lexsort((e_max, e_min))
+    e_min = e_min[order]
+    e_max = e_max[order]
+    face_ids = face_ids[order]
+    opp_ang = opp_ang[order]
+    opp_vert = opp_vert[order]
+
+    selected: list[tuple[int, int, int, int, int]] = []
+    i = 0
+    n = e_min.shape[0]
+    while i < n:
+        j = i + 1
+        while j < n and e_min[j] == e_min[i] and e_max[j] == e_max[i]:
+            j += 1
+        if j - i == 2:
+            a0, a1 = float(opp_ang[i]), float(opp_ang[i + 1])
+            if a0 >= thr and a1 >= thr:
+                u, v = int(e_min[i]), int(e_max[i])
+                f0, f1 = int(face_ids[i]), int(face_ids[i + 1])
+                split_side = int(opp_vert[i] if a0 >= a1 else opp_vert[i + 1])
+                selected.append((u, v, f0, f1, split_side))
+        i = j
+    return selected
 
 
 def split_obtuse_faces(
@@ -482,22 +597,6 @@ def split_obtuse_faces(
     total = 0
     passes = 0
 
-    def opposite_angle(face: np.ndarray, u: int, v: int) -> tuple[float, int]:
-        verts = [int(x) for x in face]
-        w = next(x for x in verts if x != u and x != v)
-        lengths = [
-            float(np.linalg.norm(V[verts[(k + 1) % 3]] - V[verts[(k + 2) % 3]]))
-            for k in range(3)
-        ]
-        if min(lengths) < short_edge:
-            return -1.0, w
-        wi = verts.index(w)
-        a = lengths[wi]
-        b = lengths[(wi + 1) % 3]
-        c = lengths[(wi + 2) % 3]
-        cosine = float(np.clip((b * b + c * c - a * a) / (2.0 * b * c), -1.0, 1.0))
-        return float(np.arccos(cosine)), w
-
     def split_face_on_edge(face: np.ndarray, u: int, v: int, new: int) -> list[np.ndarray]:
         a, b, c = (int(x) for x in face)
         for x, y, z in ((a, b, c), (b, c, a), (c, a, b)):
@@ -517,26 +616,12 @@ def split_obtuse_faces(
         if deadline is not None and _time.monotonic() >= deadline:
             break
         passes += 1
-        edge_faces = _edge_to_faces(F)
-        # Collect all currently legal split edges, then apply an independent
-        # set (no shared vertices) so one adjacency rebuild serves many splits.
-        selected: list[tuple[int, int, int, int, int]] = []
-        for (u, v), incident in edge_faces.items():
-            if len(incident) != 2:
-                continue
-            angle0, opposite0 = opposite_angle(F[incident[0]], u, v)
-            angle1, opposite1 = opposite_angle(F[incident[1]], u, v)
-            if angle0 < thr or angle1 < thr:
-                continue
-            split_side = opposite0 if angle0 > angle1 else opposite1
-            selected.append((u, v, incident[0], incident[1], split_side))
-
+        selected = _obtuse_split_candidates(V, F, thr=thr, short_edge=short_edge)
         if not selected:
             break
 
         used_verts: set[int] = set()
-        # Apply in scan order (Starlab takes the first); skip conflicts.
-        batch = []
+        batch: list[tuple[int, int, int, int, int]] = []
         for u, v, face0, face1, split_side in selected:
             if u in used_verts or v in used_verts or split_side in used_verts:
                 continue
@@ -544,26 +629,19 @@ def split_obtuse_faces(
             batch.append((u, v, face0, face1, split_side))
 
         if not batch:
-            # Degenerate conflict set — fall back to single first candidate.
             batch = [selected[0]]
 
-        # Apply from high face index to low so removals stay valid within batch
-        # only when faces don't overlap — guaranteed by used_verts on face verts
-        # but face indices themselves must not collide.
         face_used: set[int] = set()
-        clean_batch = []
+        clean_batch: list[tuple[int, int, int, int, int]] = []
         for item in batch:
             _u, _v, f0, f1, _s = item
             if f0 in face_used or f1 in face_used:
                 continue
             face_used.update((f0, f1))
             clean_batch.append(item)
-        batch = clean_batch
-        if not batch:
-            batch = [selected[0]]
+        batch = clean_batch or [selected[0]]
 
-        # Remove faces from highest index first, append all new faces after.
-        remove = set()
+        remove: set[int] = set()
         new_rows: list[np.ndarray] = []
         for u, v, face0, face1, split_side in batch:
             if deadline is not None and _time.monotonic() >= deadline:
