@@ -1,3 +1,4 @@
+"""Medial-axis / Voronoi pole helpers used by the MCFS driver (internal)."""
 from __future__ import annotations
 
 import numpy as np
@@ -6,11 +7,12 @@ from scipy.spatial import Voronoi
 
 
 def compute_voronoi_poles(mesh: tm.Trimesh, *, use_vertex_normals: bool = True) -> tuple[np.ndarray, np.ndarray]:
-    """Compute the Voronoi poles used by Starlab ``mcfskel``.
+    """Compute per-vertex medial (inner Voronoi) poles for guidance.
 
-    This mirrors ``QhullVoronoiHelper``: retain finite Voronoi loci inside the
-    input bounding box, then choose the locus in each vertex's Voronoi cell with
-    the most negative projection along the surface normal.
+    Compatible with Starlab ``mcfskel`` / ``QhullVoronoiHelper``: retain finite
+    Voronoi loci inside the input bounding box, then choose the locus in each
+    vertex's Voronoi cell with the most negative projection along the surface
+    normal.
 
     Returns
     -------

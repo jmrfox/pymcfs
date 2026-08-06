@@ -7,7 +7,7 @@ import scipy.sparse.linalg as spla
 import trimesh as tm
 import pytest
 
-from pymcfs.laplacian import starlab_cotangent_laplacian
+from pymcfs.laplacian import mcfs_cotangent_laplacian
 from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
 from pymcfs.remesh import collapse_short_edges, split_obtuse_faces
 from pymcfs.skeleton import skeletonize, thin_mesh
@@ -79,7 +79,7 @@ def test_contract_geometry_uses_starlab_stacked_least_squares():
     mcs = MeanCurvatureFlowSkeletonization(mesh, w_H=0.1, w_M=0.2, verbose=False)
     V0 = mcs.V.copy()
     wL, wH, wM = mcs._update_constraint_weights()
-    L = starlab_cotangent_laplacian(mcs.V, mcs.F).tocsr()
+    L = mcfs_cotangent_laplacian(mcs.V, mcs.F).tocsr()
     diag = np.asarray(L.diagonal()).ravel()
     L_off = L - sp.diags(diag, format="csr", shape=L.shape)
     L_weighted = (sp.diags(wL) @ L_off) + sp.diags(diag, format="csr")

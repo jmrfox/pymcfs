@@ -1,7 +1,7 @@
 [project]
 name = "pymcfs"
 version = "0.1.0"
-description = "Add your description here"
+description = "Mean-curvature-flow skeletonization for triangle meshes"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,6 +9,7 @@ dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.6",
     "networkx>=3.5",
+    "numba>=0.66.0",
     "numpy>=2.3.2",
     "plotly>=6.3.0",
     "pymeshlab>=2025.7",

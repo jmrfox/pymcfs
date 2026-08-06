@@ -63,7 +63,7 @@ def test_skeletonize_refine_downsamples_and_evens():
     mesh = tm.Trimesh(vertices=np.asarray(verts), faces=np.asarray(faces), process=True)
 
     raw = skeletonize(mesh, max_iterations=40, w_M=0.2, refine=False)
-    refined = skeletonize(mesh, max_iterations=40, w_M=0.2, refine=True)
+    refined = refine_skeleton(raw, mode="uniform")
     assert refined.nodes.shape[0] <= raw.nodes.shape[0]
     assert refined.edges.shape[0] > 0
     G = refined.graph

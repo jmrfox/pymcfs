@@ -107,7 +107,7 @@ class MeshManager:
         is_uniform_scale: bool = False
         uniform_scale: Optional[float] = None
 
-    def __init__(self, mesh: Optional[trimesh.Trimesh] = None, verbose: bool = True):
+    def __init__(self, mesh: Optional[trimesh.Trimesh] = None, verbose: bool = False):
         # Core mesh attributes
         self.mesh = mesh
         self.original_mesh = mesh
@@ -849,8 +849,9 @@ class MeshManager:
         """
         Attempt to repair common mesh issues to improve watertightness and quality.
 
+        Operates on ``self.mesh`` (via :meth:`to_trimesh`); returns a repaired copy.
+
         Args:
-            mesh_data: Either a Trimesh object or (vertices, faces) tuple
             fix_holes: Whether to attempt filling holes
             remove_duplicates: Whether to remove duplicate faces and vertices
             fix_normals: Whether to fix face normal consistency
@@ -1407,8 +1408,8 @@ class MeshManager:
         Create a grid visualization showing multiple cross-sections of a 3D mesh.
 
         Args:
-            vertices: Vertex array (alternative to mesh_data)
-            faces: Face array (alternative to mesh_data)
+            vertices: Optional vertex array (defaults to ``self.mesh`` vertices)
+            faces: Optional face array (defaults to ``self.mesh`` faces)
             title: Plot title
             num_slices: Number of slices to show (should be perfect square for grid)
             z_range: Tuple of (min_z, max_z) for slice range. Auto-detected if None.

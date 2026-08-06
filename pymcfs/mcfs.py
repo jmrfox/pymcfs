@@ -12,7 +12,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import trimesh as tm
 
-from .laplacian import starlab_cotangent_laplacian
+from .laplacian import mcfs_cotangent_laplacian
 from .medial import compute_voronoi_poles
 from .remesh import (
     collapse_ok_for_edge,
@@ -68,7 +68,9 @@ def meso_surface_to_curve_graph(
     max_steps: int | None = None,
     deadline: float | None = None,
 ) -> nx.Graph:
-    """Convert a meso-skeleton using Starlab's sorted edge-collapse procedure.
+    """Convert a contracted meso-skeleton surface into a curve graph.
+
+    Uses a sorted edge-collapse procedure compatible with Starlab ``mcfskel``.
 
     ``surfacemesh_filter_to_skeleton`` inserts all initial edges into a priority
     queue, visits them in their initial length order, and collapses an edge only
@@ -193,12 +195,28 @@ def meso_surface_to_curve_graph(
 
 @dataclass
 class MeanCurvatureFlowSkeletonization:
-    """Mean-curvature-flow skeletonization driver.
+    """Mean-curvature-flow skeletonization driver for closed triangle meshes.
 
-    Public contraction weights:
-    - ``w_H`` = quality/speed tradeoff (default 0.1)
-    - ``w_M`` = medial-centering tradeoff (default 0.2)
-    - ``w_L`` is fixed at 1 (scale invariance / partition of unity over multiplication)
+    Parameters
+    ----------
+    mesh :
+        Input ``trimesh.Trimesh``.
+    w_H :
+        Quality/speed tradeoff (default 0.1). Larger → faster / coarser.
+    w_M :
+        Medial-centering tradeoff (default 0.2). ``0`` disables Voronoi poles.
+    min_edge_length, max_triangle_angle :
+        Remesh controls during contraction.
+    area_variation_factor :
+        Relative area change vs initial area for convergence.
+    max_iterations, timeout_seconds :
+        Hard stop criteria.
+    validate, verbose, log :
+        Validation and logging.
+
+    Notes
+    -----
+    ``w_L`` is fixed at 1 (only weight ratios matter).
     """
 
     mesh: tm.Trimesh
@@ -210,7 +228,6 @@ class MeanCurvatureFlowSkeletonization:
     max_iterations: int = 500
     timeout_seconds: float | None = 120.0
     zero_TH: float = 1e-7
-    laplacian_secure: bool = True
     validate: bool = True
     verbose: bool = False
     log: logging.Logger | None = None
@@ -266,12 +283,11 @@ class MeanCurvatureFlowSkeletonization:
                 self.poles = np.asarray(targets, dtype=float)
                 self.pole_valid = self._poles_inside_mesh(self.poles)
                 n_valid = int(self.pole_valid.sum())
-                if self.verbose or n_valid < n:
-                    self._log.info(
-                        "Voronoi poles: %d/%d inside mesh (diagnostic only)",
-                        n_valid,
-                        n,
-                    )
+                self._vinfo(
+                    "Voronoi poles: %d/%d inside mesh (diagnostic only)",
+                    n_valid,
+                    n,
+                )
             except Exception as e:
                 self._log.warning("Voronoi poles failed (%s); setting w_M effective 0", e)
                 self.poles = self.V.copy()
@@ -279,7 +295,7 @@ class MeanCurvatureFlowSkeletonization:
         else:
             self.poles = self.V.copy()
         self._deadline = None
-        self._log.info(
+        self._vinfo(
             "MCFS init: n=%d f=%d min_edge=%.4g area0=%.4g bbox0=%s w_H=%.3g w_M=%.3g",
             n,
             self.F.shape[0],
@@ -290,6 +306,13 @@ class MeanCurvatureFlowSkeletonization:
             self.w_M,
         )
         self._sanity_check_state(stage="init")
+
+    def _vinfo(self, msg: str, *args) -> None:
+        """Progress / diagnostic line: info when verbose, else debug."""
+        if self.verbose:
+            self._log.info(msg, *args)
+        else:
+            self._log.debug(msg, *args)
 
     def _surface_area(self) -> float:
         if self.F.size == 0:
@@ -370,7 +393,7 @@ class MeanCurvatureFlowSkeletonization:
                 int(valid.sum()),
                 n,
             )
-        self._log.info(msg)
+        self._vinfo(msg)
 
         if not finite:
             self._log.error("sanity[%s]: non-finite vertex coordinates detected", stage)
@@ -404,7 +427,7 @@ class MeanCurvatureFlowSkeletonization:
         return wL, wH, wM
 
     def contract_geometry(self) -> None:
-        """Run Starlab's stacked least-squares geometry contraction."""
+        """Assemble and solve the stacked least-squares geometry update."""
         if self.V.shape[0] == 0 or self.F.shape[0] == 0:
             return
         self._sync_pole_valid()
@@ -420,9 +443,9 @@ class MeanCurvatureFlowSkeletonization:
         # and solves min ||A X - B||² through A.T @ A. Starlab multiplies
         # off-diagonal Laplacian entries by the source vertex's omega_L but
         # leaves the diagonal as the unweighted negative edge-weight sum.
-        L = starlab_cotangent_laplacian(self.V, self.F).tocsr()
-        # Starlab: scale off-diagonals by omega_L, leave diagonal as the
-        # unweighted negative edge-weight sum. Avoid LIL round-trips.
+        L = mcfs_cotangent_laplacian(self.V, self.F).tocsr()
+        # Scale off-diagonals by omega_L; leave diagonal as the unweighted
+        # negative edge-weight sum (Starlab / EigenContractionHelper). Avoid LIL.
         diag = np.asarray(L.diagonal()).ravel()
         L_off = L - sp.diags(diag, format="csr", shape=L.shape)
         L_weighted = (sp.diags(wL) @ L_off) + sp.diags(diag, format="csr")
@@ -495,7 +518,7 @@ class MeanCurvatureFlowSkeletonization:
             )
             self._sync_pole_valid()
         if n:
-            self._log.info(
+            self._vinfo(
                 "collapse_edges: %d collapses -> n=%d f=%d", n, self.V.shape[0], self.F.shape[0]
             )
         return int(n)
@@ -519,7 +542,7 @@ class MeanCurvatureFlowSkeletonization:
             self.is_split = split2 if split2 is not None else np.zeros(V2.shape[0], dtype=bool)
             self._sync_pole_valid()
         if n:
-            self._log.info(
+            self._vinfo(
                 "split_faces: %d splits -> n=%d f=%d", n, self.V.shape[0], self.F.shape[0]
             )
         return int(n)
@@ -528,18 +551,11 @@ class MeanCurvatureFlowSkeletonization:
         return self._deadline is not None and time.monotonic() >= self._deadline
 
     def detect_degeneracies(self) -> int:
-        """Apply Starlab's non-collapsible-short-edge degeneracy test."""
+        """Mark vertices on non-collapsible short edges as fixed (degeneracy test)."""
         if self.V.shape[0] == 0 or self.F.shape[0] == 0:
             return 0
         elength_fixed = self._min_edge / 10.0
-        edges = mesh_unique_edges(self.F)
-        neighbors, edge_faces = mesh_adjacency(self.F, self.V.shape[0])
-        incident: list[list[tuple[int, int]]] = [[] for _ in range(self.V.shape[0])]
-        for a, b in edges:
-            a, b = int(a), int(b)
-            incident[a].append((a, b))
-            incident[b].append((a, b))
-
+        topo = mesh_adjacency(self.F, self.V.shape[0])
         newly = 0
         for v in range(self.V.shape[0]):
             if self._timed_out():
@@ -547,24 +563,24 @@ class MeanCurvatureFlowSkeletonization:
             if self.fixed[v]:
                 continue
             bad = 0
-            for a, b in incident[v]:
+            for i in range(int(topo.nbr_count[v])):
+                u = int(topo.nbr[v, i])
+                a, b = (v, u) if v < u else (u, v)
                 d = float(np.linalg.norm(self.V[a] - self.V[b]))
-                # Link-only check (halfedge is_collapse_ok); skip connectivity scan.
                 if d < elength_fixed and not collapse_ok_for_edge(
                     a,
                     b,
                     self.V,
                     self.F,
                     check_connectivity=False,
-                    neighbors=neighbors,
-                    edge_faces=edge_faces,
+                    topo=topo,
                 ):
                     bad += 1
             if bad >= 2:
                 self.fixed[v] = True
                 newly += 1
         if newly:
-            self._log.info(
+            self._vinfo(
                 "detect_degeneracies: pinned %d (total fixed=%d)", newly, int(self.fixed.sum())
             )
         return newly
@@ -601,7 +617,7 @@ class MeanCurvatureFlowSkeletonization:
             last_it = it
             self._iter = it
             if self._timed_out():
-                self._log.info(
+                self._vinfo(
                     "stopping: timeout after %.3gs at iter %d",
                     float(self.timeout_seconds or 0.0),
                     it - 1,
@@ -609,14 +625,14 @@ class MeanCurvatureFlowSkeletonization:
                 break
             self.contract()
             if self._timed_out():
-                self._log.info(
+                self._vinfo(
                     "stopping: timeout after %.3gs during iter %d",
                     float(self.timeout_seconds or 0.0),
                     it,
                 )
                 break
             area = self._surface_area()
-            # Always log a compact progress line; detailed sanity every ~10%.
+            # Compact progress when verbose; detailed sanity every ~10% or on area jump.
             log_every = max(1, int(self.max_iterations) // 10)
             if self.verbose or it == 1 or it % log_every == 0:
                 self._sanity_check_state(stage="iter", prev_area=prev_area)
@@ -626,7 +642,7 @@ class MeanCurvatureFlowSkeletonization:
             if prev_area > 0 and abs(prev_area - area) < self.area_variation_factor * max(
                 self._area0, 1e-30
             ):
-                self._log.info("converged at iter %d area=%.4g", it, area)
+                self._vinfo("converged at iter %d area=%.4g", it, area)
                 break
             prev_area = area
             if self.F.shape[0] == 0:
@@ -635,6 +651,7 @@ class MeanCurvatureFlowSkeletonization:
         return last_it
 
     def meso_skeleton_mesh(self) -> tm.Trimesh:
+        """Return the current contracted meso-skeleton as a ``Trimesh``."""
         return tm.Trimesh(vertices=self.V.copy(), faces=self.F.copy(), process=False)
 
     def convert_to_skeleton(
@@ -647,14 +664,23 @@ class MeanCurvatureFlowSkeletonization:
         resample_spacing: float | None = None,
         keep_largest_component: bool = False,
     ):
-        """Convert the meso-skeleton surface into a 1D curve ``Skeleton``."""
-        from .skeleton import (
-            Skeleton,
-            _resolve_refine_options,
-            refine_skeleton_graph,
-        )
+        """Convert the meso-skeleton surface into a 1D curve ``Skeleton``.
 
-        self._log.info(
+        Parameters
+        ----------
+        refine, refine_spacing, refine_spacing_frac, compress_chains, resample_spacing :
+            Optional curve refinement (see :func:`pymcfs.skeleton.skeletonize`).
+        keep_largest_component :
+            If True, keep only the largest connected component of the curve graph.
+
+        Returns
+        -------
+        Skeleton
+        """
+        from .refine import resolve_refine_options, refine_skeleton_graph
+        from .skeleton import Skeleton
+
+        self._vinfo(
             "convert_to_skeleton: meso n=%d f=%d bbox=%s",
             self.V.shape[0],
             self.F.shape[0],
@@ -664,7 +690,7 @@ class MeanCurvatureFlowSkeletonization:
         # do not inherit an expired contraction deadline and return a partial
         # triangulated graph.
         G = meso_surface_to_curve_graph(self.V, self.F)
-        self._log.info(
+        self._vinfo(
             "convert_to_skeleton: raw curve nodes=%d edges=%d cc=%d",
             G.number_of_nodes(),
             G.number_of_edges(),
@@ -674,14 +700,14 @@ class MeanCurvatureFlowSkeletonization:
             comps = list(nx.connected_components(G))
             if len(comps) > 1:
                 largest = max(comps, key=len)
-                self._log.info(
+                self._vinfo(
                     "convert_to_skeleton: keeping largest of %d components (%d nodes)",
                     len(comps),
                     len(largest),
                 )
                 G = G.subgraph(largest).copy()
 
-        mode, spacing, spacing_frac = _resolve_refine_options(
+        mode, spacing, spacing_frac = resolve_refine_options(
             refine=refine,
             refine_spacing=refine_spacing,
             refine_spacing_frac=refine_spacing_frac,
@@ -693,7 +719,7 @@ class MeanCurvatureFlowSkeletonization:
             G = refine_skeleton_graph(
                 G, mode=mode, spacing=spacing, spacing_frac=spacing_frac
             )
-            self._log.info(
+            self._vinfo(
                 "convert_to_skeleton: refine mode=%s %d -> %d nodes",
                 mode,
                 n_before,
@@ -721,7 +747,7 @@ class MeanCurvatureFlowSkeletonization:
                     for u, v in edges_arr
                 )
             )
-            self._log.info(
+            self._vinfo(
                 "convert_to_skeleton: final nodes=%d edges=%d total_length=%.4g",
                 nodes_arr.shape[0],
                 edges_arr.shape[0],

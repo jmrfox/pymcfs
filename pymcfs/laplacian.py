@@ -115,16 +115,18 @@ def cotangent_laplacian(V: np.ndarray, F: np.ndarray, *, verbose: bool = False, 
     return L
 
 
-def starlab_cotangent_laplacian(V: np.ndarray, F: np.ndarray) -> sp.csr_matrix:
-    """Return the cotangent matrix used by Starlab ``mcfskel``.
+def mcfs_cotangent_laplacian(V: np.ndarray, F: np.ndarray) -> sp.csr_matrix:
+    """Return the cotangent Laplacian used by MCFS geometry contraction.
 
-    This intentionally mirrors ``CotangentLaplacianHelper`` rather than the
-    conventional half-scaled cotangent Laplacian:
+    Differs from :func:`cotangent_laplacian` (Pinkall–Polthier half-scale):
 
-    - each edge weight is the sum of its two opposite cotangents;
+    - each edge weight is the sum of its two opposite cotangents (not halved);
     - angle cosines are clamped to ``[-0.999, 0.999]``;
     - only a negative *summed edge weight* is clamped to zero;
     - off-diagonals are positive and the diagonal is their negative row sum.
+
+    Compatible with the Starlab ``mcfskel`` / ``CotangentLaplacianHelper``
+    convention used by the reference MCF skeletonization implementation.
     """
     V = np.asarray(V, dtype=float)
     F = np.asarray(F, dtype=int)

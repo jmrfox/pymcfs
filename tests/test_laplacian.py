@@ -6,7 +6,7 @@ from pymcfs.laplacian import (
     cotangent_laplacian,
     lumped_mass_matrix,
     mean_value_laplacian,
-    starlab_cotangent_laplacian,
+    mcfs_cotangent_laplacian,
 )
 
 
@@ -46,7 +46,7 @@ def test_mean_value_laplacian_properties():
     assert np.allclose(rowsum, 0.0, atol=1e-8)
 
 
-def test_starlab_cotangent_laplacian_matches_reference_scale():
+def test_mcfs_cotangent_laplacian_matches_reference_scale():
     # Regular tetrahedron: every opposite angle is 60 degrees, so Starlab's
     # unhalved interior-edge weight is 2*cot(60) = 2/sqrt(3).
     V = np.array(
@@ -58,7 +58,7 @@ def test_starlab_cotangent_laplacian_matches_reference_scale():
         ]
     )
     F = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]])
-    L = starlab_cotangent_laplacian(V, F)
+    L = mcfs_cotangent_laplacian(V, F)
     expected_weight = 2.0 / np.sqrt(3.0)
     dense = L.toarray()
     assert np.allclose(dense[np.triu_indices(4, k=1)], expected_weight)

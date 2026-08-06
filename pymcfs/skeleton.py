@@ -1,31 +1,43 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Union, Tuple, Dict, Iterable
+from typing import Optional, Union
 
 import logging
-import heapq
 from datetime import datetime, timezone
 import networkx as nx
 import numpy as np
-from scipy.spatial import cKDTree
 import trimesh as tm
-import plotly.graph_objects as go
 
-from .mcf import mean_curvature_flow, MCFResult
-from .medial import compute_voronoi_poles
+from .refine import (
+    RefineMode,
+    refine_skeleton,
+    refine_skeleton_graph,
+    resolve_refine_options,
+    _resample_polyline_arc_length,
+)
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-RefineMode = Literal["uniform", "compress"]
-
 
 @dataclass
 class Skeleton:
-    nodes: np.ndarray  # (k,3)
-    edges: np.ndarray  # (e,2) int indices into nodes (from pruned graph, may have cycles)
-    graph: nx.Graph    # pruned kNN graph, may contain cycles
+    """1D curve skeleton extracted from a contracted meso-skeleton surface.
+
+    Attributes
+    ----------
+    nodes : (k, 3) float ndarray
+        Node positions in 3D.
+    edges : (e, 2) int ndarray
+        Undirected edges as pairs of indices into ``nodes``.
+    graph : networkx.Graph
+        Same connectivity with node attribute ``pos`` and edge ``weight``.
+    """
+
+    nodes: np.ndarray
+    edges: np.ndarray
+    graph: nx.Graph
 
     def write_swc(
         self,
@@ -167,7 +179,7 @@ class Skeleton:
         mesh_opacity: float = 0.3,
         title: str | None = None,
         autoshow: bool = True,
-    ) -> "go.Figure":
+    ) -> object:
         """Interactive 3D visualization of the skeleton with optional mesh overlay.
 
         Parameters
@@ -199,6 +211,8 @@ class Skeleton:
         plotly.graph_objects.Figure
             The created Plotly figure.
         """
+        import plotly.graph_objects as go
+
         traces: list[go.BaseTraceType] = []
 
         # Optional mesh overlay
@@ -365,13 +379,17 @@ def _swc_bfs_order(G: nx.Graph) -> tuple[list[int], dict[int, int | None]]:
     return order, parent
 
 
-def _map_targets_to_points(points: np.ndarray, base_points: np.ndarray, base_targets: np.ndarray) -> np.ndarray:
-    if len(points) == 0:
-        return np.zeros((0, 3), dtype=float)
-    tree = cKDTree(base_points)
-    d, idx = tree.query(points, k=1)
-    return np.asarray(base_targets[idx], dtype=float)
-
+def _coerce_mesh(mesh: Union[tm.Trimesh, object]) -> tm.Trimesh:
+    """Accept ``trimesh.Trimesh`` or ``MeshManager``; raise ``TypeError`` otherwise."""
+    if isinstance(mesh, tm.Trimesh):
+        return mesh
+    try:
+        from .mesh import MeshManager
+    except Exception:
+        MeshManager = None  # type: ignore
+    if MeshManager is not None and isinstance(mesh, MeshManager):  # type: ignore
+        return mesh.to_trimesh()  # type: ignore[return-value]
+    raise TypeError("mesh must be a trimesh.Trimesh or MeshManager")
 
 
 def skeletonize(
@@ -386,6 +404,7 @@ def skeletonize(
     min_edge_length: float | None = None,
     max_triangle_angle: float = 110.0,
     area_variation_factor: float = 1e-4,
+    keep_largest_component: bool = False,
     refine: bool | RefineMode = False,
     refine_spacing: float | None = None,
     refine_spacing_frac: float | None = None,
@@ -397,36 +416,46 @@ def skeletonize(
 ) -> Skeleton:
     """Mean-curvature-flow skeletonization of a closed triangle mesh.
 
-    Primary parameters:
-    - ``w_H`` / ``quality_speed_tradeoff`` (default 0.1)
-    - ``w_M`` / ``medially_centered_speed_tradeoff`` (default 0.2)
+    Parameters
+    ----------
+    mesh :
+        Input closed triangle mesh (``trimesh.Trimesh`` or ``MeshManager``).
+    w_H, quality_speed_tradeoff :
+        Quality/speed tradeoff (default 0.1). Alias: ``quality_speed_tradeoff``.
+    w_M, medially_centered_speed_tradeoff :
+        Medial-centering tradeoff (default 0.2). Alias:
+        ``medially_centered_speed_tradeoff``. Used whenever ``w_M > 0``.
+    max_iterations, timeout_seconds :
+        Contraction stop limits.
+    min_edge_length, max_triangle_angle :
+        Remesh thresholds during contraction.
+    area_variation_factor :
+        Relative area change for convergence (vs initial surface area).
+    keep_largest_component :
+        If True, keep only the largest connected component of the curve graph.
+    refine, refine_spacing, refine_spacing_frac :
+        Optional post-conversion curve refinement (off by default).
+        ``refine=True`` / ``"uniform"`` arc-length resamples chains;
+        ``refine="compress"`` keeps only junctions/leaves.
+    compress_chains, resample_spacing :
+        Legacy aliases for refine when ``refine`` is left False.
+    validate :
+        Run mesh validation before contraction.
+    verbose, log :
+        Progress logging.
 
-    ``w_L`` is fixed at 1 (only weight ratios matter). Medial centering is used
-    whenever ``w_M > 0``.
+    Returns
+    -------
+    Skeleton
+        Curve skeleton with ``nodes``, ``edges``, and ``graph``.
 
-    Optional post-conversion refinement (non-core; off by default):
-    - ``refine=True`` / ``"uniform"``: arc-length resample chains between
-      junctions/leaves to even spacing (mild downsample by default).
-    - ``refine="compress"``: drop all degree-2 nodes, keep only junctions/leaves.
-    - ``refine_spacing``: absolute target edge length for ``uniform``.
-    - ``refine_spacing_frac``: target spacing as a fraction of the skeleton bbox
-      diagonal (used when ``refine_spacing`` is omitted).
-
-    Legacy aliases: ``compress_chains`` and ``resample_spacing`` map onto the
-    same refine path when ``refine`` is left False.
+    Raises
+    ------
+    TypeError
+        If ``mesh`` is not a Trimesh or MeshManager.
     """
     _log = log or logger
-    if isinstance(mesh, tm.Trimesh):
-        m = mesh
-    else:
-        try:
-            from .mesh import MeshManager  # type: ignore
-        except Exception:
-            MeshManager = None  # type: ignore
-        if MeshManager is not None and isinstance(mesh, MeshManager):  # type: ignore
-            m = mesh.to_trimesh()  # type: ignore[assignment]
-        else:
-            raise TypeError("mesh must be a trimesh.Trimesh or MeshManager")
+    m = _coerce_mesh(mesh)
 
     wh = float(quality_speed_tradeoff) if quality_speed_tradeoff is not None else float(w_H)
     wm = (
@@ -459,6 +488,7 @@ def skeletonize(
         refine_spacing_frac=refine_spacing_frac,
         compress_chains=bool(compress_chains),
         resample_spacing=resample_spacing,
+        keep_largest_component=bool(keep_largest_component),
     )
 
 
@@ -467,36 +497,52 @@ def thin_mesh(
     *,
     w_H: float = 0.1,
     w_M: float = 0.2,
+    quality_speed_tradeoff: float | None = None,
+    medially_centered_speed_tradeoff: float | None = None,
     max_iterations: int = 500,
     timeout_seconds: float | None = 120.0,
     min_edge_length: float | None = None,
     max_triangle_angle: float = 110.0,
+    area_variation_factor: float = 1e-4,
     validate: bool = True,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Contract a mesh with MCFS remeshing; return the meso-skeleton ``(V, F)``."""
+    """Contract a mesh with MCFS; return the meso-skeleton surface ``(V, F)``.
+
+    Parameters match :func:`skeletonize` contraction controls (no curve-graph
+    conversion). CGAL-style aliases ``quality_speed_tradeoff`` /
+    ``medially_centered_speed_tradeoff`` are accepted.
+
+    Returns
+    -------
+    V : (n, 3) float ndarray
+    F : (m, 3) int ndarray
+
+    Raises
+    ------
+    TypeError
+        If ``mesh`` is not a Trimesh or MeshManager.
+    """
     _log = log or logger
-    if isinstance(mesh, tm.Trimesh):
-        m = mesh
-    else:
-        try:
-            from .mesh import MeshManager  # type: ignore
-        except Exception:
-            MeshManager = None  # type: ignore
-        if MeshManager is not None and isinstance(mesh, MeshManager):  # type: ignore
-            m = mesh.to_trimesh()  # type: ignore[assignment]
-        else:
-            raise TypeError("mesh must be a trimesh.Trimesh or MeshManager")
+    m = _coerce_mesh(mesh)
+
+    wh = float(quality_speed_tradeoff) if quality_speed_tradeoff is not None else float(w_H)
+    wm = (
+        float(medially_centered_speed_tradeoff)
+        if medially_centered_speed_tradeoff is not None
+        else float(w_M)
+    )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
 
     driver = MeanCurvatureFlowSkeletonization(
         m,
-        w_H=float(w_H),
-        w_M=float(w_M),
+        w_H=wh,
+        w_M=wm,
         min_edge_length=min_edge_length,
         max_triangle_angle=float(max_triangle_angle),
+        area_variation_factor=float(area_variation_factor),
         max_iterations=int(max_iterations),
         timeout_seconds=timeout_seconds,
         validate=bool(validate),
@@ -516,12 +562,33 @@ def curve_skeleton_from_mesh(
     refine_spacing_frac: float | None = None,
     compress_chains: bool = False,
     resample_spacing: float | None = None,
+    keep_largest_component: bool = False,
 ) -> Skeleton:
-    """Convert a triangle mesh surface to a curve graph skeleton."""
+    """Convert a triangle mesh surface to a 1D curve-graph :class:`Skeleton`.
+
+    Parameters
+    ----------
+    V : (n, 3) float
+        Vertex positions (typically a meso-skeleton from :func:`thin_mesh`).
+    F : (m, 3) int
+        Triangle indices.
+    refine, refine_spacing, refine_spacing_frac, compress_chains, resample_spacing :
+        Same meaning as in :func:`skeletonize`.
+    keep_largest_component :
+        If True, keep only the largest connected component.
+
+    Returns
+    -------
+    Skeleton
+    """
     from .mcfs import meso_surface_to_curve_graph
 
     G = meso_surface_to_curve_graph(V, F)
-    mode, spacing, spacing_frac = _resolve_refine_options(
+    if keep_largest_component and G.number_of_nodes() > 0:
+        comps = list(nx.connected_components(G))
+        if len(comps) > 1:
+            G = G.subgraph(max(comps, key=len)).copy()
+    mode, spacing, spacing_frac = resolve_refine_options(
         refine=refine,
         refine_spacing=refine_spacing,
         refine_spacing_frac=refine_spacing_frac,
@@ -548,920 +615,15 @@ def curve_skeleton_from_mesh(
     return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)
 
 
-def _auto_voxel_size(mesh: tm.Trimesh) -> float:
-    # Choose voxel size as a small fraction of bbox diagonal
-    bb = mesh.bounding_box.extents
-    diag = float(np.linalg.norm(bb))
-    return max(diag * 0.01, 1e-4)
-
-
-def _voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
-    if len(points) == 0:
-        return points
-    # Compute voxel indices
-    mins = points.min(axis=0)
-    idx = np.floor((points - mins) / voxel_size).astype(np.int64)
-    # Hash to unique voxels
-    keys, inverse = np.unique(idx, axis=0, return_inverse=True)
-    # Average points in each voxel
-    out = np.zeros((len(keys), 3), dtype=float)
-    counts = np.bincount(inverse)
-    for d in range(3):
-        out[:, d] = np.bincount(inverse, weights=points[:, d]) / counts
-    return out
-
-
-def _knn_graph(points: np.ndarray, k: int) -> nx.Graph:
-    tree = cKDTree(points)
-    G = nx.Graph()
-    for i, p in enumerate(points):
-        G.add_node(i, pos=p)
-    # Query k+1 because first neighbor is the point itself
-    dists, nbrs = tree.query(points, k=min(k + 1, len(points)))
-    for i in range(len(points)):
-        for j, d in zip(nbrs[i], dists[i]):
-            if j == i or j < 0:
-                continue
-            w = float(d)
-            if G.has_edge(i, j):
-                # keep smallest weight if duplicate
-                if w < G[i][j]["weight"]:
-                    G[i][j]["weight"] = w
-            else:
-                G.add_edge(i, j, weight=w)
-    return G
-
-
-def _mesh_edge_graph(points: np.ndarray, faces: np.ndarray) -> nx.Graph:
-    """Build an undirected graph from triangle mesh faces.
-
-    Nodes correspond to vertex indices; edges exist for each unique mesh edge
-    with weight equal to Euclidean edge length between incident vertices.
-    """
-    G = nx.Graph()
-    for i, p in enumerate(points):
-        G.add_node(i, pos=np.asarray(p, dtype=float))
-    if faces.size == 0:
-        return G
-    # Unique edges
-    edges = set()
-    f = faces.astype(int, copy=False)
-    for tri in f:
-        i0, i1, i2 = int(tri[0]), int(tri[1]), int(tri[2])
-        for (a, b) in ((i0, i1), (i1, i2), (i2, i0)):
-            if a == b:
-                continue
-            e = (a, b) if a < b else (b, a)
-            edges.add(e)
-    # Add with weights
-    P = points
-    for (a, b) in edges:
-        w = float(np.linalg.norm(P[a] - P[b]))
-        G.add_edge(a, b, weight=w)
-    return G
-
-
-def _mesh_unique_edges(faces: np.ndarray) -> np.ndarray:
-    """Return unique undirected edges from triangle faces as (E,2) int array sorted within each pair."""
-    if faces.size == 0:
-        return np.zeros((0, 2), dtype=int)
-    e = set()
-    for tri in faces:
-        i0, i1, i2 = int(tri[0]), int(tri[1]), int(tri[2])
-        for (a, b) in ((i0, i1), (i1, i2), (i2, i0)):
-            if a == b:
-                continue
-            if a > b:
-                a, b = b, a
-            e.add((a, b))
-    if not e:
-        return np.zeros((0, 2), dtype=int)
-    arr = np.fromiter((i for ab in e for i in ab), dtype=int)
-    return arr.reshape(-1, 2)
-
-
-def _vertex_degrees_from_faces(nv: int, faces: np.ndarray) -> np.ndarray:
-    """Approximate per-vertex degree from unique mesh edges."""
-    deg = np.zeros(nv, dtype=int)
-    edges = _mesh_unique_edges(faces)
-    if edges.size > 0:
-        np.add.at(deg, edges[:, 0], 1)
-        np.add.at(deg, edges[:, 1], 1)
-    return deg
-
-
-def _mesh_edge_collapse_thinning(
-    V: np.ndarray,
-    F: np.ndarray,
-    *,
-    passes: int = 1,
-    length_percentile: float = 0.2,
-    preserve_branch_degree: int = 3,
-    mode: str = "percentile",
-    ratio: float = 0.1,
-    protect_weights: np.ndarray | None = None,
-    protect_threshold: float | None = None,
-    protect_targets: np.ndarray | None = None,
-    closest_pole_policy: bool = False,
-    closest_pole_tol: float = 1.05,
-    _log: Optional[logging.Logger] = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Greedy mesh edge-collapse thinning.
-
-    Two modes:
-    - mode="percentile": collapse edges shorter than `length_percentile` threshold per pass.
-    - mode="pq": collapse up to `ratio` fraction (0..1) of globally shortest edges per pass (single-shot order).
-    - mode="pq_heap": priority queue with stale-entry handling; after each collapse, nearby edge lengths are effectively updated (via re-push), improving local ordering.
-
-    Collapses merge endpoints to midpoints, skipping vertices with degree >= preserve_branch_degree.
-    Compacts vertices and drops degenerate faces after each pass.
-    """
-    if F.size == 0 or V.size == 0:
-        return V.copy(), F.copy()
-
-    V_curr = V.copy()
-    F_curr = F.copy().astype(int, copy=False)
-
-    for p in range(max(1, passes)):
-        nv = V_curr.shape[0]
-        edges = _mesh_unique_edges(F_curr)
-        if edges.size == 0:
-            break
-        L = np.linalg.norm(V_curr[edges[:, 0]] - V_curr[edges[:, 1]], axis=1)
-        if L.size == 0:
-            break
-        pct = float(np.clip(length_percentile, 0.0, 1.0))
-        thr = float(np.quantile(L, pct))
-        if not np.isfinite(thr) or thr <= 0:
-            thr = float(np.min(L[L > 0])) if np.any(L > 0) else 0.0
-
-        deg = _vertex_degrees_from_faces(nv, F_curr)
-        parent = np.arange(nv, dtype=int)
-        alive = np.ones(nv, dtype=bool)
-
-        order = np.argsort(L)
-        collapsed = 0
-        # Determine stopping rule based on mode
-        max_collapses = None
-        if mode in ("pq", "pq_heap"):
-            r = float(np.clip(ratio, 0.0, 1.0))
-            max_collapses = int(np.floor(r * len(order)))
-
-        def find(x: int) -> int:
-            while parent[x] != parent[parent[x]]:
-                parent[x] = parent[parent[x]]
-            return parent[x]
-
-        if mode == "pq_heap":
-            # Build adjacency (edge indices per vertex) to re-push affected edges after collapses
-            adj: list[list[int]] = [[] for _ in range(nv)]
-            for ei, (i, j) in enumerate(edges):
-                adj[int(i)].append(ei)
-                adj[int(j)].append(ei)
-            heap: list[tuple[float, int]] = [(float(L[i]), int(i)) for i in range(len(L))]
-            heapq.heapify(heap)
-
-            while heap and (max_collapses is None or collapsed < max_collapses):
-                d, ei = heapq.heappop(heap)
-                a0, b0 = int(edges[ei, 0]), int(edges[ei, 1])
-                a = find(a0)
-                b = find(b0)
-                if a == b:
-                    continue
-                # Recompute current length
-                dcur = float(np.linalg.norm(V_curr[a] - V_curr[b]))
-                # Skip if this entry is stale and no longer minimal for this pair
-                if dcur > d * 1.0001:
-                    # push updated current value and continue
-                    heapq.heappush(heap, (dcur, ei))
-                    continue
-                # Degree and medial-protect checks
-                if deg[a] >= preserve_branch_degree or deg[b] >= preserve_branch_degree:
-                    continue
-                if protect_weights is not None and protect_threshold is not None:
-                    if a < protect_weights.shape[0] and b < protect_weights.shape[0]:
-                        if min(protect_weights[a], protect_weights[b]) >= protect_threshold:
-                            continue
-                if not _edge_link_condition_ok(a, b, F_curr, incident, neighbors):
-                    continue
-                if _collapse_creates_degeneracy(a, b, F_curr, parent, incident):
-                    continue
-                # Closest-pole policy: midpoint should not move far from pole targets
-                if closest_pole_policy and protect_targets is not None:
-                    if a < protect_targets.shape[0] and b < protect_targets.shape[0]:
-                        ta = protect_targets[a]
-                        tb = protect_targets[b]
-                        d_a0 = float(np.linalg.norm(V_curr[a] - ta))
-                        d_b0 = float(np.linalg.norm(V_curr[b] - tb))
-                        mid = 0.5 * (V_curr[a] + V_curr[b])
-                        d_a1 = float(np.linalg.norm(mid - ta))
-                        d_b1 = float(np.linalg.norm(mid - tb))
-                        tol = float(max(1.0, closest_pole_tol))
-                        if (d_a1 > tol * d_a0) and (d_b1 > tol * d_b0):
-                            continue
-                # Collapse b->a
-                V_curr[a] = 0.5 * (V_curr[a] + V_curr[b])
-                parent[b] = a
-                alive[b] = False
-                collapsed += 1
-                # After merge, affected edges include those incident to a or b; push updated lengths
-                for eidx in adj[a0] + adj[b0]:
-                    i, j = int(edges[eidx, 0]), int(edges[eidx, 1])
-                    ii, jj = find(i), find(j)
-                    if ii == jj:
-                        continue
-                    heapq.heappush(heap, (float(np.linalg.norm(V_curr[ii] - V_curr[jj])), eidx))
-                if max_collapses is not None and collapsed >= max_collapses:
-                    break
-        else:
-            # percentile or simple pq (single-shot order)
-            for idx in order:
-                a, b = int(edges[idx, 0]), int(edges[idx, 1])
-                if mode != "pq" and L[idx] > thr:
-                    break
-                if parent[a] != a or parent[b] != b:
-                    continue
-                if deg[a] >= preserve_branch_degree or deg[b] >= preserve_branch_degree:
-                    continue
-                # Medial protection: if both endpoints strongly protected, skip collapse
-                if protect_weights is not None and protect_threshold is not None:
-                    if a < protect_weights.shape[0] and b < protect_weights.shape[0]:
-                        if min(protect_weights[a], protect_weights[b]) >= protect_threshold:
-                            continue
-                # Topology safety: link-condition check for manifoldness
-                if not _edge_link_condition_ok(a, b, F_curr, incident, neighbors):
-                    continue
-                # Local validity: ensure collapsing b->a doesn't create degenerate faces
-                if _collapse_creates_degeneracy(a, b, F_curr, parent, incident):
-                    continue
-                V_curr[a] = 0.5 * (V_curr[a] + V_curr[b])
-                parent[b] = a
-                alive[b] = False
-                collapsed += 1
-                if max_collapses is not None and collapsed >= max_collapses:
-                    break
-
-        if collapsed > 0:
-            # path compression
-            for i in range(nv):
-                while parent[i] != parent[parent[i]]:
-                    parent[i] = parent[parent[i]]
-            Fm = parent[F_curr]
-            keep = (Fm[:, 0] != Fm[:, 1]) & (Fm[:, 1] != Fm[:, 2]) & (Fm[:, 2] != Fm[:, 0])
-            Fm = Fm[keep]
-            roots = np.unique(parent[alive])
-            new_index = -np.ones(nv, dtype=int)
-            new_index[roots] = np.arange(len(roots))
-            V_curr = V_curr[roots]
-            F_curr = new_index[Fm]
-            if _log is not None:
-                _log.info(
-                    "Mesh collapse pass %d: collapsed=%d, nv->%d, nf->%d, thr=%.3g",
-                    p + 1,
-                    collapsed,
-                    V_curr.shape[0],
-                    F_curr.shape[0],
-                    thr,
-                )
-        else:
-            break
-
-    return V_curr, F_curr
-
-
-def _vertex_incident_faces(F: np.ndarray, nv: int) -> list[list[int]]:
-    inc: list[list[int]] = [[] for _ in range(nv)]
-    for fi, tri in enumerate(F):
-        inc[int(tri[0])].append(fi)
-        inc[int(tri[1])].append(fi)
-        inc[int(tri[2])].append(fi)
-    return inc
-
-
-def _vertex_neighbors_from_faces(F: np.ndarray, nv: int) -> list[set[int]]:
-    nbrs: list[set[int]] = [set() for _ in range(nv)]
-    for tri in F:
-        i0, i1, i2 = int(tri[0]), int(tri[1]), int(tri[2])
-        nbrs[i0].update((i1, i2))
-        nbrs[i1].update((i0, i2))
-        nbrs[i2].update((i0, i1))
-    return nbrs
-
-
-def _edge_link_condition_ok(
-    a: int,
-    b: int,
-    F: np.ndarray,
-    incident: list[list[int]],
-    neighbors: list[set[int]],
-) -> bool:
-    """Approximate link condition for collapsing edge (a,b) in a manifold triangle mesh.
-
-    For a manifold interior edge, the common neighbors of a and b should equal the set of
-    third vertices of faces incident to both a and b, and that set should have size <= 2.
-    """
-    # Identify third vertices of faces that contain both a and b
-    third: set[int] = set()
-    faces_a = incident[a]
-    faces_b = set(incident[b])
-    for fi in faces_a:
-        tri = F[fi]
-        ia, ib, ic = int(tri[0]), int(tri[1]), int(tri[2])
-        vs = {ia, ib, ic}
-        if a in vs and b in vs and len(vs) == 3:
-            vs.remove(a)
-            vs.remove(b)
-            c = vs.pop()
-            third.add(c)
-    # Common neighbors from 1-ring
-    common = neighbors[a].intersection(neighbors[b])
-    # Allow boundary-like cases where third may be size 1
-    if len(third) > 2:
-        return False
-    # Require that the common 1-ring equals the third set (no extra common neighbors)
-    if common != third:
-        return False
-    return True
-def _collapse_creates_degeneracy(
-    a: int,
-    b: int,
-    F: np.ndarray,
-    parent: np.ndarray,
-    incident: list[list[int]],
-) -> bool:
-    """Check if collapsing vertex b into a makes any incident face degenerate.
-
-    We simulate the local mapping b->a on faces incident to a or b and check if any
-    face ends up with duplicate vertex indices.
-    """
-    # Build a minimal local map (copy only affected entries)
-    # Use parent as base but override b->a
-    # Check faces touching a or b
-    touched = set(incident[a]) | set(incident[b])
-    for fi in touched:
-        v0, v1, v2 = int(parent[F[fi, 0]]), int(parent[F[fi, 1]]), int(parent[F[fi, 2]])
-        # Apply local collapse b->a
-        if v0 == b:
-            v0 = a
-        if v1 == b:
-            v1 = a
-        if v2 == b:
-            v2 = a
-        # Degenerate if any two indices equal
-        if v0 == v1 or v1 == v2 or v2 == v0:
-            return True
-    return False
-def _rebuild_knn_graph_from_existing_nodes(G_in: nx.Graph, k: int) -> nx.Graph:
-    points = np.array([G_in.nodes[i]["pos"] for i in G_in.nodes])
-    G = _knn_graph(points, k=k)
-    return G
-
-
-def _prune_short_leaves(G: nx.Graph, quantile: float = 0.7, min_keep_edges: int = 1) -> None:
-    if G.number_of_edges() == 0:
-        return
-    # Compute threshold
-    elens = np.array([d["weight"] for _, _, d in G.edges(data=True)], dtype=float)
-    thr = float(np.quantile(elens, quantile)) if len(elens) > 0 else 0.0
-
-    changed = True
-    while changed:
-        changed = False
-        leaves = [n for n in list(G.nodes) if G.degree(n) <= 1]
-        if len(G.edges) <= min_keep_edges:
-            break
-        for n in leaves:
-            nbrs = list(G.neighbors(n))
-            if not nbrs:
-                if G.number_of_nodes() > 1:
-                    G.remove_node(n)
-                changed = True
-                continue
-            u = nbrs[0]
-            w = G[n][u]["weight"]
-            if w < thr and G.number_of_edges() > min_keep_edges:
-                G.remove_node(n)
-                changed = True
-
-
-def _graph_priority_edge_collapse(
-    G: nx.Graph,
-    *,
-    preserve_branch_degree: int = 3,
-    length_percentile: float = 0.3,
-    min_edges_target: int | None = None,
-    verbose: bool = False,
-    _log: Optional[logging.Logger] = None,
-    protect_weights: np.ndarray | None = None,
-    protect_threshold: float | None = None,
-    mode: str = "percentile",
-    ratio: float = 0.1,
-    targets: np.ndarray | None = None,
-    closest_pole_policy: bool = False,
-    closest_pole_tol: float = 1.05,
-) -> None:
-    """Iteratively collapse the shortest edges in a point-graph while preserving junctions.
-
-    - Never collapse an edge if either endpoint has degree >= preserve_branch_degree
-      (heuristic to preserve branch points akin to Skelcollapse's behavior).
-    - When collapsing (u,v), create a new node at midpoint and reconnect neighbors.
-    - Remove duplicate edges and self-loops; keep minimal weights.
-
-    Modifies G in-place.
-    """
-    if G.number_of_edges() == 0:
-        return
-    log = _log or logger
-
-    # Compute all edge lengths
-    def edge_length(u: int, v: int) -> float:
-        pu = G.nodes[u]["pos"]
-        pv = G.nodes[v]["pos"]
-        return float(np.linalg.norm(pu - pv))
-
-    edges = list(G.edges())
-    lengths = np.array([edge_length(u, v) for (u, v) in edges], dtype=float)
-    if len(lengths) == 0:
-        return
-
-    # Threshold: collapse very short edges (default below given percentile)
-    pct = float(np.clip(length_percentile, 0.0, 1.0))
-    thr = float(np.quantile(lengths, pct))
-    if thr <= 0:
-        thr = float(np.min(lengths[lengths > 0])) if np.any(lengths > 0) else 0.0
-
-    # Priority order by length
-    order = np.argsort(lengths)
-    collapsed = 0
-
-    # Determine stopping rule based on mode
-    max_collapses = None
-    if mode == "pq":
-        r = float(np.clip(ratio, 0.0, 1.0))
-        max_collapses = int(np.floor(r * len(order)))
-
-    for idx in order:
-        if min_edges_target is not None and G.number_of_edges() <= min_edges_target:
-            break
-        (u, v) = edges[idx]
-        if u not in G or v not in G or not G.has_edge(u, v):
-            continue
-        # Skip if long
-        d = edge_length(u, v)
-        if mode != "pq" and d > thr:
-            continue
-        # Preserve high-degree junctions
-        if G.degree[u] >= preserve_branch_degree or G.degree[v] >= preserve_branch_degree:
-            continue
-        # Medial protection on nodes
-        if protect_weights is not None and protect_threshold is not None:
-            # Node order is 0..N-1 after relabeling above
-            if u < protect_weights.shape[0] and v < protect_weights.shape[0]:
-                if min(protect_weights[u], protect_weights[v]) >= protect_threshold:
-                    continue
-
-        # Closest-pole policy: merging midpoint should not move far from mapped pole targets
-        if closest_pole_policy and targets is not None and len(targets) > 0:
-            if u < targets.shape[0] and v < targets.shape[0]:
-                tu = targets[u]
-                tv = targets[v]
-                pu = G.nodes[u]["pos"]
-                pv = G.nodes[v]["pos"]
-                mid = 0.5 * (pu + pv)
-                du0 = float(np.linalg.norm(pu - tu))
-                dv0 = float(np.linalg.norm(pv - tv))
-                du1 = float(np.linalg.norm(mid - tu))
-                dv1 = float(np.linalg.norm(mid - tv))
-                tol = float(max(1.0, closest_pole_tol))
-                if (du1 > tol * du0) and (dv1 > tol * dv0):
-                    continue
-
-        # Merge u and v into a new node w at midpoint
-        pu = G.nodes[u]["pos"]
-        pv = G.nodes[v]["pos"]
-        wpos = 0.5 * (pu + pv)
-
-        # Create new node id
-        w = max(G.nodes) + 1 if G.number_of_nodes() > 0 else 0
-        G.add_node(w, pos=wpos)
-
-        # Collect neighbors (excluding u,v)
-        nbrs: set[int] = set(G.neighbors(u)) | set(G.neighbors(v))
-        nbrs.discard(u)
-        nbrs.discard(v)
-
-        # Remove u,v and connect w to neighbors with updated weights
-        G.remove_node(u)
-        G.remove_node(v)
-
-        for a in nbrs:
-            pa = G.nodes[a]["pos"]
-            wlen = float(np.linalg.norm(pa - wpos))
-            if a == w:
-                continue
-            if G.has_edge(a, w):
-                if wlen < G[a][w]["weight"]:
-                    G[a][w]["weight"] = wlen
-            else:
-                G.add_edge(a, w, weight=wlen)
-
-        collapsed += 1
-
-    if verbose:
-        log.info("Edge-collapse: collapsed %d edges below thr=%.3g; nodes=%d, edges=%d", collapsed, thr, G.number_of_nodes(), G.number_of_edges())
-
-
-def _map_weights_to_points(points: np.ndarray, base_points: np.ndarray, base_weights: np.ndarray) -> np.ndarray:
-    """Map scalar weights from base_points onto points via nearest neighbor.
-
-    Returns an array of shape (len(points),) with weights in the range of base_weights.
-    """
-    if len(points) == 0:
-        return np.zeros((0,), dtype=float)
-    tree = cKDTree(base_points)
-    d, idx = tree.query(points, k=1)
-    w = base_weights[idx]
-    return np.asarray(w, dtype=float)
-
-
-def _compress_degree_two_chains(G: nx.Graph) -> nx.Graph:
-    """Compress sequences of degree-2 nodes into single edges connecting junctions.
-
-    - Junctions are nodes with degree != 2; degree-1 leaves and degree>=3 junctions remain.
-    - Chains between junctions become a single edge with weight equal to the sum of
-      intermediate edge weights. Node positions for junctions are preserved.
-    - If the entire graph is a single cycle (all degree==2), return G unchanged.
-    """
-    if G.number_of_nodes() == 0:
-        return G
-    deg = dict(G.degree())
-    junctions = [n for n, d in deg.items() if d != 2]
-    if len(junctions) == 0:
-        # likely a pure cycle; leave as-is
-        return G
-
-    NG = nx.Graph()
-    # Copy junction nodes with positions
-    for n in junctions:
-        NG.add_node(n, pos=np.array(G.nodes[n]["pos"]))
-
-    visited: set[tuple[int, int]] = set()
-    for u in junctions:
-        for v in G.neighbors(u):
-            if (u, v) in visited or (v, u) in visited:
-                continue
-            path_len = float(G[u][v].get("weight", np.linalg.norm(G.nodes[u]["pos"] - G.nodes[v]["pos"])) )
-            prev = u
-            curr = v
-            visited.add((u, v))
-            # Walk forward through degree-2 nodes
-            while deg.get(curr, 0) == 2 and curr not in junctions:
-                nbrs = list(G.neighbors(curr))
-                nxt = nbrs[0] if nbrs[1] == prev else nbrs[1]
-                path_len += float(G[curr][nxt].get("weight", np.linalg.norm(G.nodes[curr]["pos"] - G.nodes[nxt]["pos"])) )
-                prev, curr = curr, nxt
-                visited.add((prev, curr))
-
-            # Now curr is a junction (or leaf)
-            a, b = u, curr
-            if a == b:
-                continue
-            w = path_len
-            # Ensure nodes exist
-            if a not in NG:
-                NG.add_node(a, pos=np.array(G.nodes[a]["pos"]))
-            if b not in NG:
-                NG.add_node(b, pos=np.array(G.nodes[b]["pos"]))
-            if NG.has_edge(a, b):
-                # keep minimal weight if duplicate, though duplicates should be rare
-                if w < NG[a][b]["weight"]:
-                    NG[a][b]["weight"] = w
-            else:
-                NG.add_edge(a, b, weight=w)
-
-    return NG
-
-
-def _resample_edges_uniform(G_in: nx.Graph, spacing: float) -> nx.Graph:
-    """Subdivide edges to have segments approximately equal to spacing.
-
-    Builds a new graph with new node IDs. Original junction node positions are
-    preserved; intermediate nodes are inserted along edges at uniform steps.
-    Chord-based only (does not follow multi-edge chains). Prefer
-    :func:`_resample_chains_uniform` for skeleton refinement.
-    """
-    if G_in.number_of_edges() == 0:
-        return G_in
-    NG = nx.Graph()
-    # Map original node -> new node id
-    node_map: dict[int, int] = {}
-
-    def ensure_node(n: int) -> int:
-        if n in node_map:
-            return node_map[n]
-        nid = NG.number_of_nodes()
-        NG.add_node(nid, pos=np.array(G_in.nodes[n]["pos"]))
-        node_map[n] = nid
-        return nid
-
-    for u, v, data in G_in.edges(data=True):
-        p0 = np.array(G_in.nodes[u]["pos"])  # type: ignore[index]
-        p1 = np.array(G_in.nodes[v]["pos"])  # type: ignore[index]
-        dist = float(np.linalg.norm(p1 - p0))
-        if dist <= 0:
-            # degenerate, just ensure nodes exist and add zero edge
-            a = ensure_node(u)
-            b = ensure_node(v)
-            if a != b and not NG.has_edge(a, b):
-                NG.add_edge(a, b, weight=0.0)
-            continue
-        segs = max(1, int(np.ceil(dist / spacing)))
-        a = ensure_node(u)
-        if segs == 1:
-            b = ensure_node(v)
-            if a != b:
-                NG.add_edge(a, b, weight=dist)
-            continue
-        # Insert intermediate nodes
-        step = (p1 - p0) / segs
-        prev = a
-        for s in range(1, segs):
-            pos = p0 + step * s
-            nid = NG.number_of_nodes()
-            NG.add_node(nid, pos=pos)
-            NG.add_edge(prev, nid, weight=float(np.linalg.norm(step)))
-            prev = nid
-        b = ensure_node(v)
-        NG.add_edge(prev, b, weight=float(np.linalg.norm(step)))
-
-    return NG
-
-
-def _edge_euclidean(G: nx.Graph, u: int, v: int) -> float:
-    data = G[u][v]
-    if "weight" in data:
-        return float(data["weight"])
-    pu = np.asarray(G.nodes[u]["pos"], dtype=float)
-    pv = np.asarray(G.nodes[v]["pos"], dtype=float)
-    return float(np.linalg.norm(pu - pv))
-
-
-def _median_edge_length(G: nx.Graph) -> float:
-    if G.number_of_edges() == 0:
-        return 1.0
-    lengths = [_edge_euclidean(G, u, v) for u, v in G.edges()]
-    med = float(np.median(lengths))
-    return med if med > 0 else float(np.mean(lengths) or 1.0)
-
-
-def _skeleton_bbox_diagonal(G: nx.Graph) -> float:
-    if G.number_of_nodes() == 0:
-        return 1.0
-    P = np.asarray([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
-    return float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
-
-
-def _iter_skeleton_chains(G: nx.Graph) -> list[tuple[list[int], bool]]:
-    """Yield ``(node_path, closed)`` chains between terminals, or closed cycles."""
-    if G.number_of_nodes() == 0:
-        return []
-    deg = dict(G.degree())
-    terminals = {n for n, d in deg.items() if d != 2}
-    chains: list[tuple[list[int], bool]] = []
-    visited: set[tuple[int, int]] = set()
-
-    def edge_key(a: int, b: int) -> tuple[int, int]:
-        return (a, b) if a < b else (b, a)
-
-    if not terminals:
-        # Pure cycle component(s): emit one closed loop per connected component.
-        for comp in nx.connected_components(G):
-            sub = G.subgraph(comp)
-            if sub.number_of_edges() == 0:
-                continue
-            start = next(iter(sub.nodes))
-            cycle_edges = nx.find_cycle(sub, source=start)
-            path = [u for u, _v in cycle_edges]
-            chains.append((path, True))
-        return chains
-
-    for t in terminals:
-        for nbr in G.neighbors(t):
-            ek = edge_key(t, nbr)
-            if ek in visited:
-                continue
-            path = [t, nbr]
-            visited.add(ek)
-            prev, curr = t, nbr
-            while deg.get(curr, 0) == 2:
-                nxts = [x for x in G.neighbors(curr) if x != prev]
-                if not nxts:
-                    break
-                nxt = nxts[0]
-                visited.add(edge_key(curr, nxt))
-                path.append(nxt)
-                prev, curr = curr, nxt
-            chains.append((path, False))
-    return chains
-
-
-def _resample_polyline_arc_length(
-    points: np.ndarray,
-    spacing: float,
-    *,
-    closed: bool = False,
-) -> np.ndarray:
-    """Resample a polyline (or closed loop) to roughly uniform arc-length spacing."""
-    P = np.asarray(points, dtype=float)
-    if P.ndim != 2 or P.shape[0] == 0:
-        return P.copy()
-    if P.shape[0] == 1:
-        return P.copy()
-    if spacing <= 0:
-        raise ValueError("spacing must be positive")
-
-    if closed:
-        segs = np.linalg.norm(np.vstack([P[1:], P[:1]]) - P, axis=1)
-    else:
-        segs = np.linalg.norm(P[1:] - P[:-1], axis=1)
-    cum = np.concatenate([[0.0], np.cumsum(segs)])
-    total = float(cum[-1])
-    if total <= 1e-15:
-        return P[:1].copy() if not closed else P[:1].copy()
-
-    if closed:
-        n_segs = max(3, int(np.ceil(total / spacing - 1e-12)))
-        targets = (np.arange(n_segs, dtype=float) * (total / n_segs)) % total
-    else:
-        n_segs = max(1, int(np.ceil(total / spacing - 1e-12)))
-        targets = np.linspace(0.0, total, n_segs + 1)
-
-    # Extend for interpolation lookup on open curves; for closed, wrap.
-    if closed:
-        P_ext = np.vstack([P, P[0]])
-        cum_ext = cum  # already includes full loop length at end
-    else:
-        P_ext = P
-        cum_ext = cum
-
-    out = np.empty((targets.shape[0], 3), dtype=float)
-    for i, t in enumerate(targets):
-        # Find segment with cum_ext[j] <= t <= cum_ext[j+1]
-        j = int(np.searchsorted(cum_ext, t, side="right") - 1)
-        j = max(0, min(j, len(cum_ext) - 2))
-        t0, t1 = cum_ext[j], cum_ext[j + 1]
-        if t1 <= t0:
-            out[i] = P_ext[j]
-            continue
-        alpha = (t - t0) / (t1 - t0)
-        out[i] = (1.0 - alpha) * P_ext[j] + alpha * P_ext[j + 1]
-    if not closed:
-        out[0] = P[0]
-        out[-1] = P[-1]
-    return out
-
-
-def _resample_chains_uniform(G: nx.Graph, spacing: float) -> nx.Graph:
-    """Resample each junction-to-junction chain by arc length at target ``spacing``.
-
-    Junctions and leaves keep their positions; degree-2 samples are rebuilt so
-    spacing is more even and typically slightly coarser than the raw MCFS curve.
-    """
-    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-        return G
-    spacing = float(spacing)
-    if spacing <= 0:
-        raise ValueError("spacing must be positive")
-
-    chains = _iter_skeleton_chains(G)
-    if not chains:
-        return G
-
-    NG = nx.Graph()
-    node_map: dict[int, int] = {}
-
-    def ensure_terminal(n: int) -> int:
-        if n in node_map:
-            return node_map[n]
-        nid = NG.number_of_nodes()
-        NG.add_node(nid, pos=np.asarray(G.nodes[n]["pos"], dtype=float).copy())
-        node_map[n] = nid
-        return nid
-
-    for path, closed in chains:
-        pts = np.asarray([G.nodes[n]["pos"] for n in path], dtype=float)
-        sampled = _resample_polyline_arc_length(pts, spacing, closed=closed)
-        if closed:
-            ids = []
-            for pos in sampled:
-                nid = NG.number_of_nodes()
-                NG.add_node(nid, pos=np.asarray(pos, dtype=float))
-                ids.append(nid)
-            for a, b in zip(ids, ids[1:] + ids[:1]):
-                w = float(np.linalg.norm(NG.nodes[a]["pos"] - NG.nodes[b]["pos"]))
-                NG.add_edge(a, b, weight=w)
-            continue
-
-        ids: list[int] = []
-        for i, pos in enumerate(sampled):
-            if i == 0:
-                ids.append(ensure_terminal(path[0]))
-            elif i == len(sampled) - 1:
-                ids.append(ensure_terminal(path[-1]))
-            else:
-                nid = NG.number_of_nodes()
-                NG.add_node(nid, pos=np.asarray(pos, dtype=float))
-                ids.append(nid)
-        for a, b in zip(ids[:-1], ids[1:]):
-            if a == b:
-                continue
-            w = float(np.linalg.norm(NG.nodes[a]["pos"] - NG.nodes[b]["pos"]))
-            NG.add_edge(a, b, weight=w)
-
-    return NG
-
-
-def _resolve_refine_options(
-    *,
-    refine: bool | RefineMode = False,
-    refine_spacing: float | None = None,
-    refine_spacing_frac: float | None = None,
-    compress_chains: bool = False,
-    resample_spacing: float | None = None,
-) -> tuple[RefineMode | None, float | None, float | None]:
-    """Map public refine / legacy flags to ``(mode, spacing, spacing_frac)``."""
-    if refine is True:
-        return "uniform", refine_spacing, refine_spacing_frac
-    if isinstance(refine, str):
-        if refine not in ("uniform", "compress"):
-            raise ValueError(f"unknown refine mode: {refine!r}")
-        return refine, refine_spacing, refine_spacing_frac  # type: ignore[return-value]
-    # Legacy aliases when refine is left off.
-    if resample_spacing is not None and float(resample_spacing) > 0:
-        return "uniform", float(resample_spacing), None
-    if compress_chains:
-        return "compress", None, None
-    return None, None, None
-
-
-def refine_skeleton_graph(
-    G: nx.Graph,
-    *,
-    mode: RefineMode = "uniform",
-    spacing: float | None = None,
-    spacing_frac: float | None = None,
-) -> nx.Graph:
-    """Refine a skeleton curve graph in-place-style (returns a new graph).
-
-    Parameters
-    ----------
-    mode :
-        ``"uniform"`` resample chains by arc length (default), or ``"compress"``
-        to keep only junctions/leaves.
-    spacing :
-        Absolute target segment length for ``uniform``. If omitted, uses
-        ``spacing_frac * bbox_diag``, else ``2 * median_edge_length``.
-    spacing_frac :
-        Relative spacing as a fraction of the skeleton axis-aligned bbox diagonal.
-    """
-    if G.number_of_nodes() == 0:
-        return G
-    if mode == "compress":
-        return _compress_degree_two_chains(G)
-    if mode != "uniform":
-        raise ValueError(f"unknown refine mode: {mode!r}")
-
-    if spacing is not None and spacing > 0:
-        target = float(spacing)
-    elif spacing_frac is not None and spacing_frac > 0:
-        target = float(spacing_frac) * _skeleton_bbox_diagonal(G)
-    else:
-        target = 2.0 * _median_edge_length(G)
-    return _resample_chains_uniform(G, target)
-
-
-def refine_skeleton(
-    skeleton: Skeleton,
-    *,
-    mode: RefineMode = "uniform",
-    spacing: float | None = None,
-    spacing_frac: float | None = None,
-) -> Skeleton:
-    """Refine a :class:`Skeleton` curve graph; returns a new instance."""
-    G = refine_skeleton_graph(
-        skeleton.graph, mode=mode, spacing=spacing, spacing_frac=spacing_frac
-    )
-    mapping = {n: i for i, n in enumerate(G.nodes)}
-    if mapping:
-        G = nx.relabel_nodes(G, mapping, copy=True)
-    nodes_arr = (
-        np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
-        if G.number_of_nodes()
-        else np.zeros((0, 3))
-    )
-    edges_arr = (
-        np.array([[u, v] for u, v in G.edges], dtype=int)
-        if G.number_of_edges()
-        else np.zeros((0, 2), dtype=int)
-    )
-    return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)
+# Re-export refine API for stable ``from pymcfs.skeleton import …``
+__all__ = [
+    "Skeleton",
+    "skeletonize",
+    "thin_mesh",
+    "curve_skeleton_from_mesh",
+    "refine_skeleton",
+    "refine_skeleton_graph",
+    "resolve_refine_options",
+    "RefineMode",
+    "_resample_polyline_arc_length",
+]
