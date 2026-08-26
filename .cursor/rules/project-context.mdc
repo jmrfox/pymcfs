@@ -20,7 +20,7 @@ alwaysApply: true
 
 - Prefer a clean importable API over ad-hoc scripts.
 - No legacy compatibility burden: change APIs when that improves the library.
-- Algorithmic context lives in `ABOUT.md`; keep implementation aligned with that design.
+- Algorithmic context lives in `README.md`; keep implementation aligned with that design.
 
 ## Tooling
 

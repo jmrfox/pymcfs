@@ -125,7 +125,7 @@ path, face-walk collapse order.
 ## 7. Documentation
 
 - [ ] Add short **WSL quickstart** section to README (copy from §1 above once verified).
-- [ ] Note in ABOUT.md when CHOLMOD API fix lands and expected speedup range.
+- [ ] Note in README.md when CHOLMOD API fix lands and expected speedup range.
 - [ ] Document notebook workflow: `ts_skeleton.py` inputs (`data/mesh/TS1.obj`), outputs (`data/swc/TS1/`, gitignored).
 
 ---
