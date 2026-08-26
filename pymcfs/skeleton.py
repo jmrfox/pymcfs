@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import logging
 from datetime import datetime, timezone
@@ -19,6 +19,59 @@ from .refine import (
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+McfsProfile = Literal["robust", "starlab"]
+
+# Application / CGAL-robust defaults (complex TS-like meshes).
+_ROBUST_W_H = 0.5
+_ROBUST_W_M = 5.0
+# Starlab mcfskel / published CGAL generic defaults (parity harness).
+_STARLAB_W_H = 0.1
+_STARLAB_W_M = 0.2
+
+
+def resolve_mcfs_profile(
+    profile: McfsProfile | None,
+    *,
+    w_H: float,
+    w_M: float,
+    gate_exterior_poles: bool | None,
+    quality_speed_tradeoff: float | None = None,
+    medially_centered_speed_tradeoff: float | None = None,
+) -> tuple[float, float, bool]:
+    """Resolve ``(w_H, w_M, gate_exterior_poles)`` from profile + explicit args.
+
+    - ``profile=\"starlab\"`` selects Starlab weights (0.1 / 0.2) and ungated poles
+      unless the caller already overrode weights via CGAL aliases or non-robust
+      ``w_H`` / ``w_M`` values, or set ``gate_exterior_poles`` explicitly.
+    - ``profile=None`` / ``\"robust\"`` uses application defaults (0.5 / 5.0) and
+      gated poles (CGAL-style), again unless overridden.
+    """
+    if profile not in (None, "robust", "starlab"):
+        raise ValueError(f"profile must be None, 'robust', or 'starlab'; got {profile!r}")
+
+    if profile == "starlab":
+        default_wh, default_wm, default_gate = _STARLAB_W_H, _STARLAB_W_M, False
+    else:
+        default_wh, default_wm, default_gate = _ROBUST_W_H, _ROBUST_W_M, True
+
+    if quality_speed_tradeoff is not None:
+        wh = float(quality_speed_tradeoff)
+    elif profile == "starlab" and float(w_H) == _ROBUST_W_H:
+        # Function signature default is robust; remap when requesting starlab profile.
+        wh = float(default_wh)
+    else:
+        wh = float(w_H)
+
+    if medially_centered_speed_tradeoff is not None:
+        wm = float(medially_centered_speed_tradeoff)
+    elif profile == "starlab" and float(w_M) == _ROBUST_W_M:
+        wm = float(default_wm)
+    else:
+        wm = float(w_M)
+
+    gate = default_gate if gate_exterior_poles is None else bool(gate_exterior_poles)
+    return wh, wm, gate
 
 
 @dataclass
@@ -165,6 +218,12 @@ class Skeleton:
             for pl in self.to_polylines():
                 coords = " ".join(f"{float(c):.9g}" for p in pl for c in p)
                 f.write(f"{pl.shape[0]} {coords}\n")
+
+    def write_cg(self, filepath: str) -> None:
+        """Write the skeleton as a Starlab Curve Graph (``.cg``) file."""
+        from .cg_io import write_cg
+
+        write_cg(filepath, self.nodes, self.edges)
 
     def plot_3d(
         self,
@@ -395,10 +454,12 @@ def _coerce_mesh(mesh: Union[tm.Trimesh, object]) -> tm.Trimesh:
 def skeletonize(
     mesh: Union[tm.Trimesh, object],
     *,
-    w_H: float = 0.1,
-    w_M: float = 0.2,
+    w_H: float = 0.5,
+    w_M: float = 5.0,
     quality_speed_tradeoff: float | None = None,
     medially_centered_speed_tradeoff: float | None = None,
+    gate_exterior_poles: bool | None = None,
+    profile: McfsProfile | None = None,
     max_iterations: int = 500,
     timeout_seconds: float | None = 120.0,
     min_edge_length: float | None = None,
@@ -421,10 +482,16 @@ def skeletonize(
     mesh :
         Input closed triangle mesh (``trimesh.Trimesh`` or ``MeshManager``).
     w_H, quality_speed_tradeoff :
-        Quality/speed tradeoff (default 0.1). Alias: ``quality_speed_tradeoff``.
+        Quality/speed tradeoff (default 0.5). Alias: ``quality_speed_tradeoff``.
     w_M, medially_centered_speed_tradeoff :
-        Medial-centering tradeoff (default 0.2). Alias:
+        Medial-centering tradeoff (default 5.0). Alias:
         ``medially_centered_speed_tradeoff``. Used whenever ``w_M > 0``.
+    gate_exterior_poles :
+        If True, apply ``w_M`` only for poles inside the mesh (CGAL-style).
+        Default True for robust profile; False for ``profile=\"starlab\"``.
+    profile :
+        ``None`` / ``\"robust\"`` — gated poles, defaults ``w_H=0.5``, ``w_M=5``.
+        ``\"starlab\"`` — ungated poles, ``w_H=0.1``, ``w_M=0.2`` (parity dumps).
     max_iterations, timeout_seconds :
         Contraction stop limits.
     min_edge_length, max_triangle_angle :
@@ -435,8 +502,8 @@ def skeletonize(
         If True, keep only the largest connected component of the curve graph.
     refine, refine_spacing, refine_spacing_frac :
         Optional post-conversion curve refinement (off by default).
-        ``refine=True`` / ``"uniform"`` arc-length resamples chains;
-        ``refine="compress"`` keeps only junctions/leaves.
+        ``refine=True`` / ``\"uniform\"`` arc-length resamples chains;
+        ``refine=\"compress\"`` keeps only junctions/leaves.
     compress_chains, resample_spacing :
         Legacy aliases for refine when ``refine`` is left False.
     validate :
@@ -457,11 +524,13 @@ def skeletonize(
     _log = log or logger
     m = _coerce_mesh(mesh)
 
-    wh = float(quality_speed_tradeoff) if quality_speed_tradeoff is not None else float(w_H)
-    wm = (
-        float(medially_centered_speed_tradeoff)
-        if medially_centered_speed_tradeoff is not None
-        else float(w_M)
+    wh, wm, gate = resolve_mcfs_profile(
+        profile,
+        w_H=w_H,
+        w_M=w_M,
+        gate_exterior_poles=gate_exterior_poles,
+        quality_speed_tradeoff=quality_speed_tradeoff,
+        medially_centered_speed_tradeoff=medially_centered_speed_tradeoff,
     )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
@@ -470,6 +539,7 @@ def skeletonize(
         m,
         w_H=wh,
         w_M=wm,
+        gate_exterior_poles=gate,
         min_edge_length=min_edge_length,
         max_triangle_angle=float(max_triangle_angle),
         area_variation_factor=float(area_variation_factor),
@@ -480,7 +550,14 @@ def skeletonize(
         log=_log,
     )
     if verbose:
-        _log.info("Skeleton: MCFS (max_iters=%d, w_H=%.3g, w_M=%.3g)", max_iterations, wh, wm)
+        _log.info(
+            "Skeleton: MCFS (max_iters=%d, w_H=%.3g, w_M=%.3g, gate_poles=%s, profile=%s)",
+            max_iterations,
+            wh,
+            wm,
+            gate,
+            profile,
+        )
     driver.contract_until_convergence()
     return driver.convert_to_skeleton(
         refine=refine,
@@ -495,10 +572,12 @@ def skeletonize(
 def thin_mesh(
     mesh: Union[tm.Trimesh, object],
     *,
-    w_H: float = 0.1,
-    w_M: float = 0.2,
+    w_H: float = 0.5,
+    w_M: float = 5.0,
     quality_speed_tradeoff: float | None = None,
     medially_centered_speed_tradeoff: float | None = None,
+    gate_exterior_poles: bool | None = None,
+    profile: McfsProfile | None = None,
     max_iterations: int = 500,
     timeout_seconds: float | None = 120.0,
     min_edge_length: float | None = None,
@@ -527,11 +606,13 @@ def thin_mesh(
     _log = log or logger
     m = _coerce_mesh(mesh)
 
-    wh = float(quality_speed_tradeoff) if quality_speed_tradeoff is not None else float(w_H)
-    wm = (
-        float(medially_centered_speed_tradeoff)
-        if medially_centered_speed_tradeoff is not None
-        else float(w_M)
+    wh, wm, gate = resolve_mcfs_profile(
+        profile,
+        w_H=w_H,
+        w_M=w_M,
+        gate_exterior_poles=gate_exterior_poles,
+        quality_speed_tradeoff=quality_speed_tradeoff,
+        medially_centered_speed_tradeoff=medially_centered_speed_tradeoff,
     )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
@@ -540,6 +621,7 @@ def thin_mesh(
         m,
         w_H=wh,
         w_M=wm,
+        gate_exterior_poles=gate,
         min_edge_length=min_edge_length,
         max_triangle_angle=float(max_triangle_angle),
         area_variation_factor=float(area_variation_factor),
@@ -624,6 +706,8 @@ __all__ = [
     "refine_skeleton",
     "refine_skeleton_graph",
     "resolve_refine_options",
+    "resolve_mcfs_profile",
     "RefineMode",
+    "McfsProfile",
     "_resample_polyline_arc_length",
 ]

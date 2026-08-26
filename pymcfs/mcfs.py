@@ -25,11 +25,6 @@ from .remesh import (
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-try:
-    from sksparse.cholmod import cholesky as _cholmod_cholesky
-except ImportError:  # optional acceleration for SPD AtA
-    _cholmod_cholesky = None
-
 
 def _edge_key(u: int, v: int) -> tuple[int, int]:
     return (u, v) if u < v else (v, u)
@@ -202,9 +197,17 @@ class MeanCurvatureFlowSkeletonization:
     mesh :
         Input ``trimesh.Trimesh``.
     w_H :
-        Quality/speed tradeoff (default 0.1). Larger → faster / coarser.
+        Quality/speed tradeoff (default 0.5; CGAL-app / TS-tuned). Larger →
+        stronger attraction to current positions.
     w_M :
-        Medial-centering tradeoff (default 0.2). ``0`` disables Voronoi poles.
+        Medial-centering tradeoff (default 5.0). ``0`` disables Voronoi poles.
+    gate_exterior_poles :
+        If True (default), apply ``w_M`` only when a pole lies inside the input
+        mesh — matching CGAL ``Side_of_triangle_mesh`` / ``ON_BOUNDED_SIDE``.
+        Set False for Starlab-style ungated medial pull.
+    use_cholmod :
+        If True, require scikit-sparse CHOLMOD for the ``AᵀA`` solve. If False,
+        force SciPy SuperLU. If None (default), use CHOLMOD when importable.
     min_edge_length, max_triangle_angle :
         Remesh controls during contraction.
     area_variation_factor :
@@ -216,12 +219,16 @@ class MeanCurvatureFlowSkeletonization:
 
     Notes
     -----
-    ``w_L`` is fixed at 1 (only weight ratios matter).
+    Laplacian scale ``w_L`` is fixed at 1 (CGAL uses the same). Cotangent edge
+    weights are recomputed each geometry step. When ``gate_exterior_poles`` is
+    on, exterior poles get ``w_M = 0`` so they cannot pull the surface outside.
     """
 
     mesh: tm.Trimesh
-    w_H: float = 0.1
-    w_M: float = 0.2
+    w_H: float = 0.5
+    w_M: float = 5.0
+    gate_exterior_poles: bool = True
+    use_cholmod: bool | None = None
     min_edge_length: float | None = None
     max_triangle_angle: float = 110.0
     area_variation_factor: float = 1e-4
@@ -240,6 +247,8 @@ class MeanCurvatureFlowSkeletonization:
     _constraint_split: np.ndarray = field(init=False, repr=False)
     poles: np.ndarray = field(init=False, repr=False)
     pole_valid: np.ndarray = field(init=False, repr=False)
+    _pole_valid_dirty: bool = field(init=False, default=True, repr=False)
+    _n_contains: int = field(init=False, default=0, repr=False)
     _min_edge: float = field(init=False, repr=False)
     _area0: float = field(init=False, repr=False)
     _w_L: float = field(init=False, default=1.0, repr=False)
@@ -274,29 +283,43 @@ class MeanCurvatureFlowSkeletonization:
         self._faces0 = int(self.F.shape[0])
         self._w_L = 1.0
         self._iter = 0
-        # Starlab uses every pole returned by its bounding-box-filtered Voronoi
-        # construction. Containment is logged as a diagnostic only.
+        self._n_contains = 0
+        self._pole_valid_dirty = True
         self.pole_valid = np.zeros(n, dtype=bool)
         if float(self.w_M) > 0.0:
             try:
                 targets, _w = compute_voronoi_poles(self.mesh)
                 self.poles = np.asarray(targets, dtype=float)
-                self.pole_valid = self._poles_inside_mesh(self.poles)
+                self.pole_valid = self._compute_pole_valid(self.poles)
+                self._pole_valid_dirty = False
                 n_valid = int(self.pole_valid.sum())
-                self._vinfo(
-                    "Voronoi poles: %d/%d inside mesh (diagnostic only)",
-                    n_valid,
-                    n,
-                )
+                if self.gate_exterior_poles:
+                    self._vinfo(
+                        "Voronoi poles: %d/%d inside mesh (gated; exterior w_M=0)",
+                        n_valid,
+                        n,
+                    )
+                else:
+                    self._vinfo(
+                        "Voronoi poles: %d/%d inside mesh (ungated Starlab-style)",
+                        n_valid,
+                        n,
+                    )
             except Exception as e:
                 self._log.warning("Voronoi poles failed (%s); setting w_M effective 0", e)
                 self.poles = self.V.copy()
                 self.w_M = 0.0
+                self._pole_valid_dirty = False
         else:
             self.poles = self.V.copy()
+            self._pole_valid_dirty = False
         self._deadline = None
+        from .spd_solve import cholmod_available, resolve_use_cholmod
+
+        self._use_cholmod = resolve_use_cholmod(self.use_cholmod)
         self._vinfo(
-            "MCFS init: n=%d f=%d min_edge=%.4g area0=%.4g bbox0=%s w_H=%.3g w_M=%.3g",
+            "MCFS init: n=%d f=%d min_edge=%.4g area0=%.4g bbox0=%s "
+            "w_H=%.3g w_M=%.3g gate_poles=%s spd=%s",
             n,
             self.F.shape[0],
             self._min_edge,
@@ -304,7 +327,13 @@ class MeanCurvatureFlowSkeletonization:
             np.array2string(self._bbox0, precision=4),
             self.w_H,
             self.w_M,
+            bool(self.gate_exterior_poles),
+            "cholmod" if self._use_cholmod else "superlu",
         )
+        if self.verbose and self.use_cholmod is None and not cholmod_available():
+            self._log.info(
+                "SPD solver: superlu (install pymcfs[cholmod] / scikit-sparse for CHOLMOD)"
+            )
         self._sanity_check_state(stage="init")
 
     def _vinfo(self, msg: str, *args) -> None:
@@ -328,18 +357,13 @@ class MeanCurvatureFlowSkeletonization:
         return self.V.max(axis=0) - self.V.min(axis=0)
 
     def _poles_inside_mesh(self, poles: np.ndarray) -> np.ndarray:
-        """Return boolean mask of poles that lie in the interior of ``self.mesh``.
-
-        Diagnostic only — Starlab does not gate poles on containment. Skipped
-        unless ``verbose`` is set so init stays cheap on large meshes.
-        """
+        """Return boolean mask of poles that lie in the interior of ``self.mesh``."""
         poles = np.asarray(poles, dtype=float)
         n = poles.shape[0]
         if n == 0:
             return np.zeros(0, dtype=bool)
-        if not self.verbose:
-            return np.ones(n, dtype=bool)
         try:
+            self._n_contains += 1
             inside = np.asarray(self.mesh.contains(poles), dtype=bool)
             if inside.shape[0] != n:
                 return np.zeros(n, dtype=bool)
@@ -348,19 +372,54 @@ class MeanCurvatureFlowSkeletonization:
             self._log.warning("pole inside-test failed (%s); treating all poles as valid", e)
             return np.ones(n, dtype=bool)
 
+    def _compute_pole_valid(self, poles: np.ndarray) -> np.ndarray:
+        """Return pole validity mask used for ``w_M`` gating / diagnostics.
+
+        When ``gate_exterior_poles`` is True (CGAL-style), this is the true
+        containment mask. When False (Starlab parity), all poles are treated as
+        valid for weighting; containment is still computed only if ``verbose``.
+        """
+        poles = np.asarray(poles, dtype=float)
+        n = poles.shape[0]
+        if n == 0:
+            return np.zeros(0, dtype=bool)
+        if self.gate_exterior_poles:
+            return self._poles_inside_mesh(poles)
+        if self.verbose:
+            # Diagnostic logging path only; does not affect weights when ungated.
+            return self._poles_inside_mesh(poles)
+        return np.ones(n, dtype=bool)
+
+    def _mark_poles_dirty(self) -> None:
+        """Invalidate cached ``pole_valid`` after poles are created or remapped."""
+        self._pole_valid_dirty = True
+
     def _sync_pole_valid(self) -> None:
-        """Keep ``pole_valid`` aligned with ``poles`` after remesh."""
+        """Keep ``pole_valid`` aligned with ``poles`` after remesh.
+
+        Containment is relative to the fixed input mesh and pole positions, so
+        we recompute only when poles are remapped (dirty), not after geometry-
+        only contraction steps.
+        """
         n = self.V.shape[0]
-        if self.pole_valid.shape[0] != n:
-            # Remesh may have changed vertex count; containment is diagnostic only.
-            if float(self.w_M) > 0.0 and self.poles.shape[0] == n:
-                self.pole_valid = (
-                    self._poles_inside_mesh(self.poles)
-                    if self.verbose
-                    else np.ones(n, dtype=bool)
-                )
-            else:
-                self.pole_valid = np.zeros(n, dtype=bool)
+        if float(self.w_M) <= 0.0 or self.poles.shape[0] != n:
+            self.pole_valid = np.zeros(n, dtype=bool)
+            self._pole_valid_dirty = False
+            return
+        if self.gate_exterior_poles:
+            if (
+                not self._pole_valid_dirty
+                and self.pole_valid.shape[0] == n
+            ):
+                return
+            self.pole_valid = self._poles_inside_mesh(self.poles)
+            self._pole_valid_dirty = False
+            return
+        if self.pole_valid.shape[0] != n or self._pole_valid_dirty:
+            self.pole_valid = (
+                self._poles_inside_mesh(self.poles) if self.verbose else np.ones(n, dtype=bool)
+            )
+            self._pole_valid_dirty = False
 
     def _sanity_check_state(self, *, stage: str, prev_area: float | None = None) -> None:
         """Log geometric / numerical health of the current meso-skeleton."""
@@ -405,8 +464,6 @@ class MeanCurvatureFlowSkeletonization:
                 area,
             )
         if n > 0 and self._bbox0 is not None:
-            # Warn if the longest original axis collapsed much faster than others
-            # while another axis grew (classic bad medial / remesh feedback).
             growth = bb / np.maximum(self._bbox0, 1e-12)
             if float(growth.max()) > 1.1 and float(area) < 0.5 * self._area0:
                 self._log.warning(
@@ -424,6 +481,11 @@ class MeanCurvatureFlowSkeletonization:
         wH[self._constraint_fixed] = 1.0 / max(self.zero_TH, 1e-16)
         wM[self._constraint_fixed] = 0.0
         wM[self._constraint_split] = 0.0
+        # CGAL: apply medial weight only when pole is inside the input mesh.
+        if self.gate_exterior_poles and self.pole_valid.shape[0] == n:
+            wM[~self.pole_valid] = 0.0
+        elif self.gate_exterior_poles:
+            wM[:] = 0.0
         return wL, wH, wM
 
     def contract_geometry(self) -> None:
@@ -462,22 +524,10 @@ class MeanCurvatureFlowSkeletonization:
         AtA = (A.T @ A).tocsc()
         At_rhs = A.T @ rhs
         try:
-            # Optional CHOLMOD (scikit-sparse) for SPD AtA; else SciPy SuperLU.
-            if _cholmod_cholesky is not None:
-                try:
-                    factor = _cholmod_cholesky(AtA)
-                    for c in range(3):
-                        self.V[:, c] = np.asarray(
-                            factor(np.asarray(At_rhs[:, c]).ravel())
-                        ).ravel()
-                except Exception:
-                    solver = spla.factorized(AtA)
-                    for c in range(3):
-                        self.V[:, c] = solver(np.asarray(At_rhs[:, c]).ravel())
-            else:
-                solver = spla.factorized(AtA)
-                for c in range(3):
-                    self.V[:, c] = solver(np.asarray(At_rhs[:, c]).ravel())
+            from .spd_solve import solve_spd_ata
+
+            X, _backend = solve_spd_ata(AtA, At_rhs, use_cholmod=self._use_cholmod)
+            self.V = X
         except Exception as e:
             self._log.warning("MCFS contract_geometry factorization failed: %s; using spsolve", e)
             for c in range(3):
@@ -516,6 +566,7 @@ class MeanCurvatureFlowSkeletonization:
                 flags.get("is_split", np.zeros(V2.shape[0], dtype=bool)),
                 dtype=bool,
             )
+            self._mark_poles_dirty()
             self._sync_pole_valid()
         if n:
             self._vinfo(
@@ -540,6 +591,7 @@ class MeanCurvatureFlowSkeletonization:
             self.fixed = fixed2 if fixed2 is not None else np.zeros(V2.shape[0], dtype=bool)
             self.poles = poles2 if poles2 is not None else self.V.copy()
             self.is_split = split2 if split2 is not None else np.zeros(V2.shape[0], dtype=bool)
+            self._mark_poles_dirty()
             self._sync_pole_valid()
         if n:
             self._vinfo(

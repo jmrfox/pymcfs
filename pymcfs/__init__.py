@@ -24,6 +24,7 @@ from .validate import validate_mcfs_mesh
 # Advanced / experimental helpers
 from .laplacian import cotangent_laplacian, lumped_mass_matrix, mcfs_cotangent_laplacian
 from .mcf import mean_curvature_flow, MCFResult
+from .cg_io import read_cg, write_cg
 
 __all__ = [
     "skeletonize",
@@ -42,4 +43,6 @@ __all__ = [
     "lumped_mass_matrix",
     "mean_curvature_flow",
     "MCFResult",
+    "read_cg",
+    "write_cg",
 ]

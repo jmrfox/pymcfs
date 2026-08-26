@@ -26,6 +26,23 @@ def test_collapse_short_edges_reduces_vertices():
     assert np.all((F2[:, 0] != F2[:, 1]) & (F2[:, 1] != F2[:, 2]) & (F2[:, 2] != F2[:, 0]))
 
 
+def test_collapse_short_edges_golden_icosphere():
+    """Bit-stable collapse vs pre-Numba golden on a fixed icosphere."""
+    import hashlib
+
+    mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces, int)
+    diag = float(np.linalg.norm(V.max(0) - V.min(0)))
+    V2, F2, ncoll, _, _ = collapse_short_edges(V, F, min_edge_length=0.15 * diag)
+    assert ncoll == 142
+    assert V2.shape == (20, 3)
+    assert F2.shape == (36, 3)
+    digest = hashlib.sha256(
+        np.ascontiguousarray(V2).tobytes() + np.ascontiguousarray(F2).tobytes()
+    ).hexdigest()
+    assert digest == "d4606e0df03de89e05e39eefa9c33c56d30409eedd63c84f18891b880e00c028"
+
+
 def test_split_obtuse_faces_runs():
     # Starlab splits an interior edge only when both incident triangles have
     # large opposite angles.
@@ -76,7 +93,9 @@ def test_contract_geometry_uses_starlab_stacked_least_squares():
     is a different operator and must stay rejected.
     """
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    mcs = MeanCurvatureFlowSkeletonization(mesh, w_H=0.1, w_M=0.2, verbose=False)
+    mcs = MeanCurvatureFlowSkeletonization(
+        mesh, w_H=0.1, w_M=0.2, gate_exterior_poles=False, verbose=False
+    )
     V0 = mcs.V.copy()
     wL, wH, wM = mcs._update_constraint_weights()
     L = mcfs_cotangent_laplacian(mcs.V, mcs.F).tocsr()
@@ -187,7 +206,12 @@ def _closed_cylinder(radius=0.5, height=2.0, radial=24, stacks=12):
 def test_cylinder_skeleton_is_long_and_centered():
     mesh = _closed_cylinder()
     assert mesh.is_watertight
-    skel = skeletonize(mesh, max_iterations=80, w_H=0.1, w_M=0.2, timeout_seconds=60)
+    skel = skeletonize(
+        mesh,
+        max_iterations=80,
+        profile="starlab",
+        timeout_seconds=60,
+    )
     assert skel.nodes.shape[0] >= 2
     assert skel.edges.shape[0] >= 1
     total_len = float(

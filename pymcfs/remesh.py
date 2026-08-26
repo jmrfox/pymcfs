@@ -345,6 +345,10 @@ def collapse_short_edges(
     ``TopologyJanitor_ClosestPole::collapser``. Stops when no legal short edge
     remains, or when a configured safety limit/deadline is hit.
 
+    Edges are visited in face-walk insertion order (legacy edge-map key order).
+    Mid-pass link checks and remaps use incremental adjacency (O(degree) per
+    collapse). Predicates match Numba ``link_condition_ok`` (golden-tested).
+
     Returns
     -------
     V, F, n_collapsed, fixed_out, poles_out
@@ -385,12 +389,14 @@ def collapse_short_edges(
         if F.size == 0:
             break
 
+        face_alive = np.ones(F.shape[0], dtype=bool)
+        edges = _face_walk_undirected_edges(F, face_alive)
+        if not edges:
+            break
+
+        # Incremental adjacency: O(deg) updates; link predicate matches Numba.
         neighbors = _vertex_neighbors(F, V.shape[0])
         edge_faces = _edge_to_faces(F)
-        if not edge_faces:
-            break
-        edges = list(edge_faces.keys())
-        face_alive = np.ones(F.shape[0], dtype=bool)
         collapsed_this = 0
 
         for a, b in edges:
@@ -408,7 +414,7 @@ def collapse_short_edges(
             if not _link_condition_ok_py(a, b, neighbors, edge_faces, F):
                 continue
 
-            keep, drop = b, a
+            keep, drop = int(b), int(a)
             mid = 0.5 * (V[a] + V[b])
             if poles is not None:
                 pa, pb = poles[keep], poles[drop]
@@ -442,6 +448,47 @@ def collapse_short_edges(
         vertex_flags.clear()
         vertex_flags.update(flags)
     return V, F, total, fixed, poles
+
+
+def _face_walk_undirected_edges(
+    F: np.ndarray, face_alive: np.ndarray
+) -> list[tuple[int, int]]:
+    """Undirected edges in first-seen face-walk order (matches legacy dict keys)."""
+    seen: set[tuple[int, int]] = set()
+    edges: list[tuple[int, int]] = []
+    for fi, (a, b, c) in enumerate(F):
+        if not face_alive[fi]:
+            continue
+        for u, v in ((int(a), int(b)), (int(b), int(c)), (int(c), int(a))):
+            key = _edge_key(u, v)
+            if key not in seen:
+                seen.add(key)
+                edges.append(key)
+    return edges
+
+
+def _apply_collapse_faces(
+    keep: int, drop: int, F: np.ndarray, face_alive: np.ndarray
+) -> None:
+    """Identify ``drop`` with ``keep`` and kill degenerate / edge-incident faces."""
+    keep = int(keep)
+    drop = int(drop)
+    for fi in range(F.shape[0]):
+        if not face_alive[fi]:
+            continue
+        a, b, c = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+        verts = (a, b, c)
+        if drop not in verts:
+            continue
+        if keep in verts:
+            face_alive[fi] = False
+            continue
+        for k in range(3):
+            if int(F[fi, k]) == drop:
+                F[fi, k] = keep
+        a, b, c = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+        if a == b or b == c or c == a:
+            face_alive[fi] = False
 
 
 def _obtuse_split_candidates(

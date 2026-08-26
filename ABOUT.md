@@ -101,9 +101,17 @@ min_X ‖ [  W_H  ] X - [ W_H V_t ] ‖²
 The implementation solves the normal equations `(AᵀA)X = AᵀB`, matching the
 reference Eigen implementation.
 
-- `ω_L` — contraction (Laplacian) weight  
-- `ω_H` — attraction to current positions  
-- `ω_P` — attraction to Voronoi poles (medial centering)
+- `ω_L` — contraction (Laplacian) weight (fixed at 1; CGAL uses the same scale)
+- `ω_H` — attraction to current positions (application default `w_H=0.5`)
+- `ω_P` / `w_M` — attraction to Voronoi poles (application default `w_M=5.0`)
+
+When `gate_exterior_poles=True` (default), medial weights are applied only for
+poles that lie inside the input mesh — matching CGAL
+`Side_of_triangle_mesh` / `ON_BOUNDED_SIDE`. Exterior poles get `w_M = 0` so
+they cannot pull branches outside the surface on complex TS-like meshes.
+
+`skeletonize(..., profile="starlab")` selects Starlab parity weights
+(`w_H=0.1`, `w_M=0.2`) with ungated poles for fixture dumps.
 
 Fixed (pinned) vertices use `ω_L = 0`, `ω_H = 1/zero_TH`, `ω_P = 0`. Split vertices from obtuse splits have `ω_P = 0`.
 
@@ -146,7 +154,10 @@ curved medial paths.
 
 ## Voronoi medial guidance
 
-`pymcfs.medial.compute_voronoi_poles(mesh)` returns per-vertex medial targets. When `is_medially_centered=True` (or `guidance_type="voronoi"`), those targets feed the `ω_P` term.
+`pymcfs.medial.compute_voronoi_poles(mesh)` returns per-vertex medial targets.
+Those targets feed the `ω_P` / `w_M` term in the MCFS driver. CGAL only
+assembles the medial block when the pole is on the bounded side of the mesh;
+pymcfs mirrors that with `gate_exterior_poles` (on by default).
 
 ---
 
@@ -155,6 +166,7 @@ curved medial paths.
 - Watertight manifold input is required for stable Laplacians and link-conditioned collapses.
 - `min_edge_length` is relative to the bounding-box diagonal by default, so absolute mesh scale (e.g. µm neuron meshes) is handled without hand-tuning `dt`.
 - Cotangent `secure=True` is the default in the MCFS driver.
+- **Tier A speedups (same discrete algorithm):** cached `mesh.contains` for exterior-pole gating (recomputed only when poles are remapped); optional CHOLMOD via `pymcfs[cholmod]` / `use_cholmod`; faster MCFS Laplacian edge assembly (argsort reduce instead of `np.unique`); short-edge collapse uses explicit face-walk edge order with incremental adjacency (same decisions as before; Numba topology used in `collapse_ok_for_edge` / degeneracy).
 
 ---
 
@@ -176,10 +188,11 @@ CGAL’s published C++ API is the algorithmic guide; this package reimplements i
 ## API quick reference
 
 - `pymcfs.mcfs.MeanCurvatureFlowSkeletonization(mesh, ...)`  
-  CGAL-style driver: `contract_geometry`, `collapse_edges`, `split_faces`, `detect_degeneracies`, `contract`, `contract_until_convergence`, `convert_to_skeleton`.
+  CGAL-style driver: `contract_geometry`, `collapse_edges`, `split_faces`, `detect_degeneracies`, `contract`, `contract_until_convergence`, `convert_to_skeleton`. Defaults: `w_H=0.5`, `w_M=5.0`, `gate_exterior_poles=True`.
 
 - `pymcfs.skeleton.skeletonize(mesh, ...) -> Skeleton`  
   Full MCFS pipeline wrapper. Optional `refine=True` / `"uniform"` / `"compress"`.
+  Use `profile="starlab"` for Starlab parity weights without pole gating.
 
 - `pymcfs.skeleton.refine_skeleton(skel, ...)` / `Skeleton.refine(...)`  
   Post-hoc curve-graph refinement (arc-length resample or compress).

@@ -118,7 +118,7 @@ def test_skeletonize_torus_runs():
 
 def test_skeletonize_with_medial_weight():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
-    skel = skeletonize(mesh, w_H=0.1, w_M=0.2, max_iterations=15, refine=True)
+    skel = skeletonize(mesh, w_H=0.1, w_M=0.2, profile="starlab", max_iterations=15, refine=True)
     assert skel.nodes.shape[0] > 0
 
 

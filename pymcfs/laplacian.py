@@ -161,12 +161,28 @@ def mcfs_cotangent_laplacian(V: np.ndarray, F: np.ndarray) -> sp.csr_matrix:
     edges.sort(axis=1)
     contributions = np.concatenate([cot0, cot1, cot2])
 
-    unique_edges, inverse = np.unique(edges, axis=0, return_inverse=True)
-    weights = np.zeros(unique_edges.shape[0], dtype=float)
-    np.add.at(weights, inverse, contributions)
-    weights = np.maximum(weights, 0.0)
+    # Pack undirected edge keys and reduce contributions via argsort (avoids
+    # np.unique on an (3m, 2) array). Manifold edges have at most two cots.
+    lo = edges[:, 0].astype(np.int64, copy=False)
+    hi = edges[:, 1].astype(np.int64, copy=False)
+    keys = lo * np.int64(n) + hi
+    order = np.argsort(keys, kind="mergesort")
+    keys_s = keys[order]
+    contrib_s = contributions[order]
+    lo_s = lo[order]
+    hi_s = hi[order]
 
-    a, b = unique_edges[:, 0], unique_edges[:, 1]
+    if keys_s.size == 0:
+        return sp.csr_matrix((n, n), dtype=float)
+
+    change = np.empty(keys_s.shape[0], dtype=bool)
+    change[0] = True
+    change[1:] = keys_s[1:] != keys_s[:-1]
+    starts = np.nonzero(change)[0]
+    a = lo_s[starts]
+    b = hi_s[starts]
+    weights = np.maximum(np.add.reduceat(contrib_s, starts), 0.0)
+
     rows = np.concatenate([a, b])
     cols = np.concatenate([b, a])
     data = np.concatenate([weights, weights])

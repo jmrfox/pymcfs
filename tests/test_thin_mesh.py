@@ -23,6 +23,6 @@ def test_thin_mesh_basic():
 
 def test_thin_mesh_medial_runs():
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    Vt, Ft = thin_mesh(mesh, max_iterations=10, w_H=0.1, w_M=0.2)
+    Vt, Ft = thin_mesh(mesh, max_iterations=10, profile="starlab")
     assert Vt.shape[0] > 0
     assert _no_degenerate_faces(Ft)

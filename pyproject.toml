@@ -32,3 +32,11 @@ dev = [
 test = [
   "pytest>=8.3.0",
 ]
+cholmod = [
+  "scikit-sparse>=0.4",
+]
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: long-running regression (e.g. full TS1 skeletonization)",
+]
