@@ -36,7 +36,7 @@ Use this list after moving to WSL. Items are ordered roughly by priority for
 
 ### CHOLMOD / scikit-sparse 0.5 API
 
-- [ ] **Fix `pymcfs/spd_solve.py` for scikit-sparse ≥ 0.5.**  
+- [x] **Fix `pymcfs/spd_solve.py` for scikit-sparse ≥ 0.5.**  
   Linux conda/pip builds often return `(R, perm)` from `cholesky()` instead of a
   callable factor object. Current code tries `factor(b)` and silently falls back
   to SuperLU on failure — you may get no speedup on WSL until this is fixed.
@@ -70,18 +70,14 @@ path, face-walk collapse order.
 
 ### Still worth doing
 
-- [ ] **Confirm CHOLMOD actually used** in driver logs (`spd=cholmod` at init when verbose).
-- [ ] **Numba collapse hot path** — `collapse_short_edges` still uses Python incremental
-  adjacency for updates; Numba `link_condition_ok` is used elsewhere but not fully
-  on the main collapse loop. Revisit only if remesh time dominates after CHOLMOD.
-- [ ] **Batch point-in-mesh** for gating — if `contains` is still slow on huge TS meshes,
-  cache a BVH / reuse trimesh ray engine across the run (same boolean mask required).
-- [ ] **Incremental sparse factor** — refactor `AᵀA` only when sparsity pattern changes
-  (largest win after CHOLMOD on long runs).
+- [x] **Confirm CHOLMOD actually used** in driver logs (`spd=cholmod` at init when verbose).
+- [x] **Numba collapse hot path** — `apply_collapse_local` kernel + `_link_condition_numba`; main loop keeps incremental Python apply (golden parity). Incremental Numba apply deferred (edge-hash drift under mid-pass updates).
+- [x] **Batch point-in-mesh** for gating — profiled; `contains` ≪1% on TS1/sindorelax (+2 calls/contract). BVH cache not needed yet.
+- [ ] **Incremental sparse factor** — refactor `AᵀA` only when sparsity pattern changes (deprioritized: geometry ≈1% of iter).
 
 ### Benchmark hygiene
 
-- [ ] Record baseline on WSL: mean ms/iter for TS1 and sindorelax via `scripts/bench_mcfs_iter.py`.
+- [x] Record baseline on WSL: mean ms/iter for TS1 and sindorelax via `scripts/bench_mcfs_iter.py` (see `docs/benchmarks.md`).
 - [ ] Do not use iterative CG unless parity proves identical geometry — new numerical error.
 
 ---

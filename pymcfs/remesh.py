@@ -14,6 +14,7 @@ from .topology import (
     build_topology,
     link_condition_ok,
     pair_obtuse_edges,
+    topology_collapse_buffers,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,43 @@ def _faces_incident_to_vertex(
     for nbr in neighbors[v]:
         out.update(edge_faces.get(_edge_key(v, nbr), ()))
     return out
+
+
+def _link_condition_numba(
+    a: int,
+    b: int,
+    F: np.ndarray,
+    face_alive: np.ndarray,
+    vert_alive: np.ndarray,
+    nv: int,
+) -> bool:
+    """Numba link test on a read-only topology snapshot of ``F``."""
+    topo = build_topology(
+        np.asarray(F, dtype=np.int32),
+        nv,
+        face_alive=face_alive,
+        vert_alive=vert_alive,
+    )
+    edge_u, edge_v, edge_f0, edge_f1, n_edges, edge_cap = topology_collapse_buffers(
+        topo, face_count=F.shape[0]
+    )
+    _ = edge_u, edge_v, n_edges, edge_cap
+    return bool(
+        link_condition_ok(
+            np.int32(a),
+            np.int32(b),
+            topo.F,
+            topo.face_alive,
+            topo.nbr,
+            topo.nbr_count,
+            edge_f0,
+            edge_f1,
+            topo.hash_key,
+            topo.hash_val,
+            topo.vface,
+            topo.vface_count,
+        )
+    )
 
 
 def _link_condition_ok_py(
@@ -394,7 +432,6 @@ def collapse_short_edges(
         if not edges:
             break
 
-        # Incremental adjacency: O(deg) updates; link predicate matches Numba.
         neighbors = _vertex_neighbors(F, V.shape[0])
         edge_faces = _edge_to_faces(F)
         collapsed_this = 0
@@ -411,6 +448,7 @@ def collapse_short_edges(
             d = float(np.linalg.norm(V[a] - V[b]))
             if d >= min_edge_length:
                 continue
+
             if not _link_condition_ok_py(a, b, neighbors, edge_faces, F):
                 continue
 
@@ -635,8 +673,7 @@ def split_obtuse_faces(
             clean_batch.append(item)
         batch = clean_batch or [selected[0]]
 
-        remove: set[int] = set()
-        new_rows: list[np.ndarray] = []
+        planned: list[tuple[int, int, int, int, int, np.ndarray, np.ndarray | None]] = []
         for u, v, face0, face1, split_side in batch:
             if deadline is not None and _time.monotonic() >= deadline:
                 break
@@ -647,10 +684,7 @@ def split_obtuse_faces(
             direction = edge / edge_length
             t = float(np.dot(V[split_side] - V[u], direction))
             new_position = V[u] + t * direction
-            new_index = V.shape[0]
-            V = np.vstack([V, new_position])
-            fixed = np.append(fixed, False)
-            is_split = np.append(is_split, True)
+            new_pole = None
             if poles is not None:
                 pole_edge = poles[v] - poles[u]
                 pole_length = float(np.linalg.norm(pole_edge))
@@ -658,18 +692,53 @@ def split_obtuse_faces(
                     new_pole = poles[u] + t * (pole_edge / pole_length)
                 else:
                     new_pole = poles[u].copy()
-                poles = np.vstack([poles, new_pole])
+            planned.append((u, v, face0, face1, split_side, new_position, new_pole))
 
-            new_rows.extend(split_face_on_edge(F[face0], u, v, new_index))
-            new_rows.extend(split_face_on_edge(F[face1], u, v, new_index))
-            remove.update((face0, face1))
+        if not planned:
+            break
+
+        n_old_v = V.shape[0]
+        n_add_v = len(planned)
+        n_old_f = F.shape[0]
+        remove = {fi for _u, _v, f0, f1, _s, _p, _pp in planned for fi in (f0, f1)}
+        n_keep_f = n_old_f - len(remove)
+        n_new_f = 4 * n_add_v
+
+        V_out = np.empty((n_old_v + n_add_v, 3), dtype=float)
+        V_out[:n_old_v] = V
+        fixed_out = np.empty(n_old_v + n_add_v, dtype=bool)
+        fixed_out[:n_old_v] = fixed
+        is_split_out = np.empty(n_old_v + n_add_v, dtype=bool)
+        is_split_out[:n_old_v] = is_split
+        if poles is not None:
+            poles_out = np.empty((n_old_v + n_add_v, 3), dtype=float)
+            poles_out[:n_old_v] = poles
+
+        F_out = np.empty((n_keep_f + n_new_f, 3), dtype=int)
+        keep_mask = np.ones(n_old_f, dtype=bool)
+        keep_mask[list(remove)] = False
+        F_out[:n_keep_f] = F[keep_mask]
+        f_write = n_keep_f
+
+        for i, (u, v, face0, face1, _split_side, new_position, new_pole) in enumerate(planned):
+            new_index = n_old_v + i
+            V_out[new_index] = new_position
+            fixed_out[new_index] = False
+            is_split_out[new_index] = True
+            if poles is not None and new_pole is not None:
+                poles_out[new_index] = new_pole
+            for src_face in (face0, face1):
+                for row in split_face_on_edge(F[src_face], u, v, new_index):
+                    F_out[f_write] = row
+                    f_write += 1
             total += 1
 
-        if not remove:
-            break
-        keep_faces = np.ones(F.shape[0], dtype=bool)
-        keep_faces[list(remove)] = False
-        F = np.vstack([F[keep_faces], *new_rows]) if new_rows else F[keep_faces]
+        V = V_out
+        fixed = fixed_out
+        is_split = is_split_out
+        if poles is not None:
+            poles = poles_out
+        F = F_out[:f_write]
 
     return V, F, total, fixed, poles, is_split
 

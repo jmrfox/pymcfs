@@ -8,16 +8,16 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 try:
-    from sksparse.cholmod import cholesky as _cholmod_cholesky
+    from sksparse.cholmod import cho_factor as _cholmod_cho_factor
 except ImportError:  # optional SuiteSparse CHOLMOD via scikit-sparse
-    _cholmod_cholesky = None
+    _cholmod_cho_factor = None
 
 SpdBackend = Literal["cholmod", "superlu", "spsolve"]
 
 
 def cholmod_available() -> bool:
     """Return True if scikit-sparse CHOLMOD is importable."""
-    return _cholmod_cholesky is not None
+    return _cholmod_cho_factor is not None
 
 
 def resolve_use_cholmod(use_cholmod: bool | None) -> bool:
@@ -52,11 +52,13 @@ def solve_spd_ata(
     n = AtA.shape[0]
     X = np.empty((n, 3), dtype=float)
 
-    if use_cholmod and _cholmod_cholesky is not None:
+    if use_cholmod and _cholmod_cho_factor is not None:
         try:
-            factor = _cholmod_cholesky(AtA)
+            factor = _cholmod_cho_factor(AtA)
             for c in range(3):
-                X[:, c] = np.asarray(factor(np.asarray(At_rhs[:, c]).ravel())).ravel()
+                X[:, c] = np.asarray(
+                    factor.solve(np.asarray(At_rhs[:, c : c + 1], dtype=float))
+                ).ravel()
             return X, "cholmod"
         except Exception:
             pass

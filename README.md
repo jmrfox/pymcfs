@@ -200,8 +200,8 @@ pymcfs mirrors that with `gate_exterior_poles` (on by default).
 
 - Watertight manifold input is required for stable Laplacians and link-conditioned collapses.
 - `min_edge_length` is relative to the bounding-box diagonal by default, so absolute mesh scale (e.g. µm neuron meshes) is handled without hand-tuning `dt`.
-- Cotangent `secure=True` is the default in the MCFS driver.
-- **Tier A speedups (same discrete algorithm):** cached `mesh.contains` for exterior-pole gating (recomputed only when poles are remapped); optional CHOLMOD via `pymcfs[cholmod]` / `use_cholmod`; faster MCFS Laplacian edge assembly (argsort reduce instead of `np.unique`); short-edge collapse uses explicit face-walk edge order with incremental adjacency (same decisions as before; Numba topology used in `collapse_ok_for_edge` / degeneracy).
+- MCFS uses `mcfs_cotangent_laplacian` (Starlab-weighted off-diagonals, unweighted diagonal).
+- **Tier A speedups (same discrete algorithm):** cached `mesh.contains` for exterior-pole gating (recomputed only when poles are remapped); optional CHOLMOD via `pymcfs[cholmod]` / `use_cholmod` (~3× on the geometry slice, ~1% full iteration); faster MCFS Laplacian edge assembly (argsort reduce instead of `np.unique`); short-edge collapse uses face-walk order with incremental adjacency and Numba `link_condition_ok` / `apply_collapse_local` in `topology.py`; obtuse split apply pass uses preallocated buffers (see `docs/benchmarks.md`).
 
 ---
 

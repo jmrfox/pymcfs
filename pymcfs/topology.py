@@ -412,6 +412,173 @@ def link_condition_ok(
 
 
 @njit(cache=True)
+def _remove_nbr(nbr: np.ndarray, nbr_count: np.ndarray, a: np.int32, b: np.int32) -> None:
+    ca = nbr_count[a]
+    for i in range(ca):
+        if nbr[a, i] == b:
+            nbr[a, i] = nbr[a, ca - 1]
+            nbr_count[a] = ca - 1
+            return
+
+
+@njit(cache=True)
+def _unlink_face_numba(
+    fi: np.int32,
+    F: np.ndarray,
+    edge_f0: np.ndarray,
+    edge_f1: np.ndarray,
+    hash_key: np.ndarray,
+    hash_val: np.ndarray,
+) -> None:
+    a = F[fi, 0]
+    b = F[fi, 1]
+    c = F[fi, 2]
+    for ua, va in ((a, b), (b, c), (c, a)):
+        ei = _hash_lookup(hash_key, hash_val, ua, va)
+        if ei >= 0:
+            if edge_f0[ei] == fi:
+                edge_f0[ei] = np.int32(-1)
+            elif edge_f1[ei] == fi:
+                edge_f1[ei] = np.int32(-1)
+
+
+@njit(cache=True)
+def _link_face_numba(
+    fi: np.int32,
+    F: np.ndarray,
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+    edge_f0: np.ndarray,
+    edge_f1: np.ndarray,
+    n_edges: np.ndarray,
+    edge_cap: np.int32,
+    hash_key: np.ndarray,
+    hash_val: np.ndarray,
+) -> None:
+    a = F[fi, 0]
+    b = F[fi, 1]
+    c = F[fi, 2]
+    for ua, va in ((a, b), (b, c), (c, a)):
+        ei = _hash_lookup(hash_key, hash_val, ua, va)
+        if ei >= 0:
+            if edge_f0[ei] < 0:
+                edge_f0[ei] = fi
+            elif edge_f1[ei] < 0:
+                edge_f1[ei] = fi
+        else:
+            ne = n_edges[0]
+            if ne >= edge_cap:
+                continue
+            if ua < va:
+                eu, ev = ua, va
+            else:
+                eu, ev = va, ua
+            edge_u[ne] = eu
+            edge_v[ne] = ev
+            edge_f0[ne] = fi
+            edge_f1[ne] = np.int32(-1)
+            _hash_insert(hash_key, hash_val, eu, ev, ne)
+            n_edges[0] = ne + np.int32(1)
+
+
+@njit(cache=True)
+def apply_collapse_local(
+    keep: np.int32,
+    drop: np.int32,
+    F: np.ndarray,
+    face_alive: np.ndarray,
+    nbr: np.ndarray,
+    nbr_count: np.ndarray,
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+    edge_f0: np.ndarray,
+    edge_f1: np.ndarray,
+    n_edges: np.ndarray,
+    edge_cap: np.int32,
+    hash_key: np.ndarray,
+    hash_val: np.ndarray,
+    vface: np.ndarray,
+    vface_count: np.ndarray,
+) -> None:
+    """Apply one edge collapse in-place; ``keep`` retains ``drop`` (keep=b, drop=a)."""
+    ei = _hash_lookup(hash_key, hash_val, drop, keep)
+    removed_f0 = np.int32(-1)
+    removed_f1 = np.int32(-1)
+    if ei >= 0:
+        removed_f0 = edge_f0[ei]
+        removed_f1 = edge_f1[ei]
+
+    for ii in range(vface_count[drop]):
+        fi = vface[drop, ii]
+        if not face_alive[fi]:
+            continue
+        _unlink_face_numba(fi, F, edge_f0, edge_f1, hash_key, hash_val)
+        if fi == removed_f0 or fi == removed_f1:
+            face_alive[fi] = False
+            continue
+        for k in range(3):
+            if F[fi, k] == drop:
+                F[fi, k] = keep
+        x0 = F[fi, 0]
+        x1 = F[fi, 1]
+        x2 = F[fi, 2]
+        if x0 == x1 or x1 == x2 or x2 == x0:
+            face_alive[fi] = False
+        else:
+            _link_face_numba(
+                fi,
+                F,
+                edge_u,
+                edge_v,
+                edge_f0,
+                edge_f1,
+                n_edges,
+                edge_cap,
+                hash_key,
+                hash_val,
+            )
+            _add_vface(vface, vface_count, keep, fi)
+
+    for i in range(nbr_count[drop]):
+        v = nbr[drop, i]
+        if v == keep:
+            continue
+        _remove_nbr(nbr, nbr_count, v, drop)
+        _add_nbr(nbr, nbr_count, v, keep)
+        _add_nbr(nbr, nbr_count, keep, v)
+    _remove_nbr(nbr, nbr_count, keep, drop)
+    nbr_count[drop] = 0
+
+
+def topology_collapse_buffers(topo: MeshTopology, *, face_count: int) -> tuple[np.ndarray, ...]:
+    """Pad edge arrays to ``3 * face_count + 1`` for incremental collapse updates."""
+    cap = 3 * int(face_count) + 1
+    edge_u = np.full(cap, -1, dtype=np.int32)
+    edge_v = np.full(cap, -1, dtype=np.int32)
+    edge_f0 = np.full(cap, -1, dtype=np.int32)
+    edge_f1 = np.full(cap, -1, dtype=np.int32)
+    ne = int(topo.n_edges)
+    if ne > 0:
+        edge_u[:ne] = topo.edge_u
+        edge_v[:ne] = topo.edge_v
+        edge_f0[:ne] = topo.edge_f0
+        edge_f1[:ne] = topo.edge_f1
+    n_edges = np.array([ne], dtype=np.int32)
+    return edge_u, edge_v, edge_f0, edge_f1, n_edges, np.int32(cap)
+
+
+@njit(cache=True)
+def edge_index(
+    hash_key: np.ndarray,
+    hash_val: np.ndarray,
+    a: np.int32,
+    b: np.int32,
+) -> np.int32:
+    """Return edge slot index for undirected edge ``(a, b)``, or ``-1``."""
+    return _hash_lookup(hash_key, hash_val, a, b)
+
+
+@njit(cache=True)
 def pair_obtuse_edges(
     e_min: np.ndarray,
     e_max: np.ndarray,
