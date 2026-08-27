@@ -445,8 +445,7 @@ print(report.summary())
 
 out_dir = OUT / mesh_name
 out_dir.mkdir(parents=True, exist_ok=True)
-skel_raw.write_swc(str(out_dir / "skeleton_raw.swc"))
-skel.write_swc(str(out_dir / "skeleton.swc"))
+skel_raw.write_polylines(str(out_dir / "skeleton_raw.polylines.txt"))
 skel.write_polylines(str(out_dir / "skeleton.polylines.txt"))
 meso.export(str(out_dir / "meso_skeleton.obj"))
 fig_compare.write_html(str(out_dir / "skeleton_refine_compare.html"))

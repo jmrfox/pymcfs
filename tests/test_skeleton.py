@@ -3,6 +3,7 @@ import numpy as np
 import trimesh as tm
 
 from pymcfs.skeleton import (
+    Skeleton,
     skeletonize,
     refine_skeleton,
     _resample_polyline_arc_length,
@@ -123,15 +124,30 @@ def test_skeletonize_with_medial_weight():
 
 
 def test_polylines_export(tmp_path):
-    mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    skel = skeletonize(mesh, max_iterations=12, w_M=0.0)
+    nodes = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float)
+    edges = np.array([[0, 1], [1, 2]], dtype=int)
+    G = nx.Graph()
+    for i, p in enumerate(nodes):
+        G.add_node(i, pos=p)
+    for u, v in edges:
+        G.add_edge(int(u), int(v), weight=float(np.linalg.norm(nodes[u] - nodes[v])))
+    skel = Skeleton(nodes=nodes, edges=edges, graph=G)
+
     pls = skel.to_polylines()
-    assert isinstance(pls, list)
+    assert len(pls) == 1
+    assert pls[0].shape == (3, 3)
+    np.testing.assert_allclose(pls[0], nodes)
+
     out = tmp_path / "skel.polylines.txt"
     skel.write_polylines(str(out))
     assert out.exists()
-    text = out.read_text(encoding="utf-8")
-    assert len(text.strip().splitlines()) >= 0
+    line = out.read_text(encoding="utf-8").strip()
+    parts = line.split()
+    n_pts = int(parts[0])
+    assert n_pts == 3
+    assert len(parts) == 1 + 3 * n_pts
+    coords = np.array([float(x) for x in parts[1:]], dtype=float).reshape(n_pts, 3)
+    np.testing.assert_allclose(coords, nodes)
 
 
 def test_analyze_skeleton_runs():

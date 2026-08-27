@@ -9,7 +9,7 @@ fixtures/parity/<case>/
     poles.off          # Starlab medial nOFF (x y z angle radius) or plain OFF
     meso_N0001.off     # contracted surface after N MCF iterations
     meso_final.off     # optional
-    skeleton.cg        # raw curve graph (no SWC)
+    skeleton.cg        # raw curve graph
   pymcfs/
     poles.npy
     meso_N0001.off|.npz

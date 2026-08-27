@@ -32,7 +32,6 @@ htmlcov/
 # Local outputs and caches
 outputs/
 *.log
-data/swc/TS*/
 
 # Starlab reference (clone locally; nested git repo — not vendored in pymcfs)
 _ref_starlab-mcfskel/

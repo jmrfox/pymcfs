@@ -52,7 +52,7 @@ log = logging.getLogger("pymcfs.ts_skeleton")
 
 ROOT = Path("..").resolve() if Path.cwd().name == "notebooks" else Path.cwd()
 DATA = ROOT / "data" / "mesh"
-OUT = ROOT / "data" / "swc"
+OUT = ROOT / "outputs" / "polylines"
 OUT.mkdir(parents=True, exist_ok=True)
 
 # --- choose mesh ---
@@ -456,7 +456,7 @@ def _summarize_skeleton(skel: Skeleton, label: str) -> dict:
 skel_raw = driver.convert_to_skeleton(refine=False)
 raw_info = _summarize_skeleton(skel_raw, "raw")
 skel_raw.write_cg(str(case_out / "skeleton_raw.cg"))
-skel_raw.write_swc(str(case_out / "skeleton_raw.swc"))
+skel_raw.write_polylines(str(case_out / "skeleton_raw.polylines.txt"))
 
 # %%
 fig_raw = skel_raw.plot_3d(
@@ -487,7 +487,7 @@ compress_info = _summarize_skeleton(skel_compress, "compress")
 
 skel = skel_uniform
 skel.write_cg(str(case_out / "skeleton_uniform.cg"))
-skel.write_swc(str(case_out / "skeleton_uniform.swc"))
+skel.write_polylines(str(case_out / "skeleton_uniform.polylines.txt"))
 
 # %%
 fig_len = go.Figure()

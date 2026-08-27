@@ -48,7 +48,7 @@ Use this list after moving to WSL. Items are ordered roughly by priority for
 
 - [ ] Re-run `notebooks/ts_skeleton.py` on WSL for **TS1** (and at least one other `data/mesh/TS*.obj`).
   - Confirm no exterior spike branches with robust defaults (`W_H=0.5`, `W_M=5.0`, gating on).
-  - Export SWC/CG under `data/swc/` (gitignored for `TS*/`).
+  - Export polylines (`.polylines.txt`) and CG under `outputs/polylines/` (gitignored per case).
 - [ ] Run slow regression explicitly:
   ```bash
   uv run python -m pytest tests/test_pole_gating.py::test_ts1_robust_no_screenshot_exterior_spikes -q
@@ -122,7 +122,7 @@ path, face-walk collapse order.
 
 - [ ] Add short **WSL quickstart** section to README (copy from §1 above once verified).
 - [ ] Note in README.md when CHOLMOD API fix lands and expected speedup range.
-- [ ] Document notebook workflow: `ts_skeleton.py` inputs (`data/mesh/TS1.obj`), outputs (`data/swc/TS1/`, gitignored).
+- [ ] Document notebook workflow: `ts_skeleton.py` inputs (`data/mesh/TS1.obj`), outputs (`outputs/polylines/<case>/`, gitignored via `outputs/`).
 
 ---
 
@@ -144,7 +144,7 @@ Treat pymcfs as ready for your TS implementation workflow when:
 2. **TS1 + ≥1 other TS mesh** produce inside-mesh skeletons with robust defaults (visual + `analyze_skeleton`).
 3. Slow TS1 regression passes on WSL.
 4. Parity Stage 1 (sindorelax poles) still passes; Stage 2 understood/documented if Starlab dumps absent.
-5. Notebook path documented: mesh → MCFS → SWC/CG export reproducible on WSL.
+5. Notebook path documented: mesh → MCFS → polylines/CG export reproducible on WSL.
 
 ---
 

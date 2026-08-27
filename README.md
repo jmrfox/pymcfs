@@ -245,7 +245,7 @@ CGAL’s published C++ API is the algorithmic guide; this package reimplements i
 
 - `pymcfs.medial.compute_voronoi_poles(mesh)`
 
-- `Skeleton.write_swc` / `Skeleton.plot_3d`
+- `Skeleton.write_polylines` / `Skeleton.to_polylines` / `Skeleton.plot_3d`
 
 - `pymcfs.mesh.example_mesh` / `MeshManager`
 

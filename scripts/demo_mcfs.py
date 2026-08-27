@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Demo: load a closed mesh, run MCFS, export SWC + polylines, print quality report.
+Demo: load a closed mesh, run MCFS, export polylines, print quality report.
 
 Usage:
   python scripts/demo_mcfs.py [--mesh PATH] [--outdir PATH] [--backend plotly|matplotlib]
@@ -119,9 +119,8 @@ def main():
             fig.savefig(str(out_png), dpi=150)
             print(f"Wrote {out_png}")
 
-    skel.write_swc(str(outdir / "skeleton.swc"))
     skel.write_polylines(str(outdir / "skeleton.polylines.txt"))
-    print(f"Wrote SWC + polylines under {outdir}")
+    print(f"Wrote polylines under {outdir}")
 
     try:
         Vt, Ft = thin_mesh(m, w_H=args.w_H, w_M=args.w_M, max_iterations=min(40, args.iters))
