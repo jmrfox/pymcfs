@@ -71,7 +71,7 @@ path, face-walk collapse order.
 ### Still worth doing
 
 - [x] **Confirm CHOLMOD actually used** in driver logs (`spd=cholmod` at init when verbose).
-- [x] **Numba collapse hot path** — `apply_collapse_local` kernel + `_link_condition_numba`; main loop keeps incremental Python apply (golden parity). Incremental Numba apply deferred (edge-hash drift under mid-pass updates).
+- [x] **Numba collapse hot path** — `apply_collapse_local` kernel + `_link_condition_numba`; incremental Numba drift fixed (Aug 2026). Main loop keeps Python apply until fast topology pack exists (`build_topology` ~10× slower than Python adjacency on sindorelax-scale meshes).
 - [x] **Batch point-in-mesh** for gating — profiled; `contains` ≪1% on TS1/sindorelax (+2 calls/contract). BVH cache not needed yet.
 - [ ] **Incremental sparse factor** — refactor `AᵀA` only when sparsity pattern changes (deprioritized: geometry ≈1% of iter).
 

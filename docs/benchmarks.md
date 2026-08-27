@@ -4,6 +4,8 @@ Recorded with `uv run python scripts/bench_mcfs_iter.py --profile` on Aug 2026.
 
 ## sindorelax (`fixtures/parity/sindorelax/input.off`, n≈12k)
 
+### Tier B (post split preallocation)
+
 | Phase | ms | Share |
 |-------|-----|-------|
 | geometry | 110 | 0.6% |
@@ -12,7 +14,26 @@ Recorded with `uv run python scripts/bench_mcfs_iter.py --profile` on Aug 2026.
 | degen | 2168 | 11% |
 | **total / iter** | **~18917** | 100% |
 
-Full iteration (after Tier B split preallocation): **~17 s/iter** (1-iter mean).
+Full iteration: **~17 s/iter** (1-iter mean).
+
+### Tier C (Aug 2026 — split arrays + degen edge batch)
+
+| Phase | ms | Share |
+|-------|-----|-------|
+| geometry | 128 | 0.6% |
+| collapse | 8104 | 41% |
+| split | 9336 | 47% |
+| degen | 2169 | 11% |
+| **contract total** | **~19736** | 100% |
+
+Full iteration: **~16.2 s/iter** (1-iter mean).
+
+Notes:
+
+- Numba `apply_collapse_local` incremental drift fixed (kill collapse-edge faces before remaps); golden icosphere hash unchanged.
+- Wiring Numba collapse in the main loop is **deferred**: `build_topology` is ~10× slower than Python `_vertex_neighbors` + `_edge_to_faces` on large meshes (~1.4 s vs ~0.16 s per pass), so the hot loop stays on incremental Python apply until topology build is optimized.
+- Split: obtuse candidates stay as `(n, 5)` arrays; face split uses Numba `split_face_on_edge_numba`.
+- Degeneracy: one link check per mesh edge instead of per vertex–neighbor pair.
 
 CHOLMOD improves the geometry slice (~3× on solve) but not wall-clock (~1% of iteration).
 

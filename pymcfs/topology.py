@@ -450,6 +450,7 @@ def _link_face_numba(
     edge_v: np.ndarray,
     edge_f0: np.ndarray,
     edge_f1: np.ndarray,
+    face_alive: np.ndarray,
     n_edges: np.ndarray,
     edge_cap: np.int32,
     hash_key: np.ndarray,
@@ -464,6 +465,10 @@ def _link_face_numba(
             if edge_f0[ei] < 0:
                 edge_f0[ei] = fi
             elif edge_f1[ei] < 0:
+                edge_f1[ei] = fi
+            elif edge_f0[ei] >= 0 and not face_alive[edge_f0[ei]]:
+                edge_f0[ei] = fi
+            elif edge_f1[ei] >= 0 and not face_alive[edge_f1[ei]]:
                 edge_f1[ei] = fi
         else:
             ne = n_edges[0]
@@ -508,14 +513,28 @@ def apply_collapse_local(
         removed_f0 = edge_f0[ei]
         removed_f1 = edge_f1[ei]
 
-    for ii in range(vface_count[drop]):
+    nd = vface_count[drop]
+    incident = np.empty(MAX_VF, dtype=np.int32)
+    n_inc = 0
+    for ii in range(nd):
         fi = vface[drop, ii]
+        if face_alive[fi]:
+            incident[n_inc] = fi
+            n_inc += 1
+
+    # Kill collapse-edge faces first so remapped faces can attach to shared edges.
+    for ii in range(n_inc):
+        fi = incident[ii]
+        if fi != removed_f0 and fi != removed_f1:
+            continue
+        _unlink_face_numba(fi, F, edge_f0, edge_f1, hash_key, hash_val)
+        face_alive[fi] = False
+
+    for ii in range(n_inc):
+        fi = incident[ii]
         if not face_alive[fi]:
             continue
         _unlink_face_numba(fi, F, edge_f0, edge_f1, hash_key, hash_val)
-        if fi == removed_f0 or fi == removed_f1:
-            face_alive[fi] = False
-            continue
         for k in range(3):
             if F[fi, k] == drop:
                 F[fi, k] = keep
@@ -532,6 +551,7 @@ def apply_collapse_local(
                 edge_v,
                 edge_f0,
                 edge_f1,
+                face_alive,
                 n_edges,
                 edge_cap,
                 hash_key,
@@ -539,6 +559,7 @@ def apply_collapse_local(
             )
             _add_vface(vface, vface_count, keep, fi)
 
+    vface_count[drop] = 0
     for i in range(nbr_count[drop]):
         v = nbr[drop, i]
         if v == keep:
@@ -611,3 +632,246 @@ def pair_obtuse_edges(
                 n_out += 1
         i = j
     return out[:n_out].copy()
+
+
+@njit(cache=True)
+def select_obtuse_split_batch(candidates: np.ndarray, n_faces: np.int32) -> np.ndarray:
+    """Greedy vertex- then face-disjoint batch from ``(u,v,f0,f1,split_side)`` rows."""
+    n = candidates.shape[0]
+    if n == 0:
+        return candidates.reshape(0, 5)
+
+    nv_hint = np.int32(0)
+    for i in range(n):
+        for j in range(5):
+            v = candidates[i, j]
+            if v > nv_hint:
+                nv_hint = v
+    nv = nv_hint + np.int32(1)
+
+    used_v = np.zeros(nv, dtype=np.bool_)
+    picked = np.zeros(n, dtype=np.bool_)
+    n_picked = 0
+    for i in range(n):
+        u = candidates[i, 0]
+        v = candidates[i, 1]
+        s = candidates[i, 4]
+        if used_v[u] or used_v[v] or used_v[s]:
+            continue
+        used_v[u] = True
+        used_v[v] = True
+        used_v[s] = True
+        picked[i] = True
+        n_picked += 1
+
+    if n_picked == 0:
+        picked[0] = True
+
+    used_f = np.zeros(n_faces, dtype=np.bool_)
+    out = np.empty((n, 5), dtype=np.int32)
+    n_out = 0
+    for i in range(n):
+        if not picked[i]:
+            continue
+        f0 = candidates[i, 2]
+        f1 = candidates[i, 3]
+        if used_f[f0] or used_f[f1]:
+            continue
+        used_f[f0] = True
+        used_f[f1] = True
+        out[n_out, 0] = candidates[i, 0]
+        out[n_out, 1] = candidates[i, 1]
+        out[n_out, 2] = f0
+        out[n_out, 3] = f1
+        out[n_out, 4] = candidates[i, 4]
+        n_out += 1
+
+    if n_out == 0:
+        return candidates[:1].copy()
+    return out[:n_out].copy()
+
+
+@njit(cache=True)
+def split_face_on_edge_numba(
+    face: np.ndarray,
+    u: np.int32,
+    v: np.int32,
+    new: np.int32,
+    row0: np.ndarray,
+    row1: np.ndarray,
+) -> bool:
+    """Write two triangle rows splitting ``(u,v)`` on ``face``; return False if edge missing."""
+    a = face[0]
+    b = face[1]
+    c = face[2]
+    if a == u and b == v:
+        row0[0] = a
+        row0[1] = new
+        row0[2] = c
+        row1[0] = new
+        row1[1] = b
+        row1[2] = c
+        return True
+    if a == v and b == u:
+        row0[0] = a
+        row0[1] = new
+        row0[2] = c
+        row1[0] = new
+        row1[1] = b
+        row1[2] = c
+        return True
+    if b == u and c == v:
+        row0[0] = b
+        row0[1] = new
+        row0[2] = a
+        row1[0] = new
+        row1[1] = c
+        row1[2] = a
+        return True
+    if b == v and c == u:
+        row0[0] = b
+        row0[1] = new
+        row0[2] = a
+        row1[0] = new
+        row1[1] = c
+        row1[2] = a
+        return True
+    if c == u and a == v:
+        row0[0] = c
+        row0[1] = new
+        row0[2] = b
+        row1[0] = new
+        row1[1] = a
+        row1[2] = b
+        return True
+    if c == v and a == u:
+        row0[0] = c
+        row0[1] = new
+        row0[2] = b
+        row1[0] = new
+        row1[1] = a
+        row1[2] = b
+        return True
+    return False
+
+
+@njit(cache=True)
+def select_obtuse_split_batch(candidates: np.ndarray, n_faces: np.int32) -> np.ndarray:
+    """Greedy vertex- then face-disjoint batch from ``(u,v,f0,f1,split_side)`` rows."""
+    n = candidates.shape[0]
+    if n == 0:
+        return candidates.reshape(0, 5)
+
+    nv_hint = 0
+    for i in range(n):
+        for j in range(5):
+            v = candidates[i, j]
+            if v > nv_hint:
+                nv_hint = v
+    nv = nv_hint + np.int32(1)
+
+    used_v = np.zeros(nv, dtype=np.bool_)
+    picked = np.zeros(n, dtype=np.bool_)
+    n_picked = 0
+    for i in range(n):
+        u = candidates[i, 0]
+        v = candidates[i, 1]
+        s = candidates[i, 4]
+        if used_v[u] or used_v[v] or used_v[s]:
+            continue
+        used_v[u] = True
+        used_v[v] = True
+        used_v[s] = True
+        picked[i] = True
+        n_picked += 1
+
+    if n_picked == 0:
+        picked[0] = True
+        n_picked = 1
+
+    used_f = np.zeros(n_faces, dtype=np.bool_)
+    out = np.empty((n, 5), dtype=np.int32)
+    n_out = 0
+    for i in range(n):
+        if not picked[i]:
+            continue
+        f0 = candidates[i, 2]
+        f1 = candidates[i, 3]
+        if used_f[f0] or used_f[f1]:
+            continue
+        used_f[f0] = True
+        used_f[f1] = True
+        out[n_out, 0] = candidates[i, 0]
+        out[n_out, 1] = candidates[i, 1]
+        out[n_out, 2] = f0
+        out[n_out, 3] = f1
+        out[n_out, 4] = candidates[i, 4]
+        n_out += 1
+
+    if n_out == 0:
+        return candidates[:1].copy()
+    return out[:n_out].copy()
+
+
+@njit(cache=True)
+def split_face_on_edge_numba(
+    face: np.ndarray,
+    u: np.int32,
+    v: np.int32,
+    new: np.int32,
+    row0: np.ndarray,
+    row1: np.ndarray,
+) -> bool:
+    """Write two triangle rows splitting ``(u,v)`` on ``face``; return False if edge missing."""
+    a = face[0]
+    b = face[1]
+    c = face[2]
+    if a == u and b == v:
+        row0[0] = a
+        row0[1] = new
+        row0[2] = c
+        row1[0] = new
+        row1[1] = b
+        row1[2] = c
+        return True
+    if a == v and b == u:
+        row0[0] = a
+        row0[1] = new
+        row0[2] = c
+        row1[0] = new
+        row1[1] = b
+        row1[2] = c
+        return True
+    if b == u and c == v:
+        row0[0] = b
+        row0[1] = new
+        row0[2] = a
+        row1[0] = new
+        row1[1] = c
+        row1[2] = a
+        return True
+    if b == v and c == u:
+        row0[0] = b
+        row0[1] = new
+        row0[2] = a
+        row1[0] = new
+        row1[1] = c
+        row1[2] = a
+        return True
+    if c == u and a == v:
+        row0[0] = c
+        row0[1] = new
+        row0[2] = b
+        row1[0] = new
+        row1[1] = a
+        row1[2] = b
+        return True
+    if c == v and a == u:
+        row0[0] = c
+        row0[1] = new
+        row0[2] = b
+        row1[0] = new
+        row1[1] = a
+        row1[2] = b
+        return True
+    return False

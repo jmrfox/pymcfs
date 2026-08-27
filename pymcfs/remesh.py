@@ -14,6 +14,7 @@ from .topology import (
     build_topology,
     link_condition_ok,
     pair_obtuse_edges,
+    split_face_on_edge_numba,
     topology_collapse_buffers,
 )
 
@@ -535,11 +536,11 @@ def _obtuse_split_candidates(
     *,
     thr: float,
     short_edge: float,
-) -> list[tuple[int, int, int, int, int]]:
-    """Return (u, v, face0, face1, split_side) for interior edges with both opposite angles > thr."""
+) -> np.ndarray:
+    """Return ``(n, 5)`` int32 rows ``(u, v, face0, face1, split_side)`` for obtuse pairs."""
     m = F.shape[0]
     if m == 0:
-        return []
+        return np.zeros((0, 5), dtype=np.int32)
 
     v0 = V[F[:, 0]]
     v1 = V[F[:, 1]]
@@ -584,7 +585,7 @@ def _obtuse_split_candidates(
         opp_vert[order],
         float(thr),
     )
-    return [(int(r[0]), int(r[1]), int(r[2]), int(r[3]), int(r[4])) for r in rows]
+    return rows
 
 
 def split_obtuse_faces(
@@ -628,53 +629,42 @@ def split_obtuse_faces(
     thr = float(max_angle_deg) * (np.pi / 180.0)
     total = 0
     passes = 0
-
-    def split_face_on_edge(face: np.ndarray, u: int, v: int, new: int) -> list[np.ndarray]:
-        a, b, c = (int(x) for x in face)
-        for x, y, z in ((a, b, c), (b, c, a), (c, a, b)):
-            if x == u and y == v:
-                return [
-                    np.array([x, new, z], dtype=int),
-                    np.array([new, y, z], dtype=int),
-                ]
-            if x == v and y == u:
-                return [
-                    np.array([x, new, z], dtype=int),
-                    np.array([new, y, z], dtype=int),
-                ]
-        raise ValueError("face does not contain split edge")
+    tri0 = np.empty(3, dtype=np.int32)
+    tri1 = np.empty(3, dtype=np.int32)
 
     while passes < max_passes:
         if deadline is not None and _time.monotonic() >= deadline:
             break
         passes += 1
         selected = _obtuse_split_candidates(V, F, thr=thr, short_edge=short_edge)
-        if not selected:
+        if selected.shape[0] == 0:
             break
 
         used_verts: set[int] = set()
-        batch: list[tuple[int, int, int, int, int]] = []
-        for u, v, face0, face1, split_side in selected:
+        batch_rows: list[np.ndarray] = []
+        for row in selected:
+            u, v, face0, face1, split_side = (int(row[i]) for i in range(5))
             if u in used_verts or v in used_verts or split_side in used_verts:
                 continue
             used_verts.update((u, v, split_side))
-            batch.append((u, v, face0, face1, split_side))
+            batch_rows.append(row)
 
-        if not batch:
-            batch = [selected[0]]
+        if not batch_rows:
+            batch_rows = [selected[0]]
 
         face_used: set[int] = set()
-        clean_batch: list[tuple[int, int, int, int, int]] = []
-        for item in batch:
-            _u, _v, f0, f1, _s = item
+        clean_batch: list[np.ndarray] = []
+        for row in batch_rows:
+            f0, f1 = int(row[2]), int(row[3])
             if f0 in face_used or f1 in face_used:
                 continue
             face_used.update((f0, f1))
-            clean_batch.append(item)
+            clean_batch.append(row)
         batch = clean_batch or [selected[0]]
 
         planned: list[tuple[int, int, int, int, int, np.ndarray, np.ndarray | None]] = []
-        for u, v, face0, face1, split_side in batch:
+        for row in batch:
+            u, v, face0, face1, split_side = (int(row[i]) for i in range(5))
             if deadline is not None and _time.monotonic() >= deadline:
                 break
             edge = V[v] - V[u]
@@ -719,6 +709,7 @@ def split_obtuse_faces(
         keep_mask[list(remove)] = False
         F_out[:n_keep_f] = F[keep_mask]
         f_write = n_keep_f
+        F_i32 = np.asarray(F, dtype=np.int32)
 
         for i, (u, v, face0, face1, _split_side, new_position, new_pole) in enumerate(planned):
             new_index = n_old_v + i
@@ -728,9 +719,20 @@ def split_obtuse_faces(
             if poles is not None and new_pole is not None:
                 poles_out[new_index] = new_pole
             for src_face in (face0, face1):
-                for row in split_face_on_edge(F[src_face], u, v, new_index):
-                    F_out[f_write] = row
-                    f_write += 1
+                ok = split_face_on_edge_numba(
+                    F_i32[src_face],
+                    np.int32(u),
+                    np.int32(v),
+                    np.int32(new_index),
+                    tri0,
+                    tri1,
+                )
+                if not ok:
+                    raise ValueError("face does not contain split edge")
+                F_out[f_write] = tri0
+                f_write += 1
+                F_out[f_write] = tri1
+                f_write += 1
             total += 1
 
         V = V_out

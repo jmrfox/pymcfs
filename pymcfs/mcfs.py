@@ -609,30 +609,33 @@ class MeanCurvatureFlowSkeletonization:
         elength_fixed = self._min_edge / 10.0
         elength_fixed_sq = elength_fixed * elength_fixed
         topo = mesh_adjacency(self.F, self.V.shape[0])
-        newly = 0
+        bad_count = np.zeros(self.V.shape[0], dtype=np.int32)
         V = self.V
+        for ei in range(topo.n_edges):
+            if self._timed_out():
+                break
+            a = int(topo.edge_u[ei])
+            b = int(topo.edge_v[ei])
+            diff = V[a] - V[b]
+            if float(diff @ diff) >= elength_fixed_sq:
+                continue
+            if not collapse_ok_for_edge(
+                a,
+                b,
+                V,
+                self.F,
+                check_connectivity=False,
+                topo=topo,
+            ):
+                bad_count[a] += 1
+                bad_count[b] += 1
+        newly = 0
         for v in range(self.V.shape[0]):
             if self._timed_out():
                 break
             if self.fixed[v]:
                 continue
-            bad = 0
-            for i in range(int(topo.nbr_count[v])):
-                u = int(topo.nbr[v, i])
-                diff = V[v] - V[u]
-                if float(diff @ diff) >= elength_fixed_sq:
-                    continue
-                a, b = (v, u) if v < u else (u, v)
-                if not collapse_ok_for_edge(
-                    a,
-                    b,
-                    V,
-                    self.F,
-                    check_connectivity=False,
-                    topo=topo,
-                ):
-                    bad += 1
-            if bad >= 2:
+            if int(bad_count[v]) >= 2:
                 self.fixed[v] = True
                 newly += 1
         if newly:
