@@ -15,13 +15,15 @@ from .refine import (
     refine_skeleton,
     refine_skeleton_graph,
     resolve_refine_options,
+    prune_exterior_branches,
+    prune_exterior_graph,
     _resample_polyline_arc_length,
 )
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-McfsProfile = Literal["robust", "starlab"]
+McfsProfile = Literal["robust", "starlab", "auto"]
 
 # Application / CGAL-robust defaults (complex TS-like meshes).
 _ROBUST_W_H = 0.5
@@ -39,6 +41,8 @@ def resolve_mcfs_profile(
     gate_exterior_poles: bool | None,
     quality_speed_tradeoff: float | None = None,
     medially_centered_speed_tradeoff: float | None = None,
+    mesh: tm.Trimesh | None = None,
+    branching: str = "sparse",
 ) -> tuple[float, float, bool]:
     """Resolve ``(w_H, w_M, gate_exterior_poles)`` from profile + explicit args.
 
@@ -47,9 +51,44 @@ def resolve_mcfs_profile(
       ``w_H`` / ``w_M`` values, or set ``gate_exterior_poles`` explicitly.
     - ``profile=None`` / ``\"robust\"`` uses application defaults (0.5 / 5.0) and
       gated poles (CGAL-style), again unless overridden.
+    - ``profile=\"auto\"`` proposes weights from mesh features via
+      :func:`pymcfs.params.propose_mcfs_params` (requires ``mesh``).
+      ``branching`` is forwarded (default ``\"sparse\"``). Explicit
+      ``quality_speed_tradeoff`` / ``medially_centered_speed_tradeoff`` still
+      override the proposal; ``gate_exterior_poles`` overrides when not ``None``.
+
+    Raises
+    ------
+    ValueError
+        If ``profile`` is unknown, or ``profile=\"auto\"`` without ``mesh``.
     """
-    if profile not in (None, "robust", "starlab"):
-        raise ValueError(f"profile must be None, 'robust', or 'starlab'; got {profile!r}")
+    if profile not in (None, "robust", "starlab", "auto"):
+        raise ValueError(
+            f"profile must be None, 'robust', 'starlab', or 'auto'; got {profile!r}"
+        )
+
+    if profile == "auto":
+        if mesh is None:
+            raise ValueError("profile='auto' requires a mesh to propose parameters")
+        from .params import propose_mcfs_params
+
+        proposed = propose_mcfs_params(mesh, branching=branching)  # type: ignore[arg-type]
+        wh = (
+            float(quality_speed_tradeoff)
+            if quality_speed_tradeoff is not None
+            else float(proposed.w_H)
+        )
+        wm = (
+            float(medially_centered_speed_tradeoff)
+            if medially_centered_speed_tradeoff is not None
+            else float(proposed.w_M)
+        )
+        gate = (
+            bool(gate_exterior_poles)
+            if gate_exterior_poles is not None
+            else bool(proposed.gate_exterior_poles)
+        )
+        return wh, wm, gate
 
     if profile == "starlab":
         default_wh, default_wm, default_gate = _STARLAB_W_H, _STARLAB_W_M, False
@@ -150,14 +189,26 @@ class Skeleton:
         return polylines
 
     def write_polylines(self, filepath: str) -> None:
-        """Write polylines as text: ``N x y z x y z ...`` per line."""
+        """Write polylines as text: ``N x y z x y z ...`` per line.
+
+        Parameters
+        ----------
+        filepath :
+            Output path (created/overwritten).
+        """
         with open(filepath, "w", encoding="utf-8") as f:
             for pl in self.to_polylines():
                 coords = " ".join(f"{float(c):.9g}" for p in pl for c in p)
                 f.write(f"{pl.shape[0]} {coords}\n")
 
     def write_cg(self, filepath: str) -> None:
-        """Write the skeleton as a Starlab Curve Graph (``.cg``) file."""
+        """Write the skeleton as a Starlab Curve Graph (``.cg``) file.
+
+        Parameters
+        ----------
+        filepath :
+            Output ``.cg`` path.
+        """
         from .cg_io import write_cg
 
         write_cg(filepath, self.nodes, self.edges)
@@ -206,8 +257,17 @@ class Skeleton:
         -------
         plotly.graph_objects.Figure
             The created Plotly figure.
+
+        Raises
+        ------
+        ImportError
+            If Plotly is not installed (``uv sync --extra viz`` / ``pymcfs[viz]``).
+        TypeError
+            If ``mesh`` is neither a Trimesh nor a ``(V, F)`` tuple.
         """
-        import plotly.graph_objects as go
+        from .viz import require_plotly
+
+        go = require_plotly()
 
         traces: list[go.BaseTraceType] = []
 
@@ -293,7 +353,14 @@ class Skeleton:
     ) -> "Skeleton":
         """Return a copy with optional chain merge / arc-length resampling.
 
-        See :func:`refine_skeleton`.
+        Parameters
+        ----------
+        mode, spacing, spacing_frac :
+            Forwarded to :func:`refine_skeleton`.
+
+        Returns
+        -------
+        Skeleton
         """
         return refine_skeleton(
             self, mode=mode, spacing=spacing, spacing_frac=spacing_frac
@@ -321,7 +388,10 @@ def skeletonize(
     quality_speed_tradeoff: float | None = None,
     medially_centered_speed_tradeoff: float | None = None,
     gate_exterior_poles: bool | None = None,
+    fast_gating: bool = False,
+    use_cholmod: bool | None = None,
     profile: McfsProfile | None = None,
+    branching: str = "sparse",
     max_iterations: int = 500,
     timeout_seconds: float | None = 120.0,
     min_edge_length: float | None = None,
@@ -333,6 +403,7 @@ def skeletonize(
     refine_spacing_frac: float | None = None,
     compress_chains: bool = False,
     resample_spacing: float | None = None,
+    prune_exterior: bool = True,
     validate: bool = True,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
@@ -351,9 +422,21 @@ def skeletonize(
     gate_exterior_poles :
         If True, apply ``w_M`` only for poles inside the mesh (CGAL-style).
         Default True for robust profile; False for ``profile=\"starlab\"``.
+    fast_gating :
+        Use the mesh's Embree ray backend (``pymcfs[embree]``) for pole
+        containment instead of the exact float64 traverser. Much faster, but
+        single precision: only safe for meshes at unit-ish scale near the
+        origin. See :class:`pymcfs.mcfs.MeanCurvatureFlowSkeletonization`.
+    use_cholmod :
+        If True, require scikit-sparse CHOLMOD. If False, force SuperLU.
+        If None (default), use CHOLMOD when importable.
     profile :
         ``None`` / ``\"robust\"`` — gated poles, defaults ``w_H=0.5``, ``w_M=5``.
         ``\"starlab\"`` — ungated poles, ``w_H=0.1``, ``w_M=0.2`` (parity dumps).
+        ``\"auto\"`` — mesh-conditioned proposal from :func:`pymcfs.params.propose_mcfs_params`.
+    branching :
+        Oracle branching preference when ``profile=\"auto\"``: ``\"sparse\"``
+        (default, fewest junctions), ``\"balanced\"``, or ``\"dense\"``.
     max_iterations, timeout_seconds :
         Contraction stop limits.
     min_edge_length, max_triangle_angle :
@@ -368,6 +451,9 @@ def skeletonize(
         ``refine=\"compress\"`` keeps only junctions/leaves.
     compress_chains, resample_spacing :
         Legacy aliases for refine when ``refine`` is left False.
+    prune_exterior :
+        If True (default), remove dangling curve tips outside the input mesh
+        after conversion (see :func:`pymcfs.refine.prune_exterior_branches`).
     validate :
         Run mesh validation before contraction.
     verbose, log :
@@ -382,6 +468,17 @@ def skeletonize(
     ------
     TypeError
         If ``mesh`` is not a Trimesh or MeshManager.
+    ValueError
+        If validation fails, ``profile`` is invalid, or ``profile=\"auto\"``
+        lacks a usable mesh.
+    ImportError
+        If ``use_cholmod=True`` but scikit-sparse CHOLMOD is unavailable.
+
+    Notes
+    -----
+    Contraction uses :class:`~pymcfs.mcfs.MeanCurvatureFlowSkeletonization`
+    with default ``max_vertex_growth=4.0`` (remesh blow-up abort). Tune that
+    guard via the driver class directly.
     """
     _log = log or logger
     m = _coerce_mesh(mesh)
@@ -393,6 +490,8 @@ def skeletonize(
         gate_exterior_poles=gate_exterior_poles,
         quality_speed_tradeoff=quality_speed_tradeoff,
         medially_centered_speed_tradeoff=medially_centered_speed_tradeoff,
+        mesh=m,
+        branching=branching,
     )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
@@ -402,6 +501,8 @@ def skeletonize(
         w_H=wh,
         w_M=wm,
         gate_exterior_poles=gate,
+        fast_gating=bool(fast_gating),
+        use_cholmod=use_cholmod,
         min_edge_length=min_edge_length,
         max_triangle_angle=float(max_triangle_angle),
         area_variation_factor=float(area_variation_factor),
@@ -428,6 +529,7 @@ def skeletonize(
         compress_chains=bool(compress_chains),
         resample_spacing=resample_spacing,
         keep_largest_component=bool(keep_largest_component),
+        prune_exterior=bool(prune_exterior),
     )
 
 
@@ -439,7 +541,10 @@ def thin_mesh(
     quality_speed_tradeoff: float | None = None,
     medially_centered_speed_tradeoff: float | None = None,
     gate_exterior_poles: bool | None = None,
+    fast_gating: bool = False,
+    use_cholmod: bool | None = None,
     profile: McfsProfile | None = None,
+    branching: str = "sparse",
     max_iterations: int = 500,
     timeout_seconds: float | None = 120.0,
     min_edge_length: float | None = None,
@@ -452,8 +557,14 @@ def thin_mesh(
     """Contract a mesh with MCFS; return the meso-skeleton surface ``(V, F)``.
 
     Parameters match :func:`skeletonize` contraction controls (no curve-graph
-    conversion). CGAL-style aliases ``quality_speed_tradeoff`` /
-    ``medially_centered_speed_tradeoff`` are accepted.
+    conversion / refine flags). Accepted keyword arguments:
+
+    ``w_H``, ``w_M``, ``quality_speed_tradeoff``,
+    ``medially_centered_speed_tradeoff``, ``gate_exterior_poles``,
+    ``fast_gating``, ``use_cholmod``, ``profile``, ``branching``,
+    ``max_iterations``, ``timeout_seconds``, ``min_edge_length``,
+    ``max_triangle_angle``, ``area_variation_factor``, ``validate``,
+    ``verbose``, ``log``.
 
     Returns
     -------
@@ -464,6 +575,15 @@ def thin_mesh(
     ------
     TypeError
         If ``mesh`` is not a Trimesh or MeshManager.
+    ValueError
+        If validation fails or ``profile`` is invalid.
+    ImportError
+        If ``use_cholmod=True`` but CHOLMOD is unavailable.
+
+    Notes
+    -----
+    Uses the same remesh-growth abort default (``max_vertex_growth=4.0``) as
+    :func:`skeletonize`.
     """
     _log = log or logger
     m = _coerce_mesh(mesh)
@@ -475,6 +595,8 @@ def thin_mesh(
         gate_exterior_poles=gate_exterior_poles,
         quality_speed_tradeoff=quality_speed_tradeoff,
         medially_centered_speed_tradeoff=medially_centered_speed_tradeoff,
+        mesh=m,
+        branching=branching,
     )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
@@ -484,6 +606,8 @@ def thin_mesh(
         w_H=wh,
         w_M=wm,
         gate_exterior_poles=gate,
+        fast_gating=bool(fast_gating),
+        use_cholmod=use_cholmod,
         min_edge_length=min_edge_length,
         max_triangle_angle=float(max_triangle_angle),
         area_variation_factor=float(area_variation_factor),
@@ -501,12 +625,14 @@ def curve_skeleton_from_mesh(
     V: np.ndarray,
     F: np.ndarray,
     *,
+    mesh: tm.Trimesh | None = None,
     refine: bool | RefineMode = False,
     refine_spacing: float | None = None,
     refine_spacing_frac: float | None = None,
     compress_chains: bool = False,
     resample_spacing: float | None = None,
     keep_largest_component: bool = False,
+    prune_exterior: bool = True,
 ) -> Skeleton:
     """Convert a triangle mesh surface to a 1D curve-graph :class:`Skeleton`.
 
@@ -516,22 +642,30 @@ def curve_skeleton_from_mesh(
         Vertex positions (typically a meso-skeleton from :func:`thin_mesh`).
     F : (m, 3) int
         Triangle indices.
+    mesh :
+        Original closed surface used when ``prune_exterior`` is True. If None,
+        exterior pruning is skipped.
     refine, refine_spacing, refine_spacing_frac, compress_chains, resample_spacing :
         Same meaning as in :func:`skeletonize`.
     keep_largest_component :
         If True, keep only the largest connected component.
+    prune_exterior :
+        If True (default) and ``mesh`` is provided, remove exterior dangling tips.
 
     Returns
     -------
     Skeleton
     """
     from .mcfs import meso_surface_to_curve_graph
+    from .refine import prune_exterior_graph
 
     G = meso_surface_to_curve_graph(V, F)
     if keep_largest_component and G.number_of_nodes() > 0:
         comps = list(nx.connected_components(G))
         if len(comps) > 1:
             G = G.subgraph(max(comps, key=len)).copy()
+    if prune_exterior and mesh is not None and G.number_of_nodes() > 0:
+        G, _n = prune_exterior_graph(G, mesh)
     mode, spacing, spacing_frac = resolve_refine_options(
         refine=refine,
         refine_spacing=refine_spacing,
@@ -567,6 +701,8 @@ __all__ = [
     "curve_skeleton_from_mesh",
     "refine_skeleton",
     "refine_skeleton_graph",
+    "prune_exterior_branches",
+    "prune_exterior_graph",
     "resolve_refine_options",
     "resolve_mcfs_profile",
     "RefineMode",

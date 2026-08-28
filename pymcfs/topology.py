@@ -53,12 +53,30 @@ def _next_pow2(x: np.int64) -> np.int64:
 
 
 @njit(cache=True)
+def _hash_slot(key: np.int64, cap: np.int64) -> np.int64:
+    """Open-addressing start slot for a packed edge key.
+
+    ``cap`` is always a power of two (see :func:`_next_pow2`), so ``key % cap``
+    would keep only the low bits — and those come entirely from the larger
+    endpoint index, since the smaller one is shifted up by 32. Every key would
+    then land in ``[0, nv)`` of a much larger table and linear probing would
+    degenerate into one giant cluster. Mix the whole key first (murmur3
+    finalizer) so both endpoints reach the low bits.
+    """
+    h = key
+    h ^= h >> np.int64(33)
+    h *= np.int64(-49064778989728563)  # 0xff51afd7ed558ccd
+    h ^= h >> np.int64(33)
+    h *= np.int64(-4265267296055464877)  # 0xc4ceb9fe1a85ec53
+    h ^= h >> np.int64(33)
+    return h & (cap - np.int64(1))
+
+
+@njit(cache=True)
 def _hash_lookup(hash_key: np.ndarray, hash_val: np.ndarray, u: np.int32, v: np.int32) -> np.int32:
     key = _pack_edge_key(u, v)
     cap = hash_key.shape[0]
-    h = key % np.int64(cap)
-    if h < 0:
-        h = -h
+    h = _hash_slot(key, np.int64(cap))
     for _ in range(cap):
         k = hash_key[h]
         if k == HASH_EMPTY:
@@ -81,9 +99,7 @@ def _hash_insert(
 ) -> None:
     key = _pack_edge_key(u, v)
     cap = hash_key.shape[0]
-    h = key % np.int64(cap)
-    if h < 0:
-        h = -h
+    h = _hash_slot(key, np.int64(cap))
     for _ in range(cap):
         k = hash_key[h]
         if k == key or k == HASH_EMPTY:
@@ -126,6 +142,7 @@ def _build_topology_kernel(
     F: np.ndarray,
     face_alive: np.ndarray,
     nv: np.int32,
+    edge_headroom: np.int64,
 ):
     m = F.shape[0]
     nbr = np.full((nv, MAX_NBR), -1, dtype=np.int32)
@@ -141,7 +158,9 @@ def _build_topology_kernel(
     edge_f1 = np.empty(max_edges, dtype=np.int32)
     n_edges = np.int32(0)
 
-    cap = int(_next_pow2(np.int64(max(8, 2 * max_edges))))
+    # Incremental collapse retires edge slots without reclaiming them, so the
+    # table has to stay under-loaded for the headroom the caller asked for.
+    cap = int(_next_pow2(np.int64(max(8, 2 * (max_edges + edge_headroom)))))
     hash_key = np.full(cap, np.int64(-1), dtype=np.int64)
     hash_val = np.full(cap, np.int32(-1), dtype=np.int32)
 
@@ -199,8 +218,13 @@ def build_topology(
     *,
     face_alive: np.ndarray | None = None,
     vert_alive: np.ndarray | None = None,
+    edge_headroom: int = 0,
 ) -> MeshTopology:
-    """Build array topology from triangle faces."""
+    """Build array topology from triangle faces.
+
+    ``edge_headroom`` oversizes the edge hash table for callers that will add
+    edges incrementally (see :func:`topology_collapse_buffers`).
+    """
     F = np.asarray(F, dtype=np.int32)
     if F.size == 0:
         n = int(nv or 0)
@@ -245,7 +269,9 @@ def build_topology(
         hash_val,
         vface,
         vface_count,
-    ) = _build_topology_kernel(F, face_alive, np.int32(nv))
+    ) = _build_topology_kernel(
+        F, face_alive, np.int32(nv), np.int64(max(0, int(edge_headroom)))
+    )
 
     return MeshTopology(
         F=F,
@@ -264,6 +290,55 @@ def build_topology(
         vface_count=vface_count,
         vert_alive=vert_alive,
     )
+
+
+@njit(cache=True)
+def _face_walk_edges_kernel(F: np.ndarray, face_alive: np.ndarray, nv: np.int32):
+    m = F.shape[0]
+    max_edges = 3 * m + 1
+    out = np.empty((max_edges, 2), dtype=np.int32)
+    n_out = 0
+
+    cap = int(_next_pow2(np.int64(max(8, 2 * max_edges))))
+    hash_key = np.full(cap, np.int64(-1), dtype=np.int64)
+    hash_val = np.full(cap, np.int32(-1), dtype=np.int32)
+
+    for fi in range(m):
+        if not face_alive[fi]:
+            continue
+        i0 = F[fi, 0]
+        i1 = F[fi, 1]
+        i2 = F[fi, 2]
+        for ua, va in ((i0, i1), (i1, i2), (i2, i0)):
+            if _hash_lookup(hash_key, hash_val, ua, va) >= 0:
+                continue
+            if ua < va:
+                eu, ev = ua, va
+            else:
+                eu, ev = va, ua
+            out[n_out, 0] = eu
+            out[n_out, 1] = ev
+            _hash_insert(hash_key, hash_val, eu, ev, np.int32(n_out))
+            n_out += 1
+    return out[:n_out].copy()
+
+
+def face_walk_edges(F: np.ndarray, face_alive: np.ndarray | None = None) -> np.ndarray:
+    """Undirected edges as ``(e, 2)`` int32 in first-seen face-walk order.
+
+    Same sequence as walking faces in index order and emitting each edge the
+    first time it appears, which is the visit order the short-edge collapse
+    sweep depends on.
+    """
+    F = np.asarray(F, dtype=np.int32)
+    if F.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    if face_alive is None:
+        face_alive = np.ones(F.shape[0], dtype=np.bool_)
+    else:
+        face_alive = np.asarray(face_alive, dtype=np.bool_)
+    nv = np.int32(int(F.max()) + 1)
+    return _face_walk_edges_kernel(F, face_alive, nv)
 
 
 @njit(cache=True)
@@ -571,9 +646,138 @@ def apply_collapse_local(
     nbr_count[drop] = 0
 
 
-def topology_collapse_buffers(topo: MeshTopology, *, face_count: int) -> tuple[np.ndarray, ...]:
-    """Pad edge arrays to ``3 * face_count + 1`` for incremental collapse updates."""
-    cap = 3 * int(face_count) + 1
+@njit(cache=True)
+def collapse_short_edge_sweep(
+    edges: np.ndarray,
+    V: np.ndarray,
+    poles: np.ndarray,
+    pole_valid: np.ndarray,
+    has_poles: bool,
+    has_pole_valid: bool,
+    F: np.ndarray,
+    face_alive: np.ndarray,
+    vert_alive: np.ndarray,
+    nbr: np.ndarray,
+    nbr_count: np.ndarray,
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+    edge_f0: np.ndarray,
+    edge_f1: np.ndarray,
+    n_edges: np.ndarray,
+    edge_cap: np.int32,
+    hash_key: np.ndarray,
+    hash_val: np.ndarray,
+    vface: np.ndarray,
+    vface_count: np.ndarray,
+    min_edge_length: float,
+    max_collapses: np.int64,
+) -> np.int64:
+    """Collapse short edges along ``edges``, updating everything in place.
+
+    Visits ``edges`` in order, collapsing ``(a, b)`` into ``b`` when it is
+    shorter than ``min_edge_length`` and link-legal. The kept vertex moves to
+    the midpoint and retains whichever of the two poles is closer to it, along
+    with that pole's validity. Returns the number of collapses applied.
+    """
+    collapsed = np.int64(0)
+    for i in range(edges.shape[0]):
+        if collapsed >= max_collapses:
+            break
+        a = edges[i, 0]
+        b = edges[i, 1]
+        if not vert_alive[a] or not vert_alive[b]:
+            continue
+
+        ei = _hash_lookup(hash_key, hash_val, a, b)
+        if ei < 0:
+            continue
+        f0 = edge_f0[ei]
+        f1 = edge_f1[ei]
+        alive0 = f0 >= 0 and face_alive[f0]
+        alive1 = f1 >= 0 and face_alive[f1]
+        if not alive0 and not alive1:
+            continue
+
+        dx = V[a, 0] - V[b, 0]
+        dy = V[a, 1] - V[b, 1]
+        dz = V[a, 2] - V[b, 2]
+        if np.sqrt(dx * dx + dy * dy + dz * dz) >= min_edge_length:
+            continue
+
+        if not link_condition_ok(
+            a,
+            b,
+            F,
+            face_alive,
+            nbr,
+            nbr_count,
+            edge_f0,
+            edge_f1,
+            hash_key,
+            hash_val,
+            vface,
+            vface_count,
+        ):
+            continue
+
+        keep = b
+        drop = a
+        mx = 0.5 * (V[a, 0] + V[b, 0])
+        my = 0.5 * (V[a, 1] + V[b, 1])
+        mz = 0.5 * (V[a, 2] + V[b, 2])
+
+        if has_poles:
+            kx = mx - poles[keep, 0]
+            ky = my - poles[keep, 1]
+            kz = mz - poles[keep, 2]
+            gx = mx - poles[drop, 0]
+            gy = my - poles[drop, 1]
+            gz = mz - poles[drop, 2]
+            d_keep = np.sqrt(kx * kx + ky * ky + kz * kz)
+            d_drop = np.sqrt(gx * gx + gy * gy + gz * gz)
+            if d_keep > d_drop:
+                poles[keep, 0] = poles[drop, 0]
+                poles[keep, 1] = poles[drop, 1]
+                poles[keep, 2] = poles[drop, 2]
+                if has_pole_valid:
+                    pole_valid[keep] = pole_valid[drop]
+
+        V[keep, 0] = mx
+        V[keep, 1] = my
+        V[keep, 2] = mz
+        vert_alive[drop] = False
+        apply_collapse_local(
+            keep,
+            drop,
+            F,
+            face_alive,
+            nbr,
+            nbr_count,
+            edge_u,
+            edge_v,
+            edge_f0,
+            edge_f1,
+            n_edges,
+            edge_cap,
+            hash_key,
+            hash_val,
+            vface,
+            vface_count,
+        )
+        collapsed += np.int64(1)
+    return collapsed
+
+
+def topology_collapse_buffers(
+    topo: MeshTopology, *, face_count: int, edge_headroom: int = 0
+) -> tuple[np.ndarray, ...]:
+    """Pad edge arrays to ``3 * face_count + 1 + edge_headroom`` for collapses.
+
+    A collapse retires the edge slots around the dropped vertex and appends new
+    slots for the remapped edges, without reclaiming the retired ones, so a
+    long sweep needs headroom beyond the initial edge count.
+    """
+    cap = 3 * int(face_count) + 1 + max(0, int(edge_headroom))
     edge_u = np.full(cap, -1, dtype=np.int32)
     edge_v = np.full(cap, -1, dtype=np.int32)
     edge_f0 = np.full(cap, -1, dtype=np.int32)
@@ -632,127 +836,6 @@ def pair_obtuse_edges(
                 n_out += 1
         i = j
     return out[:n_out].copy()
-
-
-@njit(cache=True)
-def select_obtuse_split_batch(candidates: np.ndarray, n_faces: np.int32) -> np.ndarray:
-    """Greedy vertex- then face-disjoint batch from ``(u,v,f0,f1,split_side)`` rows."""
-    n = candidates.shape[0]
-    if n == 0:
-        return candidates.reshape(0, 5)
-
-    nv_hint = np.int32(0)
-    for i in range(n):
-        for j in range(5):
-            v = candidates[i, j]
-            if v > nv_hint:
-                nv_hint = v
-    nv = nv_hint + np.int32(1)
-
-    used_v = np.zeros(nv, dtype=np.bool_)
-    picked = np.zeros(n, dtype=np.bool_)
-    n_picked = 0
-    for i in range(n):
-        u = candidates[i, 0]
-        v = candidates[i, 1]
-        s = candidates[i, 4]
-        if used_v[u] or used_v[v] or used_v[s]:
-            continue
-        used_v[u] = True
-        used_v[v] = True
-        used_v[s] = True
-        picked[i] = True
-        n_picked += 1
-
-    if n_picked == 0:
-        picked[0] = True
-
-    used_f = np.zeros(n_faces, dtype=np.bool_)
-    out = np.empty((n, 5), dtype=np.int32)
-    n_out = 0
-    for i in range(n):
-        if not picked[i]:
-            continue
-        f0 = candidates[i, 2]
-        f1 = candidates[i, 3]
-        if used_f[f0] or used_f[f1]:
-            continue
-        used_f[f0] = True
-        used_f[f1] = True
-        out[n_out, 0] = candidates[i, 0]
-        out[n_out, 1] = candidates[i, 1]
-        out[n_out, 2] = f0
-        out[n_out, 3] = f1
-        out[n_out, 4] = candidates[i, 4]
-        n_out += 1
-
-    if n_out == 0:
-        return candidates[:1].copy()
-    return out[:n_out].copy()
-
-
-@njit(cache=True)
-def split_face_on_edge_numba(
-    face: np.ndarray,
-    u: np.int32,
-    v: np.int32,
-    new: np.int32,
-    row0: np.ndarray,
-    row1: np.ndarray,
-) -> bool:
-    """Write two triangle rows splitting ``(u,v)`` on ``face``; return False if edge missing."""
-    a = face[0]
-    b = face[1]
-    c = face[2]
-    if a == u and b == v:
-        row0[0] = a
-        row0[1] = new
-        row0[2] = c
-        row1[0] = new
-        row1[1] = b
-        row1[2] = c
-        return True
-    if a == v and b == u:
-        row0[0] = a
-        row0[1] = new
-        row0[2] = c
-        row1[0] = new
-        row1[1] = b
-        row1[2] = c
-        return True
-    if b == u and c == v:
-        row0[0] = b
-        row0[1] = new
-        row0[2] = a
-        row1[0] = new
-        row1[1] = c
-        row1[2] = a
-        return True
-    if b == v and c == u:
-        row0[0] = b
-        row0[1] = new
-        row0[2] = a
-        row1[0] = new
-        row1[1] = c
-        row1[2] = a
-        return True
-    if c == u and a == v:
-        row0[0] = c
-        row0[1] = new
-        row0[2] = b
-        row1[0] = new
-        row1[1] = a
-        row1[2] = b
-        return True
-    if c == v and a == u:
-        row0[0] = c
-        row0[1] = new
-        row0[2] = b
-        row1[0] = new
-        row1[1] = a
-        row1[2] = b
-        return True
-    return False
 
 
 @njit(cache=True)

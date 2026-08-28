@@ -6,6 +6,44 @@ import trimesh as tm
 from scipy.spatial import Voronoi
 
 
+def points_inside_mesh(
+    mesh: tm.Trimesh, points: np.ndarray, *, fast: bool = False
+) -> np.ndarray:
+    """Boolean mask of ``points`` strictly inside ``mesh``.
+
+    ``mesh.contains`` silently switches to Embree whenever ``embreex`` is
+    importable, and Embree traces in single precision. On meshes whose
+    coordinates sit far from the origin (TS neuron meshes span ~5.7e3 to
+    ~8.0e3) that loses enough precision to flip the majority of pole gating
+    decisions, so the exact float64 traverser is the default and the fast
+    backend has to be requested explicitly.
+
+    Parameters
+    ----------
+    mesh :
+        Closed triangle mesh used for containment tests.
+    points : (k, 3) float
+        Query points.
+    fast :
+        Use the mesh's own ray backend (Embree when installed). Much faster,
+        but only trustworthy for meshes at unit-ish scale near the origin.
+
+    Returns
+    -------
+    (k,) bool ndarray
+        True where the point is strictly inside the mesh.
+    """
+    points = np.asarray(points, dtype=float)
+    if points.size == 0:
+        return np.zeros(points.shape[0], dtype=bool)
+    if fast:
+        return np.asarray(mesh.contains(points), dtype=bool)
+    from trimesh.ray.ray_triangle import RayMeshIntersector
+
+    intersector = RayMeshIntersector(mesh)
+    return np.asarray(intersector.contains_points(points), dtype=bool)
+
+
 def compute_voronoi_poles(mesh: tm.Trimesh, *, use_vertex_normals: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """Compute per-vertex medial (inner Voronoi) poles for guidance.
 
@@ -14,12 +52,25 @@ def compute_voronoi_poles(mesh: tm.Trimesh, *, use_vertex_normals: bool = True) 
     vertex's Voronoi cell with the most negative projection along the surface
     normal.
 
+    Parameters
+    ----------
+    mesh :
+        Input triangle mesh.
+    use_vertex_normals :
+        Currently unused for branching (both paths use ``mesh.vertex_normals``);
+        retained for API compatibility with older call sites.
+
     Returns
     -------
-    targets : (n,3) float
+    targets : (n, 3) float
         Medial target positions (inner Voronoi poles) for each vertex.
     weights : (n,) float
         Suggested diagonal guidance weights per vertex in ``[0, 1]``.
+
+    Raises
+    ------
+    TypeError
+        If ``mesh`` is not a ``trimesh.Trimesh``.
     """
     if not isinstance(mesh, tm.Trimesh):
         raise TypeError("compute_voronoi_poles expects a trimesh.Trimesh")

@@ -19,7 +19,7 @@ def test_collapse_short_edges_reduces_vertices():
     V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces, int)
     n0 = V.shape[0]
     diag = float(np.linalg.norm(V.max(0) - V.min(0)))
-    V2, F2, ncoll, _, _ = collapse_short_edges(V, F, min_edge_length=0.15 * diag)
+    V2, F2, ncoll, *_ = collapse_short_edges(V, F, min_edge_length=0.15 * diag)
     assert ncoll > 0
     assert V2.shape[0] < n0
     assert F2.ndim == 2 and F2.shape[1] == 3
@@ -33,7 +33,7 @@ def test_collapse_short_edges_golden_icosphere():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
     V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces, int)
     diag = float(np.linalg.norm(V.max(0) - V.min(0)))
-    V2, F2, ncoll, _, _ = collapse_short_edges(V, F, min_edge_length=0.15 * diag)
+    V2, F2, ncoll, *_ = collapse_short_edges(V, F, min_edge_length=0.15 * diag)
     assert ncoll == 142
     assert V2.shape == (20, 3)
     assert F2.shape == (36, 3)
@@ -41,6 +41,51 @@ def test_collapse_short_edges_golden_icosphere():
         np.ascontiguousarray(V2).tobytes() + np.ascontiguousarray(F2).tobytes()
     ).hexdigest()
     assert digest == "d4606e0df03de89e05e39eefa9c33c56d30409eedd63c84f18891b880e00c028"
+
+
+def test_collapse_short_edges_carries_pole_valid_by_index():
+    """A collapsed vertex inherits the validity of whichever pole it kept."""
+    mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces, int)
+    diag = float(np.linalg.norm(V.max(0) - V.min(0)))
+    poles = V * 0.5
+    valid = np.zeros(V.shape[0], dtype=bool)
+    valid[::2] = True
+
+    V2, F2, ncoll, _, poles2, valid2 = collapse_short_edges(
+        V, F, min_edge_length=0.15 * diag, poles=poles, pole_valid=valid
+    )
+    assert ncoll > 0
+    assert valid2.shape[0] == V2.shape[0] == poles2.shape[0]
+
+    validity_of_pole = {
+        tuple(p): bool(v) for p, v in zip(poles.tolist(), valid.tolist())
+    }
+    for p, v in zip(poles2.tolist(), valid2.tolist()):
+        assert validity_of_pole[tuple(p)] == v
+
+
+def test_split_obtuse_faces_grows_pole_valid_with_new_vertices():
+    V = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, 0.01, 0.0],
+            [0.5, -0.01, 0.0],
+        ],
+        dtype=float,
+    )
+    F = np.array([[0, 1, 2], [1, 0, 3]], dtype=int)
+    valid = np.ones(V.shape[0], dtype=bool)
+    V2, _F2, n, _fixed, _poles, valid2, _split = split_obtuse_faces(
+        V, F, max_angle_deg=90.0, poles=V.copy(), pole_valid=valid
+    )
+    assert n >= 1
+    assert valid2.shape[0] == V2.shape[0]
+    # Pre-existing validity is preserved; new vertices are placeholders for the
+    # caller's batched containment test.
+    assert bool(valid2[: V.shape[0]].all())
+    assert not bool(valid2[V.shape[0] :].any())
 
 
 def test_split_obtuse_faces_runs():
@@ -156,7 +201,7 @@ def test_mcfs_timeout_stops():
 def test_collapse_does_not_raise_nameerror():
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
     diag = float(np.linalg.norm(mesh.vertices.max(0) - mesh.vertices.min(0)))
-    V2, F2, n, _, _ = collapse_short_edges(
+    V2, F2, n, *_ = collapse_short_edges(
         np.asarray(mesh.vertices, float),
         np.asarray(mesh.faces, int),
         min_edge_length=0.2 * diag,

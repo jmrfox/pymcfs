@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pymcfs import mcfs as mcfs_module
 from pymcfs.laplacian import mcfs_cotangent_laplacian
 from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
 from pymcfs.parity import load_mesh
@@ -32,9 +33,44 @@ MESH_PRESETS = {
 }
 
 
+class _GatingProbe:
+    """Charge pole containment to its own phase instead of the calling remesh.
+
+    Gating runs inside ``collapse_edges`` / ``split_faces``, so timing those
+    calls as wholes hides the point-in-mesh cost inside the remesh phases.
+    This patches the driver's containment entry point, measures it separately,
+    and the caller subtracts it back out.
+    """
+
+    def __init__(self) -> None:
+        self.original = mcfs_module.points_inside_mesh
+        self.seconds = 0.0
+        self.calls = 0
+        self.points = 0
+        mcfs_module.points_inside_mesh = self
+
+    def __call__(self, mesh, points, *, fast=False):
+        t0 = time.perf_counter()
+        result = self.original(mesh, points, fast=fast)
+        self.seconds += time.perf_counter() - t0
+        self.calls += 1
+        self.points += len(points)
+        return result
+
+    def restore(self) -> None:
+        mcfs_module.points_inside_mesh = self.original
+
+    def take(self) -> tuple[float, int, int]:
+        """Return and reset the accumulated (seconds, calls, points)."""
+        stats = (self.seconds, self.calls, self.points)
+        self.seconds, self.calls, self.points = 0.0, 0, 0
+        return stats
+
+
 def _profile_contract(driver: MeanCurvatureFlowSkeletonization) -> dict[str, float]:
     """Time sub-phases of one ``contract()`` call (seconds)."""
     times: dict[str, float] = {}
+    probe = _GatingProbe()
 
     driver._sync_pole_valid()
     wL, wH, wM = driver._update_constraint_weights()
@@ -44,38 +80,47 @@ def _profile_contract(driver: MeanCurvatureFlowSkeletonization) -> dict[str, flo
     times["laplacian"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    diag = np.asarray(L.diagonal()).ravel()
-    L_off = L - sp.diags(diag, format="csr", shape=L.shape)
-    L_weighted = (sp.diags(wL) @ L_off) + sp.diags(diag, format="csr")
-    WH = sp.diags(wH, format="csr")
-    WP = sp.diags(wM, format="csr")
-    A = sp.vstack([L_weighted, WH, WP], format="csc")
-    rhs = np.vstack(
-        [
-            np.zeros_like(driver.V),
-            wH[:, None] * driver.V,
-            wM[:, None] * driver.poles,
-        ]
+    row_of = np.repeat(np.arange(L.shape[0]), np.diff(L.indptr))
+    row_scale = wL[row_of]
+    row_scale[L.indices == row_of] = 1.0
+    L_weighted = sp.csr_matrix(
+        (L.data * row_scale, L.indices, L.indptr), shape=L.shape
     )
-    AtA = (A.T @ A).tocsc()
-    At_rhs = A.T @ rhs
+    AtA = (
+        (L_weighted.T @ L_weighted)
+        + sp.diags(wH * wH, format="csr")
+        + sp.diags(wM * wM, format="csr")
+    ).tocsc()
+    At_rhs = wH[:, None] * (wH[:, None] * driver.V) + wM[:, None] * (
+        wM[:, None] * driver.poles
+    )
     times["ata_assemble"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     solve_spd_ata(AtA, At_rhs, use_cholmod=driver._use_cholmod)
     times["solve"] = time.perf_counter() - t0
 
+    probe.take()
+    gating_s = 0.0
+    gating_calls = 0
+    gating_points = 0
+
     t0 = time.perf_counter()
     driver.contract_geometry()
     times["geometry"] = time.perf_counter() - t0
 
-    t0 = time.perf_counter()
-    driver.collapse_edges()
-    times["collapse"] = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    new_splits = driver.split_faces()
-    times["split"] = time.perf_counter() - t0
+    # Each remesh phase is reported net of the gating it triggered internally.
+    for phase, run in (("collapse", driver.collapse_edges), ("split", driver.split_faces)):
+        t0 = time.perf_counter()
+        result = run()
+        elapsed = time.perf_counter() - t0
+        gate_s, gate_calls, gate_points = probe.take()
+        times[phase] = max(elapsed - gate_s, 0.0)
+        gating_s += gate_s
+        gating_calls += gate_calls
+        gating_points += gate_points
+        if phase == "split":
+            new_splits = result
 
     driver._constraint_fixed = driver.fixed.copy()
     driver._constraint_split = driver.is_split.copy()
@@ -86,18 +131,22 @@ def _profile_contract(driver: MeanCurvatureFlowSkeletonization) -> dict[str, flo
     driver.detect_degeneracies()
     times["degen"] = time.perf_counter() - t0
 
+    times["gating"] = gating_s
+    times["gating_calls"] = float(gating_calls)
+    times["gating_points"] = float(gating_points)
+    probe.restore()
     return times
 
 
 def _print_profile(times: dict[str, float]) -> None:
     geom_detail = times["laplacian"] + times["ata_assemble"] + times["solve"]
-    contract_total = (
+    total = (
         times["geometry"]
         + times["collapse"]
         + times["split"]
         + times["degen"]
+        + times["gating"]
     )
-    total = contract_total
     print("profile (one contract, ms):")
     rows = [
         ("geometry", times["geometry"]),
@@ -107,11 +156,16 @@ def _print_profile(times: dict[str, float]) -> None:
         ("collapse", times["collapse"]),
         ("split", times["split"]),
         ("degen", times["degen"]),
+        ("gating (contains)", times["gating"]),
         ("total", total),
     ]
     for name, sec in rows:
         pct = 100.0 * sec / total if total > 0 else 0.0
-        print(f"  {name:16s}: {1000.0 * sec:8.1f} ms ({pct:5.1f}%)")
+        print(f"  {name:18s}: {1000.0 * sec:8.1f} ms ({pct:5.1f}%)")
+    print(
+        f"  (gating: {int(times['gating_calls'])} contains calls, "
+        f"{int(times['gating_points'])} points; collapse/split shown net of it)"
+    )
     if geom_detail > 0 and abs(times["geometry"] - geom_detail) > 1e-6:
         print(
             f"  (geometry detail sum {1000.0 * geom_detail:.1f} ms "
@@ -171,6 +225,7 @@ def main() -> int:
         _print_profile(_profile_contract(driver))
 
     n_contains_before = int(driver._n_contains)
+    probe = _GatingProbe()
     t0 = time.perf_counter()
     for i in range(args.iters):
         t_i = time.perf_counter()
@@ -180,11 +235,15 @@ def main() -> int:
             f"n={driver.V.shape[0]} f={driver.F.shape[0]}"
         )
     elapsed = time.perf_counter() - t0
+    gate_s, gate_calls, gate_points = probe.take()
+    probe.restore()
     mean_ms = 1000.0 * elapsed / max(args.iters, 1)
     print(f"iters={args.iters} mean_ms={mean_ms:.2f} total_s={elapsed:.3f}")
     print(
         f"contains_calls={driver._n_contains} "
-        f"(+{driver._n_contains - n_contains_before} during contracts)"
+        f"(+{driver._n_contains - n_contains_before} during contracts) "
+        f"gating={gate_s:.3f}s ({100.0 * gate_s / max(elapsed, 1e-9):.1f}%) "
+        f"points={gate_points} in {gate_calls} calls"
     )
     return 0
 

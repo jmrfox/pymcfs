@@ -8,7 +8,7 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.5
 #   kernelspec:
-#     display_name: Python 3
+#     display_name: .venv
 #     language: python
 #     name: python3
 # ---
@@ -56,10 +56,15 @@ OUT = ROOT / "outputs" / "polylines"
 OUT.mkdir(parents=True, exist_ok=True)
 
 # --- choose mesh ---
-TS_NAME = "TS1" 
+TS_NAME = "TS3" 
 REPAIR_IF_NEEDED = True
 
-# MCFS (application / CGAL-robust defaults for complex TS meshes)
+# MCFS weights: robust defaults (0.5 / 5.0), or set USE_ORACLE=True for
+# mesh-conditioned proposals (see pymcfs.params.propose_mcfs_params).
+# branching="sparse" (default) snaps TS1-like meshes to robust and prefers
+# fewer junctions on thick fragments — best for neuroscience centerlines.
+USE_ORACLE = True
+ORACLE_BRANCHING = "sparse"  # "sparse" | "balanced" | "dense"
 W_H = 0.5
 W_M = 5.0
 GATE_EXTERIOR_POLES = True  # CGAL: w_M only when pole is inside the mesh
@@ -241,6 +246,14 @@ fig_off
 # occasional meso snapshots (N=1 is especially useful for Starlab parity).
 
 # %%
+if USE_ORACLE:
+    from pymcfs import propose_mcfs_params
+
+    _proposed = propose_mcfs_params(mesh, branching=ORACLE_BRANCHING)
+    W_H, W_M = float(_proposed.w_H), float(_proposed.w_M)
+    GATE_EXTERIOR_POLES = bool(_proposed.gate_exterior_poles)
+    print(f"oracle: {_proposed.summary()}")
+
 driver = MeanCurvatureFlowSkeletonization(
     mesh,
     w_H=W_H,

@@ -8,6 +8,7 @@ import pytest
 import trimesh as tm
 
 from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
+from pymcfs.medial import points_inside_mesh
 from pymcfs.quality import analyze_skeleton
 from pymcfs.skeleton import resolve_mcfs_profile, skeletonize
 
@@ -67,16 +68,23 @@ def test_ungated_keeps_wM_for_outside_poles():
     assert float(wM[0]) == pytest.approx(0.2)
 
 
+def _record_gating(monkeypatch, sizes: list[int]) -> None:
+    """Record the batch size of every pole containment test the driver runs."""
+    from pymcfs import mcfs as mcfs_mod
+
+    original = mcfs_mod.points_inside_mesh
+
+    def recording(mesh, points, *, fast=False):
+        sizes.append(int(np.asarray(points).shape[0]))
+        return original(mesh, points, fast=fast)
+
+    monkeypatch.setattr(mcfs_mod, "points_inside_mesh", recording)
+
+
 def test_pole_valid_contains_cached_across_geometry_steps(monkeypatch):
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    calls = {"n": 0}
-    orig = mesh.contains
-
-    def counting_contains(points):
-        calls["n"] += 1
-        return orig(points)
-
-    monkeypatch.setattr(mesh, "contains", counting_contains)
+    sizes: list[int] = []
+    _record_gating(monkeypatch, sizes)
     mcs = MeanCurvatureFlowSkeletonization(
         mesh,
         w_H=0.5,
@@ -85,23 +93,90 @@ def test_pole_valid_contains_cached_across_geometry_steps(monkeypatch):
         use_cholmod=False,
         verbose=False,
     )
-    n_after_init = calls["n"]
-    assert n_after_init >= 1
+    assert len(sizes) >= 1
+    n_after_init = len(sizes)
     mcs.contract_geometry()
     mcs.contract_geometry()
-    assert calls["n"] == n_after_init
+    assert len(sizes) == n_after_init
 
 
-def test_pole_valid_recomputed_after_remesh_marks_dirty(monkeypatch):
+def test_collapse_carries_pole_valid_without_contains(monkeypatch):
+    """Collapse keeps one of two existing poles, so validity carries by index."""
+    mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    sizes: list[int] = []
+    _record_gating(monkeypatch, sizes)
+    mcs = MeanCurvatureFlowSkeletonization(
+        mesh,
+        w_H=0.5,
+        w_M=5.0,
+        gate_exterior_poles=True,
+        use_cholmod=False,
+        verbose=False,
+    )
+    diag = float(np.linalg.norm(mcs.V.max(axis=0) - mcs.V.min(axis=0)))
+    mcs._min_edge = 0.15 * diag
+    sizes.clear()
+
+    assert mcs.collapse_edges() > 0
+    assert sizes == []
+    assert mcs.pole_valid.shape[0] == mcs.V.shape[0]
+    assert np.array_equal(mcs.pole_valid, points_inside_mesh(mesh, mcs.poles))
+
+
+def test_remesh_only_tests_newly_interpolated_poles(monkeypatch):
+    """Every post-init containment batch covers new split poles only."""
+    mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    sizes: list[int] = []
+    _record_gating(monkeypatch, sizes)
+    mcs = MeanCurvatureFlowSkeletonization(
+        mesh,
+        w_H=0.1,
+        w_M=5.0,
+        gate_exterior_poles=True,
+        use_cholmod=False,
+        verbose=False,
+    )
+    sizes.clear()
+
+    for _ in range(4):
+        mcs.contract()
+
+    # No batch may cover the whole mesh: that would be a full re-test.
+    assert all(size < mcs.V.shape[0] for size in sizes)
+    assert np.array_equal(mcs.pole_valid, points_inside_mesh(mesh, mcs.poles))
+
+
+def test_gating_defaults_to_exact_float64_backend():
+    """Gating must not silently switch to Embree just because it is installed.
+
+    Embree traces in single precision, which flips most pole decisions on
+    meshes far from the origin, so the exact traverser stays the default.
+    """
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    calls = {"n": 0}
-    orig = mesh.contains
+    mcs = MeanCurvatureFlowSkeletonization(
+        mesh, w_H=0.5, w_M=5.0, use_cholmod=False, verbose=False
+    )
+    assert mcs.fast_gating is False
 
-    def counting_contains(points):
-        calls["n"] += 1
-        return orig(points)
+    # Same containment whether the mesh sits at the origin or far from it.
+    offset = np.array([6000.0, 1200.0, 3400.0])
+    far = tm.Trimesh(
+        vertices=np.asarray(mesh.vertices) + offset,
+        faces=np.asarray(mesh.faces),
+        process=False,
+    )
+    probes = np.asarray(mesh.vertices) * 0.5
+    assert np.array_equal(
+        points_inside_mesh(mesh, probes),
+        points_inside_mesh(far, probes + offset),
+    )
 
-    monkeypatch.setattr(mesh, "contains", counting_contains)
+
+def test_pole_valid_recomputed_after_marking_dirty(monkeypatch):
+    """``_mark_poles_dirty`` remains an escape hatch to a full re-test."""
+    mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
+    sizes: list[int] = []
+    _record_gating(monkeypatch, sizes)
     mcs = MeanCurvatureFlowSkeletonization(
         mesh,
         w_H=0.5,
@@ -110,13 +185,13 @@ def test_pole_valid_recomputed_after_remesh_marks_dirty(monkeypatch):
         use_cholmod=False,
         verbose=False,
     )
-    n0 = calls["n"]
+    sizes.clear()
     mcs._mark_poles_dirty()
     mcs._sync_pole_valid()
-    assert calls["n"] == n0 + 1
+    assert sizes == [mcs.V.shape[0]]
 
 
-@pytest.mark.slow
+@pytest.mark.e2e
 def test_ts1_robust_no_screenshot_exterior_spikes():
     """TS1 with robust defaults should not grow the known exterior spike region."""
     if not TS1.is_file():

@@ -21,7 +21,23 @@ def cholmod_available() -> bool:
 
 
 def resolve_use_cholmod(use_cholmod: bool | None) -> bool:
-    """Resolve driver ``use_cholmod``: None means use CHOLMOD when available."""
+    """Resolve driver ``use_cholmod``: None means use CHOLMOD when available.
+
+    Parameters
+    ----------
+    use_cholmod :
+        True → require CHOLMOD; False → force SuperLU path; None → auto.
+
+    Returns
+    -------
+    bool
+        Whether the CHOLMOD path should be used.
+
+    Raises
+    ------
+    ImportError
+        If ``use_cholmod`` is True but scikit-sparse CHOLMOD is not importable.
+    """
     if use_cholmod is False:
         return False
     if use_cholmod is True:
@@ -44,6 +60,26 @@ def solve_spd_ata(
 
     Prefers CHOLMOD when ``use_cholmod`` is True, then SciPy SuperLU
     (``factorized``), then ``spsolve`` as a last resort.
+
+    Parameters
+    ----------
+    AtA :
+        SPD normal-equation matrix.
+    At_rhs : (n, 3) float
+        Right-hand side columns.
+    use_cholmod :
+        Attempt CHOLMOD first when True and the library is available.
+
+    Returns
+    -------
+    X : (n, 3) float ndarray
+    backend : {\"cholmod\", \"superlu\", \"spsolve\"}
+        Solver that produced ``X``.
+
+    Raises
+    ------
+    ValueError
+        If ``At_rhs`` is not shape ``(n, 3)``.
     """
     AtA = AtA.tocsc()
     At_rhs = np.asarray(At_rhs, dtype=float)

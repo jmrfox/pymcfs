@@ -6,14 +6,31 @@ import trimesh as tm
 
 
 def validate_mcfs_mesh(mesh: tm.Trimesh, *, require_watertight: bool = True) -> tm.Trimesh:
-    """Ensure ``mesh`` is a single-component closed watertight triangle mesh.
+    """Ensure ``mesh`` meets MCFS input preconditions.
+
+    Always requires a non-empty triangle mesh with exactly one connected
+    component. When ``require_watertight`` is True (default), also requires a
+    closed watertight surface with no boundary edges.
+
+    Parameters
+    ----------
+    mesh :
+        Input ``trimesh.Trimesh``.
+    require_watertight :
+        If True (default), enforce watertightness and zero boundary edges.
+        Set False when loading a mesh that will be repaired first.
+
+    Returns
+    -------
+    trimesh.Trimesh
+        The same ``mesh`` object if validation succeeds.
 
     Raises
     ------
     TypeError
         If ``mesh`` is not a ``trimesh.Trimesh``.
     ValueError
-        If the mesh fails MCFS input preconditions.
+        If the mesh fails the selected preconditions.
     """
     if not isinstance(mesh, tm.Trimesh):
         raise TypeError(f"expected trimesh.Trimesh, got {type(mesh)!r}")

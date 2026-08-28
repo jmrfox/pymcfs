@@ -13,7 +13,7 @@ import scipy.sparse.linalg as spla
 import trimesh as tm
 
 from .laplacian import mcfs_cotangent_laplacian
-from .medial import compute_voronoi_poles
+from .medial import compute_voronoi_poles, points_inside_mesh
 from .remesh import (
     collapse_ok_for_edge,
     collapse_short_edges,
@@ -72,6 +72,22 @@ def meso_surface_to_curve_graph(
     while it still bounds a face. Geometry is not moved during this loop. Each
     surviving vertex is positioned afterward at the centroid of the original
     meso-skeleton vertices collapsed into it.
+
+    Parameters
+    ----------
+    V : (n, 3) float
+        Meso-skeleton vertex positions.
+    F : (m, 3) int
+        Triangle indices.
+    max_steps :
+        Optional cap on collapse attempts (default: number of unique edges).
+    deadline :
+        Optional ``time.monotonic()`` deadline; abort early when exceeded.
+
+    Returns
+    -------
+    networkx.Graph
+        Undirected curve graph with node attribute ``pos``.
     """
     V = np.asarray(V, dtype=float)
     F = np.asarray(F, dtype=int).copy()
@@ -205,35 +221,63 @@ class MeanCurvatureFlowSkeletonization:
         If True (default), apply ``w_M`` only when a pole lies inside the input
         mesh — matching CGAL ``Side_of_triangle_mesh`` / ``ON_BOUNDED_SIDE``.
         Set False for Starlab-style ungated medial pull.
+    fast_gating :
+        Use the mesh's own ray backend for pole containment (Embree when
+        ``pymcfs[embree]`` is installed) instead of the exact float64
+        traverser. Roughly 100x faster, but Embree traces in single precision:
+        on meshes far from the origin (TS neuron meshes span ~5.7e3 to ~8.0e3)
+        that flips most gating decisions. Only enable for meshes at unit-ish
+        scale near the origin.
     use_cholmod :
         If True, require scikit-sparse CHOLMOD for the ``AᵀA`` solve. If False,
         force SciPy SuperLU. If None (default), use CHOLMOD when importable.
     min_edge_length, max_triangle_angle :
-        Remesh controls during contraction.
+        Remesh controls during contraction. If ``min_edge_length`` is None,
+        the effective threshold is ``0.002 * bbox_diagonal``.
     area_variation_factor :
         Relative area change vs initial area for convergence.
     max_iterations, timeout_seconds :
         Hard stop criteria.
+    max_vertex_growth :
+        Abort contraction when ``n > max_vertex_growth * n0`` (remesh blow-up).
+        ``None`` or ``<= 0`` disables the guard. Default ``4.0`` (successful
+        TS runs often reach ~2×; catastrophic blow-ups are 10–100×).
+    zero_TH :
+        Numerical floor used when pinning fixed vertices
+        (``w_H = 1 / zero_TH``) and as a short-edge epsilon in remesh.
     validate, verbose, log :
         Validation and logging.
+
+    Attributes
+    ----------
+    aborted_remesh_growth :
+        Set True when :meth:`contract_until_convergence` stops because
+        vertex count exceeded ``max_vertex_growth * n0``.
+    area_overshoot_seen :
+        Set True if a sanity check observed surface area growing far beyond
+        the initial area (numerical / remesh failure signal).
 
     Notes
     -----
     Laplacian scale ``w_L`` is fixed at 1 (CGAL uses the same). Cotangent edge
     weights are recomputed each geometry step. When ``gate_exterior_poles`` is
     on, exterior poles get ``w_M = 0`` so they cannot pull the surface outside.
+    High-level :func:`pymcfs.skeletonize` / :func:`pymcfs.thin_mesh` construct
+    this driver with the default ``max_vertex_growth=4.0``.
     """
 
     mesh: tm.Trimesh
     w_H: float = 0.5
     w_M: float = 5.0
     gate_exterior_poles: bool = True
+    fast_gating: bool = False
     use_cholmod: bool | None = None
     min_edge_length: float | None = None
     max_triangle_angle: float = 110.0
     area_variation_factor: float = 1e-4
     max_iterations: int = 500
     timeout_seconds: float | None = 120.0
+    max_vertex_growth: float | None = 4.0
     zero_TH: float = 1e-7
     validate: bool = True
     verbose: bool = False
@@ -251,10 +295,14 @@ class MeanCurvatureFlowSkeletonization:
     _n_contains: int = field(init=False, default=0, repr=False)
     _min_edge: float = field(init=False, repr=False)
     _area0: float = field(init=False, repr=False)
+    _n0: int = field(init=False, repr=False)
+    _n_max: int = field(init=False, repr=False)
     _w_L: float = field(init=False, default=1.0, repr=False)
     _deadline: float | None = field(init=False, default=None, repr=False)
     _iter: int = field(init=False, default=0, repr=False)
     _bbox0: np.ndarray = field(init=False, repr=False)
+    aborted_remesh_growth: bool = field(init=False, default=False, repr=False)
+    area_overshoot_seen: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.mesh, tm.Trimesh):
@@ -281,10 +329,14 @@ class MeanCurvatureFlowSkeletonization:
         )
         self._area0 = self._surface_area()
         self._faces0 = int(self.F.shape[0])
+        self._n0 = int(n)
+        self._n_max = int(n)
         self._w_L = 1.0
         self._iter = 0
         self._n_contains = 0
         self._pole_valid_dirty = True
+        self.aborted_remesh_growth = False
+        self.area_overshoot_seen = False
         self.pole_valid = np.zeros(n, dtype=bool)
         if float(self.w_M) > 0.0:
             try:
@@ -364,7 +416,7 @@ class MeanCurvatureFlowSkeletonization:
             return np.zeros(0, dtype=bool)
         try:
             self._n_contains += 1
-            inside = np.asarray(self.mesh.contains(poles), dtype=bool)
+            inside = points_inside_mesh(self.mesh, poles, fast=self.fast_gating)
             if inside.shape[0] != n:
                 return np.zeros(n, dtype=bool)
             return inside
@@ -391,35 +443,44 @@ class MeanCurvatureFlowSkeletonization:
         return np.ones(n, dtype=bool)
 
     def _mark_poles_dirty(self) -> None:
-        """Invalidate cached ``pole_valid`` after poles are created or remapped."""
+        """Force a full ``pole_valid`` recompute on the next sync."""
         self._pole_valid_dirty = True
 
     def _sync_pole_valid(self) -> None:
-        """Keep ``pole_valid`` aligned with ``poles`` after remesh.
+        """Keep ``pole_valid`` aligned with ``poles``.
 
-        Containment is relative to the fixed input mesh and pole positions, so
-        we recompute only when poles are remapped (dirty), not after geometry-
-        only contraction steps.
+        Containment is a property of a fixed pole position against the fixed
+        input mesh. Collapse carries validity by index (it keeps one of two
+        existing poles) and split refreshes only the poles it interpolates, so
+        this is a safety net: it re-tests every pole only when the arrays fall
+        out of sync or something explicitly marked them dirty.
         """
         n = self.V.shape[0]
         if float(self.w_M) <= 0.0 or self.poles.shape[0] != n:
             self.pole_valid = np.zeros(n, dtype=bool)
             self._pole_valid_dirty = False
             return
-        if self.gate_exterior_poles:
-            if (
-                not self._pole_valid_dirty
-                and self.pole_valid.shape[0] == n
-            ):
-                return
-            self.pole_valid = self._poles_inside_mesh(self.poles)
-            self._pole_valid_dirty = False
+        if not self._pole_valid_dirty and self.pole_valid.shape[0] == n:
             return
-        if self.pole_valid.shape[0] != n or self._pole_valid_dirty:
-            self.pole_valid = (
-                self._poles_inside_mesh(self.poles) if self.verbose else np.ones(n, dtype=bool)
-            )
-            self._pole_valid_dirty = False
+        self.pole_valid = self._compute_pole_valid(self.poles)
+        self._pole_valid_dirty = False
+
+    def _refresh_new_pole_valid(self, n_new: int) -> None:
+        """Test containment for the ``n_new`` poles appended by an edge split.
+
+        Edge splits interpolate genuinely new pole positions and only ever
+        append, so the trailing ``n_new`` rows are the sole poles whose
+        containment is not already known by index. One small batched test here
+        replaces a whole-mesh ``contains`` call per remesh.
+        """
+        if n_new <= 0 or float(self.w_M) <= 0.0:
+            return
+        n = self.V.shape[0]
+        if self.poles.shape[0] != n or self.pole_valid.shape[0] != n or n_new > n:
+            self._mark_poles_dirty()
+            self._sync_pole_valid()
+            return
+        self.pole_valid[-n_new:] = self._compute_pole_valid(self.poles[-n_new:])
 
     def _sanity_check_state(self, *, stage: str, prev_area: float | None = None) -> None:
         """Log geometric / numerical health of the current meso-skeleton."""
@@ -457,6 +518,7 @@ class MeanCurvatureFlowSkeletonization:
         if not finite:
             self._log.error("sanity[%s]: non-finite vertex coordinates detected", stage)
         if prev_area is not None and prev_area > 0 and area > 1.25 * prev_area:
+            self.area_overshoot_seen = True
             self._log.warning(
                 "sanity[%s]: area increased sharply %.4g -> %.4g (possible medial overshoot)",
                 stage,
@@ -505,24 +567,30 @@ class MeanCurvatureFlowSkeletonization:
         # and solves min ||A X - B||² through A.T @ A. Starlab multiplies
         # off-diagonal Laplacian entries by the source vertex's omega_L but
         # leaves the diagonal as the unweighted negative edge-weight sum.
+        #
+        # The lower two blocks are diagonal, so A.T @ A is
+        # L_w.T @ L_w + diag(w_H²) + diag(w_M²) and A.T @ B collapses to a
+        # dense scaling. Building those directly avoids materialising the
+        # (3n, n) stack, its transpose and the big sparse product. The terms
+        # are combined in the same order the stacked product would use, which
+        # keeps the result bit-identical.
         L = mcfs_cotangent_laplacian(self.V, self.F).tocsr()
-        # Scale off-diagonals by omega_L; leave diagonal as the unweighted
-        # negative edge-weight sum (Starlab / EigenContractionHelper). Avoid LIL.
-        diag = np.asarray(L.diagonal()).ravel()
-        L_off = L - sp.diags(diag, format="csr", shape=L.shape)
-        L_weighted = (sp.diags(wL) @ L_off) + sp.diags(diag, format="csr")
-        WH = sp.diags(wH, format="csr")
-        WP = sp.diags(wM, format="csr")
-        A = sp.vstack([L_weighted, WH, WP], format="csc")
-        rhs = np.vstack(
-            [
-                np.zeros_like(self.V),
-                wH[:, None] * self.V,
-                wM[:, None] * self.poles,
-            ]
+        # Scale off-diagonals by omega_L in the CSR data; leave the diagonal as
+        # the unweighted negative edge-weight sum (EigenContractionHelper).
+        row_of = np.repeat(np.arange(L.shape[0]), np.diff(L.indptr))
+        row_scale = wL[row_of]
+        row_scale[L.indices == row_of] = 1.0
+        L_weighted = sp.csr_matrix(
+            (L.data * row_scale, L.indices, L.indptr), shape=L.shape
         )
-        AtA = (A.T @ A).tocsc()
-        At_rhs = A.T @ rhs
+        AtA = (
+            (L_weighted.T @ L_weighted)
+            + sp.diags(wH * wH, format="csr")
+            + sp.diags(wM * wM, format="csr")
+        ).tocsc()
+        At_rhs = wH[:, None] * (wH[:, None] * self.V) + wM[:, None] * (
+            wM[:, None] * self.poles
+        )
         try:
             from .spd_solve import solve_spd_ata
 
@@ -549,12 +617,14 @@ class MeanCurvatureFlowSkeletonization:
         """Collapse edges shorter than ``min_edge_length``."""
         n_before = self.V.shape[0]
         flags = {"is_split": self.is_split}
-        V2, F2, n, fixed2, poles2 = collapse_short_edges(
+        valid_in = self.pole_valid if self.pole_valid.shape[0] == n_before else None
+        V2, F2, n, fixed2, poles2, valid2 = collapse_short_edges(
             self.V,
             self.F,
             min_edge_length=self._min_edge,
             fixed=self.fixed,
             poles=self.poles,
+            pole_valid=valid_in,
             vertex_flags=flags,
             deadline=self._deadline,
         )
@@ -566,7 +636,10 @@ class MeanCurvatureFlowSkeletonization:
                 flags.get("is_split", np.zeros(V2.shape[0], dtype=bool)),
                 dtype=bool,
             )
-            self._mark_poles_dirty()
+            if valid2 is not None:
+                self.pole_valid = valid2
+            else:
+                self._mark_poles_dirty()
             self._sync_pole_valid()
         if n:
             self._vinfo(
@@ -576,13 +649,15 @@ class MeanCurvatureFlowSkeletonization:
 
     def split_faces(self) -> int:
         """Split faces with an angle larger than ``max_triangle_angle``."""
-        V2, F2, n, fixed2, poles2, split2 = split_obtuse_faces(
+        valid_in = self.pole_valid if self.pole_valid.shape[0] == self.V.shape[0] else None
+        V2, F2, n, fixed2, poles2, valid2, split2 = split_obtuse_faces(
             self.V,
             self.F,
             max_angle_deg=self.max_triangle_angle,
             short_edge=max(self.zero_TH, 1e-12),
             fixed=self.fixed,
             poles=self.poles,
+            pole_valid=valid_in,
             is_split=self.is_split,
             deadline=self._deadline,
         )
@@ -591,7 +666,11 @@ class MeanCurvatureFlowSkeletonization:
             self.fixed = fixed2 if fixed2 is not None else np.zeros(V2.shape[0], dtype=bool)
             self.poles = poles2 if poles2 is not None else self.V.copy()
             self.is_split = split2 if split2 is not None else np.zeros(V2.shape[0], dtype=bool)
-            self._mark_poles_dirty()
+            if valid2 is not None:
+                self.pole_valid = valid2
+                self._refresh_new_pole_valid(n)
+            else:
+                self._mark_poles_dirty()
             self._sync_pole_valid()
         if n:
             self._vinfo(
@@ -611,14 +690,19 @@ class MeanCurvatureFlowSkeletonization:
         topo = mesh_adjacency(self.F, self.V.shape[0])
         bad_count = np.zeros(self.V.shape[0], dtype=np.int32)
         V = self.V
-        for ei in range(topo.n_edges):
+        # Only a tiny fraction of edges are short enough to matter, so screen
+        # them all at once. Ascending index order preserves the visit order
+        # among the short edges, which is all `bad_count` depends on.
+        eu = topo.edge_u[: topo.n_edges]
+        ev = topo.edge_v[: topo.n_edges]
+        diff = V[eu] - V[ev]
+        d2 = diff[:, 0] * diff[:, 0] + diff[:, 1] * diff[:, 1] + diff[:, 2] * diff[:, 2]
+        short = np.flatnonzero(d2 < elength_fixed_sq)
+        for ei in short:
             if self._timed_out():
                 break
-            a = int(topo.edge_u[ei])
-            b = int(topo.edge_v[ei])
-            diff = V[a] - V[b]
-            if float(diff @ diff) >= elength_fixed_sq:
-                continue
+            a = int(eu[ei])
+            b = int(ev[ei])
             if not collapse_ok_for_edge(
                 a,
                 b,
@@ -629,15 +713,10 @@ class MeanCurvatureFlowSkeletonization:
             ):
                 bad_count[a] += 1
                 bad_count[b] += 1
-        newly = 0
-        for v in range(self.V.shape[0]):
-            if self._timed_out():
-                break
-            if self.fixed[v]:
-                continue
-            if int(bad_count[v]) >= 2:
-                self.fixed[v] = True
-                newly += 1
+        pinned = (bad_count >= 2) & ~self.fixed
+        newly = int(pinned.sum())
+        if newly:
+            self.fixed[pinned] = True
         if newly:
             self._vinfo(
                 "detect_degeneracies: pinned %d (total fixed=%d)", newly, int(self.fixed.sum())
@@ -664,14 +743,24 @@ class MeanCurvatureFlowSkeletonization:
             self._constraint_split[-new_splits:] = False
         self.detect_degeneracies()
 
+    def remesh_growth_ratio(self) -> float:
+        """Peak vertex count during contraction divided by the input size."""
+        n0 = max(int(self._n0), 1)
+        return float(self._n_max) / float(n0)
+
     def contract_until_convergence(self) -> int:
-        """Iterate ``contract`` until area change is small, max iterations, or timeout."""
+        """Iterate ``contract`` until area change is small, max iterations, or timeout.
+
+        Also aborts when vertex count exceeds ``max_vertex_growth * n0`` (remesh
+        blow-up from aggressive medial pull / obtuse splits).
+        """
         if self.timeout_seconds is not None and self.timeout_seconds > 0:
             self._deadline = time.monotonic() + float(self.timeout_seconds)
         else:
             self._deadline = None
         prev_area = self._surface_area()
         last_it = 0
+        growth_cap = self.max_vertex_growth
         for it in range(1, int(self.max_iterations) + 1):
             last_it = it
             self._iter = it
@@ -683,6 +772,23 @@ class MeanCurvatureFlowSkeletonization:
                 )
                 break
             self.contract()
+            n = int(self.V.shape[0])
+            if n > self._n_max:
+                self._n_max = n
+            if (
+                growth_cap is not None
+                and float(growth_cap) > 0.0
+                and n > float(growth_cap) * float(self._n0)
+            ):
+                self.aborted_remesh_growth = True
+                self._log.warning(
+                    "stopping: remesh growth n=%d > %.3g * n0=%d at iter %d",
+                    n,
+                    float(growth_cap),
+                    int(self._n0),
+                    it,
+                )
+                break
             if self._timed_out():
                 self._vinfo(
                     "stopping: timeout after %.3gs during iter %d",
@@ -722,6 +828,7 @@ class MeanCurvatureFlowSkeletonization:
         compress_chains: bool = False,
         resample_spacing: float | None = None,
         keep_largest_component: bool = False,
+        prune_exterior: bool = True,
     ):
         """Convert the meso-skeleton surface into a 1D curve ``Skeleton``.
 
@@ -731,12 +838,20 @@ class MeanCurvatureFlowSkeletonization:
             Optional curve refinement (see :func:`pymcfs.skeleton.skeletonize`).
         keep_largest_component :
             If True, keep only the largest connected component of the curve graph.
+        prune_exterior :
+            If True (default), remove dangling curve tips that lie outside the
+            original input mesh. Catches rare contraction leaks that become
+            long exterior leaf branches.
 
         Returns
         -------
         Skeleton
         """
-        from .refine import resolve_refine_options, refine_skeleton_graph
+        from .refine import (
+            resolve_refine_options,
+            refine_skeleton_graph,
+            prune_exterior_graph,
+        )
         from .skeleton import Skeleton
 
         self._vinfo(
@@ -765,6 +880,16 @@ class MeanCurvatureFlowSkeletonization:
                     len(largest),
                 )
                 G = G.subgraph(largest).copy()
+
+        if prune_exterior and G.number_of_nodes() > 0:
+            G, n_pruned = prune_exterior_graph(
+                G, self.mesh, fast=bool(self.fast_gating)
+            )
+            if n_pruned:
+                self._vinfo(
+                    "convert_to_skeleton: pruned %d exterior dangling node(s)",
+                    n_pruned,
+                )
 
         mode, spacing, spacing_frac = resolve_refine_options(
             refine=refine,

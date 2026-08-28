@@ -12,8 +12,11 @@ import numpy as np
 from .topology import (
     MeshTopology,
     build_topology,
+    collapse_short_edge_sweep,
+    face_walk_edges,
     link_condition_ok,
     pair_obtuse_edges,
+    select_obtuse_split_batch,
     split_face_on_edge_numba,
     topology_collapse_buffers,
 )
@@ -41,6 +44,13 @@ def _edge_key(u: int, v: int) -> tuple[int, int]:
 def mesh_adjacency(F: np.ndarray, nv: int) -> MeshTopology:
     """Return array-backed mesh topology for ``F``."""
     return build_topology(np.asarray(F, dtype=np.int32), nv)
+
+
+# --- Python reference adjacency ------------------------------------------
+# The collapse pass runs on the Numba kernels in `topology.py`. These
+# set-based helpers are the reference the equivalence tests in
+# `tests/test_topology.py` compare those kernels against; they are not on the
+# hot path.
 
 
 def _vertex_neighbors(F: np.ndarray, nv: int) -> list[set[int]]:
@@ -373,11 +383,14 @@ def collapse_short_edges(
     min_edge_length: float,
     fixed: np.ndarray | None = None,
     poles: np.ndarray | None = None,
+    pole_valid: np.ndarray | None = None,
     vertex_flags: dict[str, np.ndarray] | None = None,
     max_collapses: int | None = None,
     max_passes: int | None = None,
     deadline: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, int, np.ndarray | None, np.ndarray | None]:
+) -> tuple[
+    np.ndarray, np.ndarray, int, np.ndarray | None, np.ndarray | None, np.ndarray | None
+]:
     """Collapse edges shorter than ``min_edge_length`` when the link condition holds.
 
     Midpoint merge with the closest pole retained, matching
@@ -388,16 +401,21 @@ def collapse_short_edges(
     Mid-pass link checks and remaps use incremental adjacency (O(degree) per
     collapse). Predicates match Numba ``link_condition_ok`` (golden-tested).
 
+    ``pole_valid`` is an optional per-vertex mask marking poles that lie inside
+    the input mesh. A collapse keeps whichever of the two existing poles is
+    closer to the midpoint, so its validity carries over by index and never
+    needs a fresh point-in-mesh test.
+
     Returns
     -------
-    V, F, n_collapsed, fixed_out, poles_out
+    V, F, n_collapsed, fixed_out, poles_out, pole_valid_out
     """
     import time as _time
 
     V = np.asarray(V, dtype=float).copy()
     F = np.asarray(F, dtype=int).copy()
     if F.size == 0 or V.size == 0:
-        return V, F, 0, fixed, poles
+        return V, F, 0, fixed, poles, pole_valid
 
     nv = V.shape[0]
     if fixed is None:
@@ -406,6 +424,8 @@ def collapse_short_edges(
         fixed = np.asarray(fixed, dtype=bool).copy()
     if poles is not None:
         poles = np.asarray(poles, dtype=float).copy()
+    if pole_valid is not None:
+        pole_valid = np.asarray(pole_valid, dtype=bool).copy()
     flags = (
         {name: np.asarray(values).copy() for name, values in vertex_flags.items()}
         if vertex_flags is not None
@@ -419,56 +439,69 @@ def collapse_short_edges(
 
     total = 0
     passes = 0
-    vert_alive = np.ones(nv, dtype=bool)
+    # Collapses retire edge slots without reclaiming them, so give the edge
+    # arrays and hash table room for a full sweep's worth of remapped edges.
+    F = np.ascontiguousarray(F, dtype=np.int32)
+    headroom = 3 * F.shape[0] + 1
+    topo = build_topology(F, nv, edge_headroom=headroom)
+    edge_u, edge_v, edge_f0, edge_f1, n_edges, edge_cap = topology_collapse_buffers(
+        topo, face_count=F.shape[0], edge_headroom=headroom
+    )
+    face_alive = topo.face_alive
+    vert_alive = np.ones(nv, dtype=np.bool_)
+    # The kernel needs concrete arrays even for the branches it will not take.
+    poles_buf = poles if poles is not None else np.zeros((1, 3), dtype=float)
+    valid_buf = pole_valid if pole_valid is not None else np.zeros(1, dtype=np.bool_)
 
     while passes < max_passes and total < max_collapses:
         if deadline is not None and _time.monotonic() >= deadline:
             break
         passes += 1
-        if F.size == 0:
+        if topo.F.size == 0:
             break
 
-        face_alive = np.ones(F.shape[0], dtype=bool)
-        edges = _face_walk_undirected_edges(F, face_alive)
-        if not edges:
+        # A collapse can create edge keys that did not exist before, so the
+        # visit order is re-enumerated per sweep; the topology itself is
+        # maintained incrementally and built only once.
+        edges = face_walk_edges(topo.F, face_alive)
+        if edges.shape[0] == 0:
             break
 
-        neighbors = _vertex_neighbors(F, V.shape[0])
-        edge_faces = _edge_to_faces(F)
-        collapsed_this = 0
-
-        for a, b in edges:
-            if total + collapsed_this >= max_collapses:
-                break
-            if deadline is not None and _time.monotonic() >= deadline:
-                break
-            if not vert_alive[a] or not vert_alive[b]:
-                continue
-            if _edge_key(a, b) not in edge_faces:
-                continue
-            d = float(np.linalg.norm(V[a] - V[b]))
-            if d >= min_edge_length:
-                continue
-
-            if not _link_condition_ok_py(a, b, neighbors, edge_faces, F):
-                continue
-
-            keep, drop = int(b), int(a)
-            mid = 0.5 * (V[a] + V[b])
-            if poles is not None:
-                pa, pb = poles[keep], poles[drop]
-                if np.linalg.norm(mid - pa) <= np.linalg.norm(mid - pb):
-                    poles[keep] = pa
-                else:
-                    poles[keep] = pb
-            V[keep] = mid
-            vert_alive[drop] = False
-            _apply_collapse_local(keep, drop, F, face_alive, neighbors, edge_faces)
-            collapsed_this += 1
-
+        collapsed_this = int(
+            collapse_short_edge_sweep(
+                edges,
+                V,
+                poles_buf,
+                valid_buf,
+                poles is not None,
+                pole_valid is not None,
+                topo.F,
+                face_alive,
+                vert_alive,
+                topo.nbr,
+                topo.nbr_count,
+                edge_u,
+                edge_v,
+                edge_f0,
+                edge_f1,
+                n_edges,
+                edge_cap,
+                topo.hash_key,
+                topo.hash_val,
+                topo.vface,
+                topo.vface_count,
+                float(min_edge_length),
+                np.int64(max_collapses - total),
+            )
+        )
         if collapsed_this == 0:
             break
+        total += collapsed_this
 
+    F = np.asarray(topo.F, dtype=int)
+    if total:
+        # Compaction is monotone (``np.unique`` is sorted), so doing it once at
+        # the end is equivalent to doing it after every sweep.
         F = F[face_alive]
         used = np.unique(F.reshape(-1)) if F.size else np.zeros(0, dtype=int)
         remap = -np.ones(V.shape[0], dtype=int)
@@ -478,15 +511,15 @@ def collapse_short_edges(
         fixed = fixed[used]
         if poles is not None:
             poles = poles[used]
+        if pole_valid is not None:
+            pole_valid = pole_valid[used]
         for name in flags:
             flags[name] = flags[name][used]
-        vert_alive = np.ones(V.shape[0], dtype=bool)
-        total += collapsed_this
 
     if vertex_flags is not None:
         vertex_flags.clear()
         vertex_flags.update(flags)
-    return V, F, total, fixed, poles
+    return V, F, total, fixed, poles, pole_valid
 
 
 def _face_walk_undirected_edges(
@@ -596,20 +629,38 @@ def split_obtuse_faces(
     short_edge: float = 1e-12,
     fixed: np.ndarray | None = None,
     poles: np.ndarray | None = None,
+    pole_valid: np.ndarray | None = None,
     is_split: np.ndarray | None = None,
     max_passes: int | None = None,
     deadline: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, int, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    int,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     """Split flat triangle pairs at obtuse angles via edge splits.
 
     Procedure compatible with Starlab ``mcfskel`` remeshing.
+
+    Splits only append vertices, so the ``n_split`` new vertices are always the
+    last ``n_split`` rows of the returned ``V``. Their interpolated poles are
+    genuinely new points: ``pole_valid`` is grown with ``False`` placeholders
+    for them and the caller is expected to test just that tail range.
+
+    Returns
+    -------
+    V, F, n_split, fixed_out, poles_out, pole_valid_out, is_split_out
     """
     import time as _time
 
     V = np.asarray(V, dtype=float).copy()
     F = np.asarray(F, dtype=int).copy()
     if F.size == 0:
-        return V, F, 0, fixed, poles, is_split
+        return V, F, 0, fixed, poles, pole_valid, is_split
 
     nv = V.shape[0]
     if fixed is None:
@@ -622,6 +673,8 @@ def split_obtuse_faces(
         is_split = np.asarray(is_split, dtype=bool).copy()
     if poles is not None:
         poles = np.asarray(poles, dtype=float).copy()
+    if pole_valid is not None:
+        pole_valid = np.asarray(pole_valid, dtype=bool).copy()
 
     if max_passes is None:
         max_passes = max(nv, 200)
@@ -640,27 +693,9 @@ def split_obtuse_faces(
         if selected.shape[0] == 0:
             break
 
-        used_verts: set[int] = set()
-        batch_rows: list[np.ndarray] = []
-        for row in selected:
-            u, v, face0, face1, split_side = (int(row[i]) for i in range(5))
-            if u in used_verts or v in used_verts or split_side in used_verts:
-                continue
-            used_verts.update((u, v, split_side))
-            batch_rows.append(row)
-
-        if not batch_rows:
-            batch_rows = [selected[0]]
-
-        face_used: set[int] = set()
-        clean_batch: list[np.ndarray] = []
-        for row in batch_rows:
-            f0, f1 = int(row[2]), int(row[3])
-            if f0 in face_used or f1 in face_used:
-                continue
-            face_used.update((f0, f1))
-            clean_batch.append(row)
-        batch = clean_batch or [selected[0]]
+        batch = select_obtuse_split_batch(
+            np.ascontiguousarray(selected, dtype=np.int32), np.int32(F.shape[0])
+        )
 
         planned: list[tuple[int, int, int, int, int, np.ndarray, np.ndarray | None]] = []
         for row in batch:
@@ -703,6 +738,9 @@ def split_obtuse_faces(
         if poles is not None:
             poles_out = np.empty((n_old_v + n_add_v, 3), dtype=float)
             poles_out[:n_old_v] = poles
+        if pole_valid is not None:
+            pole_valid_out = np.zeros(n_old_v + n_add_v, dtype=bool)
+            pole_valid_out[:n_old_v] = pole_valid
 
         F_out = np.empty((n_keep_f + n_new_f, 3), dtype=int)
         keep_mask = np.ones(n_old_f, dtype=bool)
@@ -740,9 +778,11 @@ def split_obtuse_faces(
         is_split = is_split_out
         if poles is not None:
             poles = poles_out
+        if pole_valid is not None:
+            pole_valid = pole_valid_out
         F = F_out[:f_write]
 
-    return V, F, total, fixed, poles, is_split
+    return V, F, total, fixed, poles, pole_valid, is_split
 
 
 def collapse_ok_for_edge(

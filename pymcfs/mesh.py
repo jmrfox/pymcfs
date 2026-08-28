@@ -1,6 +1,4 @@
-"""
-Main mesh class
-"""
+"""Mesh loading, repair, and visualization helpers (``MeshManager``)."""
 
 import logging
 from dataclasses import dataclass
@@ -94,8 +92,10 @@ def example_mesh(
 
 
 class MeshManager:
-    """
-    Unified mesh class handling loading, processing, and analysis.
+    """Optional mesh I/O / repair / viz utilities around a ``trimesh.Trimesh``.
+
+    Not required for :func:`pymcfs.skeletonize`; useful for loading, repair,
+    transforms, and Plotly/Matplotlib previews (``pymcfs[viz]``).
     """
 
     @dataclass
@@ -155,21 +155,37 @@ class MeshManager:
     def load_mesh(
         self, filepath: str, file_format: Optional[str] = None, *, validate_mcfs: bool = True
     ) -> trimesh.Trimesh:
-        """
-        Load a mesh from file.
+        """Load a mesh from file.
 
-        Args:
-            filepath: Path to mesh file
-            file_format: Optional format specification (auto-detected if None)
-            validate_mcfs: If True (default), require a single-component closed
-                watertight triangle mesh (MCFS input precondition). Set False
-                when loading meshes intended for repair.
+        Parameters
+        ----------
+        filepath :
+            Path to mesh file.
+        file_format :
+            Optional format specification (auto-detected if None).
+        validate_mcfs :
+            If True (default), require a single-component closed watertight
+            triangle mesh (MCFS input precondition). Set False when loading
+            meshes intended for repair.
+
+        Returns
+        -------
+        trimesh.Trimesh
+            The loaded mesh also stored on ``self.mesh``.
+
+        Notes
+        -----
+        Loads with ``force=\"mesh\"`` and ``process=False``. Trimesh's default
+        ``process=True`` merges duplicate vertices and can introduce non-manifold
+        edges that flip ``is_watertight`` to False even when the on-disk mesh is
+        closed — which is why an inventory pass with ``process=False`` can look
+        fine while a processed load fails validation.
         """
         try:
+            load_kwargs: Dict[str, Any] = {"force": "mesh", "process": False}
             if file_format:
-                mesh = trimesh.load(filepath, file_type=file_format)
-            else:
-                mesh = trimesh.load(filepath)
+                load_kwargs["file_type"] = file_format
+            mesh = trimesh.load(filepath, **load_kwargs)
 
             # Ensure we have a single mesh
             if isinstance(mesh, trimesh.Scene):
@@ -208,15 +224,18 @@ class MeshManager:
             return mesh
 
         except Exception as e:
-            raise ValueError(f"Failed to load mesh from {filepath}: {str(e)}")
+            raise ValueError(f"Failed to load mesh from {filepath}: {str(e)}") from e
 
     def save(self, filepath, file_format="obj"):
+        """Export ``self.mesh`` to ``filepath`` via trimesh."""
         self.mesh.export(filepath, file_type=file_format)
 
     def copy(self):
+        """Return a new ``MeshManager`` with a copied trimesh."""
         return MeshManager(self.mesh.copy(), verbose=self.verbose)
 
     def to_trimesh(self):
+        """Return the underlying ``trimesh.Trimesh`` (same object)."""
         return self.mesh
 
     # =================================================================
@@ -310,14 +329,17 @@ class MeshManager:
         return self.bounds["z"]
 
     def center_mesh(self, center_on: str = "centroid") -> trimesh.Trimesh:
-        """
-        Center the mesh.
+        """Center the mesh in place.
 
-        Args:
-            center_on: 'centroid', 'bounds_center', or 'origin'
+        Parameters
+        ----------
+        center_on :
+            ``\"centroid\"``, ``\"bounds_center\"``, or ``\"origin\"``.
 
-        Returns:
-            Centered mesh
+        Returns
+        -------
+        trimesh.Trimesh
+            Centered mesh (also stored on ``self.mesh``).
         """
         if self.mesh is None:
             raise ValueError("No mesh loaded")
@@ -342,14 +364,17 @@ class MeshManager:
         return self.mesh
 
     def scale_mesh(self, scale_factor: float) -> trimesh.Trimesh:
-        """
-        Scale the mesh uniformly.
+        """Scale the mesh uniformly in place.
 
-        Args:
-            scale_factor: Scaling factor
+        Parameters
+        ----------
+        scale_factor :
+            Uniform scaling factor.
 
-        Returns:
-            Scaled mesh
+        Returns
+        -------
+        trimesh.Trimesh
+            Scaled mesh (also stored on ``self.mesh``).
         """
         if self.mesh is None:
             raise ValueError("No mesh loaded")
@@ -371,14 +396,17 @@ class MeshManager:
     def align_with_z_axis(
         self, target_axis: Optional[np.ndarray] = None
     ) -> trimesh.Trimesh:
-        """
-        Align the mesh's principal axis with the z-axis.
+        """Align the mesh's principal axis with the z-axis.
 
-        Args:
-            target_axis: Target direction (default: [0, 0, 1])
+        Parameters
+        ----------
+        target_axis :
+            Target direction (default ``[0, 0, 1]``).
 
-        Returns:
-            Aligned mesh
+        Returns
+        -------
+        trimesh.Trimesh
+            Aligned mesh (also stored on ``self.mesh``).
         """
         if self.mesh is None:
             raise ValueError("No mesh loaded")
@@ -482,24 +510,23 @@ class MeshManager:
         prefer_positive_z: bool = True,
         use_convex_hull: bool = True,
     ) -> trimesh.Trimesh:
-        """
-        Orient the mesh so the vector between the two furthest-apart points
-        aligns with the +Z axis.
+        """Orient the mesh so the diameter between furthest points aligns with +Z.
 
-        This computes a diameter of the point set (by default using the convex
-        hull vertices for efficiency), finds the pair of points with maximum
-        Euclidean distance, and rotates the mesh about its centroid so that
-        this vector is aligned with the positive z-axis.
+        Computes a diameter of the point set (by default over convex-hull
+        vertices), then rotates about the centroid so that vector aligns with
+        the positive z-axis.
 
-        Args:
-            prefer_positive_z: If True, align the diameter to +Z; otherwise the
-                orientation to Z is arbitrary up to a sign.
-            use_convex_hull: If True (default), compute the diameter over the
-                convex hull vertices. This is typically much smaller than the
-                full vertex set and yields the same diameter for convex sets.
+        Parameters
+        ----------
+        prefer_positive_z :
+            If True, align the diameter to +Z; otherwise the sign is arbitrary.
+        use_convex_hull :
+            If True (default), compute the diameter over convex-hull vertices.
 
-        Returns:
-            The rotated mesh (also stored in self.mesh).
+        Returns
+        -------
+        trimesh.Trimesh
+            The rotated mesh (also stored on ``self.mesh``).
         """
         if self.mesh is None:
             raise ValueError("No mesh loaded")
@@ -758,11 +785,12 @@ class MeshManager:
         return results
 
     def print_mesh_analysis(self, verbose: bool = False) -> None:
-        """
-        Analyze a mesh and print a formatted report of its properties.
+        """Analyze a mesh and print a formatted report of its properties.
 
-        Args:
-            verbose: Whether to print detailed information
+        Parameters
+        ----------
+        verbose :
+            Print additional detail when True.
         """
         analysis = self.analyze_mesh()
 
@@ -846,22 +874,33 @@ class MeshManager:
         keep_largest_component: bool = False,
         verbose: bool = True,
     ) -> trimesh.Trimesh:
-        """
-        Attempt to repair common mesh issues to improve watertightness and quality.
+        """Attempt to repair common mesh issues to improve watertightness and quality.
 
-        Operates on ``self.mesh`` (via :meth:`to_trimesh`); returns a repaired copy.
+        Operates on ``self.mesh`` via :meth:`to_trimesh` (same object when a mesh
+        is already loaded). Updates ``self.mesh`` in place and returns it.
 
-        Args:
-            fix_holes: Whether to attempt filling holes
-            remove_duplicates: Whether to remove duplicate faces and vertices
-            fix_normals: Whether to fix face normal consistency
-            remove_degenerate: Whether to remove degenerate faces
-            fix_negative_volume: Whether to invert faces if mesh has negative volume
-            keep_largest_component: Whether to keep only the largest connected component
-            verbose: Whether to print repair summary
+        Parameters
+        ----------
+        fix_holes :
+            Attempt to fill holes.
+        remove_duplicates :
+            Remove duplicate faces/vertices.
+        fix_normals :
+            Fix face normal consistency.
+        remove_degenerate :
+            Remove degenerate faces.
+        fix_negative_volume :
+            Invert faces if the mesh volume is negative.
+        keep_largest_component :
+            Keep only the largest connected component.
+        verbose :
+            Print a repair summary when True.
 
-        Returns:
-            Repaired mesh (new copy, original is not modified)
+        Returns
+        -------
+        trimesh.Trimesh
+            The repaired mesh stored on ``self.mesh`` (not an independent copy of
+            the pre-repair geometry).
         """
 
         mesh = self.to_trimesh()
@@ -999,18 +1038,28 @@ class MeshManager:
         width: int = 800,
         height: int = 600,
     ) -> Optional[object]:
-        """
-        Create a 3D visualization of a mesh.
+        """Create a 3D visualization of a mesh.
 
-        Args:
-            title: Plot title
-            color: Mesh color (named color or RGB tuple)
-            backend: Visualization backend ('plotly' or 'matplotlib')
-            show_axes: Whether to show coordinate axes
-            show_wireframe: Whether to show wireframe overlay
+        Parameters
+        ----------
+        title :
+            Plot title.
+        color :
+            Mesh color (named color or RGB).
+        backend :
+            ``\"auto\"`` (prefer Plotly, then Matplotlib), ``\"plotly\"``, or
+            ``\"matplotlib\"``. Requires ``pymcfs[viz]``.
+        show_axes :
+            Whether to show coordinate axes.
+        show_wireframe :
+            Whether to show a wireframe overlay.
+        width, height :
+            Figure size in pixels (Plotly).
 
-        Returns:
-            Figure object (backend-dependent) or None if visualization fails
+        Returns
+        -------
+        figure or None
+            Backend-dependent figure, or None if visualization fails.
         """
         if backend == "auto":
             # Try plotly first, then fallback to others
@@ -1170,24 +1219,27 @@ class MeshManager:
         mesh_color: str = "lightblue",
         mesh_opacity: float = 0.3,
     ) -> Optional[object]:
-        """
-        Create an interactive 3D visualization of a mesh with a controllable slice plane.
+        """Interactive 3D mesh view with a controllable z-slice plane (Plotly).
 
-        This function displays a 3D mesh and calculates the intersection of the mesh
-        with an xy-plane at a user-controlled z-value. The intersection is shown as a
-        colored line on the mesh. A slider allows the user to interactively change the
-        z-value of the intersection plane.
+        Parameters
+        ----------
+        title :
+            Plot title.
+        z_range :
+            ``(min_z, max_z)`` for the slice slider; auto-detected if None.
+        num_slices :
+            Number of slider positions.
+        slice_color :
+            Color for the intersection polyline.
+        mesh_color :
+            Color for the 3D mesh.
+        mesh_opacity :
+            Mesh opacity in ``[0, 1]``.
 
-        Args:
-            title: Plot title
-            z_range: Tuple of (min_z, max_z) for slice range. Auto-detected if None.
-            num_slices: Number of positions for the slider
-            slice_color: Color for the intersection line
-            mesh_color: Color for the 3D mesh
-            mesh_opacity: Opacity of the 3D mesh (0-1)
-
-        Returns:
-            Plotly figure with interactive slider for controlling the z-value
+        Returns
+        -------
+        plotly.graph_objects.Figure or None
+            Figure with slider, or None if Plotly is unavailable.
         """
         try:
             import plotly.graph_objects as go
@@ -1404,18 +1456,23 @@ class MeshManager:
         num_slices: int = 9,
         z_range: Optional[Tuple[float, float]] = None,
     ) -> Optional[object]:
-        """
-        Create a grid visualization showing multiple cross-sections of a 3D mesh.
+        """Grid of cross-sections through the mesh (Plotly subplots).
 
-        Args:
-            vertices: Optional vertex array (defaults to ``self.mesh`` vertices)
-            faces: Optional face array (defaults to ``self.mesh`` faces)
-            title: Plot title
-            num_slices: Number of slices to show (should be perfect square for grid)
-            z_range: Tuple of (min_z, max_z) for slice range. Auto-detected if None.
+        Parameters
+        ----------
+        vertices, faces :
+            Optional overrides; default to ``self.mesh``.
+        title :
+            Plot title.
+        num_slices :
+            Number of slices (ideally a perfect square for the grid layout).
+        z_range :
+            ``(min_z, max_z)``; auto-detected if None.
 
-        Returns:
-            Plotly figure with subplot grid
+        Returns
+        -------
+        plotly.graph_objects.Figure or None
+            Subplot grid, or None if Plotly is unavailable.
         """
         try:
             import math

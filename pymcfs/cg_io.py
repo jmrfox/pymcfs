@@ -20,7 +20,22 @@ def write_cg(
     nodes: np.ndarray,
     edges: np.ndarray,
 ) -> None:
-    """Write an undirected curve skeleton as a Starlab ``.cg`` file."""
+    """Write an undirected curve skeleton as a Starlab ``.cg`` file.
+
+    Parameters
+    ----------
+    path :
+        Output file path (parent directories are created as needed).
+    nodes : (n, 3) float
+        Vertex positions.
+    edges : (e, 2) int
+        Undirected edges (0-based). Empty arrays are allowed.
+
+    Raises
+    ------
+    ValueError
+        If ``nodes`` or ``edges`` have the wrong shape.
+    """
     nodes = np.asarray(nodes, dtype=float)
     edges = np.asarray(edges, dtype=int)
     if nodes.ndim != 2 or nodes.shape[1] != 3:
@@ -41,7 +56,24 @@ def write_cg(
 
 
 def read_cg(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """Read a Starlab ``.cg`` file into ``(nodes, edges)`` (0-based edges)."""
+    """Read a Starlab ``.cg`` file into ``(nodes, edges)`` (0-based edges).
+
+    Parameters
+    ----------
+    path :
+        Input ``.cg`` path.
+
+    Returns
+    -------
+    nodes : (n, 3) float ndarray
+    edges : (e, 2) int ndarray
+        Converted from 1-based file indices.
+
+    Raises
+    ------
+    ValueError
+        If a line is malformed or unrecognized.
+    """
     nodes: list[list[float]] = []
     edges: list[list[int]] = []
     with Path(path).open("r", encoding="utf-8") as f:

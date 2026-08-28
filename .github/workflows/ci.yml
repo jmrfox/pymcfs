@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Sync and test
+        run: |
+          uv sync --extra cholmod --group dev --group docs
+          uv run pytest -m "not e2e" -q
+          uv run mkdocs build --strict

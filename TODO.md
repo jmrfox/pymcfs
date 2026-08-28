@@ -1,159 +1,107 @@
-# pymcfs development TODO
+# pymcfs — path to v1.0
 
-Progress checkpoint: robust MCFS (pole gating, CGAL-app defaults), Starlab parity
-harness, Tier A speedups, and `ts_skeleton` notebook are in place. Tests:
-`52 passed`, `1 skipped` (CHOLMOD), `1 deselected` (slow TS1).
+Goal: a small, installable library for MCFS skeletonization of closed triangle
+meshes (especially TS biological surfaces). Users import and call; no CLI.
 
-Use this list after moving to WSL. Items are ordered roughly by priority for
-**production use on TS biological meshes**, not a PyPI release.
-
----
-
-## 1. WSL environment (do first)
-
-- [ ] Clone/pull repo in WSL; use Linux paths (avoid `/mnt/c/...` for heavy MCFS runs if I/O is slow).
-- [ ] Install system deps:
-  ```bash
-  sudo apt update
-  sudo apt install -y libsuitesparse-dev build-essential
-  ```
-- [ ] Recreate env with uv:
-  ```bash
-  uv sync
-  uv sync --extra cholmod
-  ```
-- [ ] Verify CHOLMOD:
-  ```bash
-  uv run python -c "from pymcfs.spd_solve import cholmod_available; print(cholmod_available())"
-  uv run python -m pytest tests/test_spd_solve.py -q
-  ```
-- [ ] Optional Starlab reference (parity dumps / reading C++): clone mcfskel into
-  `_ref_starlab-mcfskel/` (gitignored). See `fixtures/parity/README.md`.
-
----
-
-## 2. Blockers before trusting TS production runs
-
-### CHOLMOD / scikit-sparse 0.5 API
-
-- [x] **Fix `pymcfs/spd_solve.py` for scikit-sparse ≥ 0.5.**  
-  Linux conda/pip builds often return `(R, perm)` from `cholesky()` instead of a
-  callable factor object. Current code tries `factor(b)` and silently falls back
-  to SuperLU on failure — you may get no speedup on WSL until this is fixed.
-  - Target API: `cho_factor` / `cho_solve`, or `CholeskyFactor(...).factorize()` + solve.
-  - Re-run `tests/test_spd_solve.py` with CHOLMOD installed (currently `skipped` if missing).
-  - Benchmark: `uv run python scripts/bench_mcfs_iter.py --iters 5` (with vs without `--no-cholmod`).
-
-### TS mesh validation
-
-- [ ] Re-run `notebooks/ts_skeleton.py` on WSL for **TS1** (and at least one other `data/mesh/TS*.obj`).
-  - Confirm no exterior spike branches with robust defaults (`W_H=0.5`, `W_M=5.0`, gating on).
-  - Export polylines (`.polylines.txt`) and CG under `outputs/polylines/` (gitignored per case).
-- [ ] Run slow regression explicitly:
-  ```bash
-  uv run python -m pytest tests/test_pole_gating.py::test_ts1_robust_no_screenshot_exterior_spikes -q
-  ```
-- [ ] Spot-check `analyze_skeleton(mesh, skel)` containment on each TS mesh you care about.
-
-### Correctness confidence
-
-- [ ] Review skeleton quality on **non-trivial topology** (handles, branches), not only TS1.
-- [ ] If residual exterior nodes appear after gating, consider a **post-prune pass**
-  (deferred from robust MCFS plan — only if still needed after WSL runs).
-
----
-
-## 3. Performance (remaining Tier A + Tier B)
-
-Tier A (done): cached `mesh.contains`, faster Laplacian assembly, optional CHOLMOD
-path, face-walk collapse order.
-
-### Still worth doing
-
-- [x] **Confirm CHOLMOD actually used** in driver logs (`spd=cholmod` at init when verbose).
-- [x] **Numba collapse hot path** — `apply_collapse_local` kernel + `_link_condition_numba`; incremental Numba drift fixed (Aug 2026). Main loop keeps Python apply until fast topology pack exists (`build_topology` ~10× slower than Python adjacency on sindorelax-scale meshes).
-- [x] **Batch point-in-mesh** for gating — profiled; `contains` ≪1% on TS1/sindorelax (+2 calls/contract). BVH cache not needed yet.
-- [ ] **Incremental sparse factor** — refactor `AᵀA` only when sparsity pattern changes (deprioritized: geometry ≈1% of iter).
-
-### Benchmark hygiene
-
-- [x] Record baseline on WSL: mean ms/iter for TS1 and sindorelax via `scripts/bench_mcfs_iter.py` (see `docs/benchmarks.md`).
-- [ ] Do not use iterative CG unless parity proves identical geometry — new numerical error.
-
----
-
-## 4. Starlab parity harness
-
-- [ ] Re-run full parity suite on WSL:
-  ```bash
-  uv run pytest tests/test_parity.py -q
-  uv run python scripts/compare_starlab_parity.py --case sindorelax
-  ```
-- [ ] **Stage 2–3 gates** skip when Starlab `meso_N0001` / `skeleton.cg` dumps are missing
-  (Windows demo MCF often broken without CHOLMOD DLLs). Options:
-  - Regenerate Starlab dumps from a working Linux/WSL Starlab build, or
-  - Accept pymcfs-only gates until reference binaries exist.
-- [ ] Keep parity scripts on **`profile="starlab"`** / ungated poles — do not conflate with robust TS defaults.
-
----
-
-## 5. API and library polish
-
-- [ ] Export `McfsProfile` and `resolve_mcfs_profile` from `pymcfs.__init__` if external scripts need them.
-- [ ] Thread `use_cholmod` through `skeletonize` / `thin_mesh` kwargs (currently driver-only).
-- [ ] Move `pytest` from main `[project.dependencies]` to optional `test` extra (cleanup, not urgent).
-- [ ] Jupytext: open notebooks via `notebooks/*.py` only; `*.ipynb` stays gitignored.
-  - Regenerate local `.ipynb` after edits: `uv run jupytext --sync notebooks/ts_skeleton.py`
-
----
-
-## 6. Testing and CI
-
-- [ ] Add GitHub Actions (or similar): `uv sync`, `pytest -m "not slow"`, optional weekly slow TS1 job.
-- [ ] Document slow marker in README:
-  ```bash
-  uv run python -m pytest -m slow
-  ```
-- [ ] Consider TS2/TS3 smoke tests (marked slow) once TS1 path is stable on WSL.
-
----
-
-## 7. Documentation
-
-- [ ] Add short **WSL quickstart** section to README (copy from §1 above once verified).
-- [ ] Note in README.md when CHOLMOD API fix lands and expected speedup range.
-- [ ] Document notebook workflow: `ts_skeleton.py` inputs (`data/mesh/TS1.obj`), outputs (`outputs/polylines/<case>/`, gitignored via `outputs/`).
-
----
-
-## 8. Deferred / explicit non-goals (for now)
-
-- **JAX / GPU / iterative solvers** — no accuracy benefit for this linear MCFS step; risks parity drift.
-- **CGAL `ω_L` area-ratio schedule** — not in current CGAL/Starlab source; do not invent unless reference proves it.
-- **Windows native CHOLMOD** — use WSL + `libsuitesparse-dev` instead of micromamba side envs.
-- **PyPI release** — no packaging/version bump until TS workflow is validated end-to-end.
-- **Exterior-branch post-prune** — only if gated robust defaults still leave outliers on real TS data.
-
----
-
-## 9. Definition of done (implementation-ready)
-
-Treat pymcfs as ready for your TS implementation workflow when:
-
-1. WSL env runs with **CHOLMOD enabled** and measurably faster than SuperLU on TS1-scale meshes.
-2. **TS1 + ≥1 other TS mesh** produce inside-mesh skeletons with robust defaults (visual + `analyze_skeleton`).
-3. Slow TS1 regression passes on WSL.
-4. Parity Stage 1 (sindorelax poles) still passes; Stage 2 understood/documented if Starlab dumps absent.
-5. Notebook path documented: mesh → MCFS → polylines/CG export reproducible on WSL.
-
----
-
-## Quick reference commands (WSL)
+Version is `0.1.0` in `pyproject.toml`. Tag `v1.0.0` when the remaining
+correctness gates below are signed off.
 
 ```bash
-uv sync --extra cholmod
-uv run python -m pytest -m "not slow" -q
-uv run python -m pytest -m slow -q
-uv run python scripts/bench_mcfs_iter.py --mesh data/mesh/TS1.obj --iters 3
+uv sync --extra cholmod --group dev
+uv run pytest -m "not e2e" -q
+```
+
+---
+
+## 1. Dependency diet — done
+
+Runtime: `numpy`, `scipy`, `trimesh`, `networkx`, `numba`, `rtree`.
+
+Extras / groups:
+
+```bash
+uv sync                          # core
+uv sync --extra cholmod          # faster solves (recommended on Linux/WSL)
+uv sync --extra viz              # plotly / matplotlib
+uv sync --extra embree           # optional fast_gating
+uv sync --group dev              # pytest, jupytext, notebooks, viz libs
+```
+
+Removed unused `pymeshlab`. `pytest` / Jupyter / viz are no longer default deps.
+
+---
+
+## 2. API freeze — done (keep stable)
+
+Public surface: `skeletonize`, `thin_mesh`, `MeanCurvatureFlowSkeletonization`,
+`Skeleton`, `propose_mcfs_params` / `profile="auto"`, `analyze_skeleton` /
+`score_skeleton`, `validate_mcfs_mesh`, `MeshManager` (optional utilities).
+
+- [x] Thread `use_cholmod` through `skeletonize` / `thin_mesh`
+- [x] Soft-import plotly/matplotlib via `pymcfs.viz` (`pymcfs[viz]`)
+- [x] Keep `MeshManager` public but document as optional
+- [x] `__version__` matches `pyproject.toml` (`0.1.0`)
+
+Do **not** expand the API (no CLI, no GPU, no silent normalization).
+
+---
+
+## 3. Correctness gates — remaining before tag
+
+- [ ] Re-run `notebooks/ts_skeleton.py` on TS1 + TS2 (oracle or documented weights)
+- [x] E2E regression (`uv run pytest -m e2e -q`) — passed
+- [ ] Spot-check `analyze_skeleton` on each TS mesh you ship examples for
+- [x] Parity Stage 1 green (`tests/test_parity.py`)
+- [x] Remesh-growth abort + oracle on TS2 confirmed in earlier sweeps
+      (robust `0.5/5` aborts; oracle / low ratio works)
+
+---
+
+## 4. Docs — MkDocs site
+
+```bash
+uv sync --group docs
+uv run mkdocs serve
+uv run mkdocs build --strict
+```
+
+Pages under `docs/`; config in `mkdocs.yml`. README stays a short landing page.
+
+- [x] MkDocs Material + mkdocstrings API pages
+- [x] Split algorithm / guide / getting-started from the old README monolith
+- [x] CI builds docs with `--strict`
+- [x] Read the Docs (`.readthedocs.yaml`, same uv/`docs` pattern as MASCAF)
+      (URL: https://pymcfs.readthedocs.io/en/latest/)
+---
+
+## 5. Packaging / release
+
+- [x] Lean `pyproject.toml`, version `0.1.0`
+- [x] Wheel contains only `pymcfs/`; sdist excludes `data/`, `notebooks/`, fixtures
+- [x] CI workflow: `.github/workflows/ci.yml` (`pytest -m "not e2e"`)
+- [ ] Tag `v1.0.0` after §3 gates
+- [ ] Optional: publish to PyPI
+
+---
+
+## 6. Explicit non-goals (v1)
+
+- Built-in normalize → skeletonize → rescale
+- Incremental `AᵀA` refactor / iterative CG solvers
+- JAX / GPU
+- Windows-native CHOLMOD (use WSL)
+- Changing Laplacian weight `w_L` (stays 1)
+- Per-vertex `w_M` from unused Voronoi pole weights (follow-up)
+
+---
+
+## Quick commands
+
+```bash
+uv sync --extra cholmod --group dev
+uv run pytest -m "not e2e" -q
+uv run pytest -m e2e -q
+uv run python scripts/bench_mcfs_iter.py --mesh ts1 --iters 5 --profile
+uv run python scripts/sweep_mcfs_params.py --mesh ts2
 uv run python scripts/compare_starlab_parity.py --case sindorelax
 ```

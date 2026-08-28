@@ -1,3 +1,4 @@
+"""Discrete Laplace–Beltrami and mass-matrix operators on triangle meshes."""
 from __future__ import annotations
 
 import logging
@@ -127,6 +128,17 @@ def mcfs_cotangent_laplacian(V: np.ndarray, F: np.ndarray) -> sp.csr_matrix:
 
     Compatible with the Starlab ``mcfskel`` / ``CotangentLaplacianHelper``
     convention used by the reference MCF skeletonization implementation.
+
+    Parameters
+    ----------
+    V : (n, 3) float
+        Vertex positions.
+    F : (m, 3) int
+        Triangle indices.
+
+    Returns
+    -------
+    (n, n) csr_matrix
     """
     V = np.asarray(V, dtype=float)
     F = np.asarray(F, dtype=int)
@@ -201,12 +213,14 @@ def mean_value_laplacian(V: np.ndarray, F: np.ndarray, *, verbose: bool = False)
 
     Parameters
     ----------
-    V : (n,3) float array
-    F : (m,3) int array
+    V : (n, 3) float array
+    F : (m, 3) int array
+    verbose :
+        Log build progress when True.
 
     Returns
     -------
-    L : (n,n) csr_matrix
+    L : (n, n) csr_matrix
     """
     n = V.shape[0]
     if verbose:
@@ -261,7 +275,22 @@ def mean_value_laplacian(V: np.ndarray, F: np.ndarray, *, verbose: bool = False)
 
 
 def lumped_mass_matrix(V: np.ndarray, F: np.ndarray, *, verbose: bool = False) -> sp.csr_matrix:
-    """Lumped (barycentric) mass matrix: M(i,i) = 1/3 sum of incident triangle areas."""
+    """Lumped (barycentric) mass matrix: ``M(i,i) = 1/3`` sum of incident areas.
+
+    Parameters
+    ----------
+    V : (n, 3) float
+        Vertex positions.
+    F : (m, 3) int
+        Triangle indices.
+    verbose :
+        Log a short summary when True.
+
+    Returns
+    -------
+    (n, n) csr_matrix
+        Diagonal mass matrix.
+    """
     n = V.shape[0]
     areas = _face_areas(V, F)
     Mdiag = np.zeros(n, dtype=float)

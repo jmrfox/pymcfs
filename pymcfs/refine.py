@@ -280,18 +280,29 @@ def refine_skeleton_graph(
     spacing: float | None = None,
     spacing_frac: float | None = None,
 ) -> nx.Graph:
-    """Refine a skeleton curve graph in-place-style (returns a new graph).
+    """Refine a skeleton curve graph (returns a new graph).
 
     Parameters
     ----------
+    G :
+        Input curve graph with node attribute ``pos``.
     mode :
-        ``"uniform"`` resample chains by arc length (default), or ``"compress"``
+        ``\"uniform\"`` resample chains by arc length (default), or ``\"compress\"``
         to keep only junctions/leaves.
     spacing :
         Absolute target segment length for ``uniform``. If omitted, uses
         ``spacing_frac * bbox_diag``, else ``2 * median_edge_length``.
     spacing_frac :
         Relative spacing as a fraction of the skeleton axis-aligned bbox diagonal.
+
+    Returns
+    -------
+    networkx.Graph
+
+    Raises
+    ------
+    ValueError
+        If ``mode`` is not ``uniform`` or ``compress``.
     """
     if G.number_of_nodes() == 0:
         return G
@@ -316,12 +327,113 @@ def refine_skeleton(
     spacing: float | None = None,
     spacing_frac: float | None = None,
 ) -> "Skeleton":
-    """Refine a :class:`~pymcfs.skeleton.Skeleton` curve graph; returns a new instance."""
+    """Refine a :class:`~pymcfs.skeleton.Skeleton`; returns a new instance.
+
+    Parameters
+    ----------
+    skeleton :
+        Input skeleton.
+    mode, spacing, spacing_frac :
+        Forwarded to :func:`refine_skeleton_graph`.
+
+    Returns
+    -------
+    Skeleton
+    """
     from .skeleton import Skeleton
 
     G = refine_skeleton_graph(
         skeleton.graph, mode=mode, spacing=spacing, spacing_frac=spacing_frac
     )
+    mapping = {n: i for i, n in enumerate(G.nodes)}
+    if mapping:
+        G = nx.relabel_nodes(G, mapping, copy=True)
+    nodes_arr = (
+        np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
+        if G.number_of_nodes()
+        else np.zeros((0, 3))
+    )
+    edges_arr = (
+        np.array([[u, v] for u, v in G.edges], dtype=int)
+        if G.number_of_edges()
+        else np.zeros((0, 2), dtype=int)
+    )
+    return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)
+
+
+def prune_exterior_graph(
+    G: nx.Graph,
+    mesh: "tm.Trimesh",
+    *,
+    fast: bool = False,
+) -> tuple[nx.Graph, int]:
+    """Remove dangling branches whose tips lie outside ``mesh``.
+
+    Iteratively deletes degree-1 nodes classified outside the volume (exact
+    float64 containment by default). This catches contraction leaks that
+    survive surface→curve conversion as long exterior leaf edges — without
+    changing interior topology.
+
+    Parameters
+    ----------
+    G :
+        Curve graph with node attribute ``pos``.
+    mesh :
+        Closed triangle mesh used for containment.
+    fast :
+        Forwarded to :func:`pymcfs.medial.points_inside_mesh`.
+
+    Returns
+    -------
+    G_new :
+        Pruned copy of ``G``.
+    n_removed :
+        Number of nodes deleted.
+    """
+    import trimesh as tm
+
+    from .medial import points_inside_mesh
+
+    if not isinstance(mesh, tm.Trimesh):
+        raise TypeError("mesh must be a trimesh.Trimesh")
+    if G.number_of_nodes() == 0:
+        return G.copy(), 0
+
+    H = G.copy()
+    removed = 0
+    while H.number_of_nodes() > 0:
+        nodes = list(H.nodes)
+        P = np.array([H.nodes[n]["pos"] for n in nodes], dtype=float)
+        inside = points_inside_mesh(mesh, P, fast=bool(fast))
+        outside = {n for n, ok in zip(nodes, inside) if not bool(ok)}
+        if not outside:
+            break
+        leaves = [n for n in outside if H.degree(n) <= 1]
+        if not leaves:
+            # Exterior nodes remain but are not dangling tips (e.g. barely
+            # outside mid-chain); leave them — aggressive mid-chain cuts risk
+            # breaking real topology.
+            break
+        for n in leaves:
+            if n in H:
+                H.remove_node(n)
+                removed += 1
+    return H, removed
+
+
+def prune_exterior_branches(
+    skeleton: "Skeleton",
+    mesh: "tm.Trimesh",
+    *,
+    fast: bool = False,
+) -> "Skeleton":
+    """Return a copy of ``skeleton`` with exterior dangling tips removed.
+
+    See :func:`prune_exterior_graph`.
+    """
+    from .skeleton import Skeleton
+
+    G, _n = prune_exterior_graph(skeleton.graph, mesh, fast=fast)
     mapping = {n: i for i, n in enumerate(G.nodes)}
     if mapping:
         G = nx.relabel_nodes(G, mapping, copy=True)

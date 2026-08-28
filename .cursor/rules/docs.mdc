@@ -1,0 +1,15 @@
+---
+description: Documentation site (MkDocs) conventions for pymcfs
+globs: docs/**/*.md, mkdocs.yml, .readthedocs.yaml
+---
+
+# Docs
+
+- Site: **MkDocs Material** + **mkdocstrings** (`mkdocs.yml`).
+- Hosted on **Read the Docs** (`pymcfs.readthedocs.io`), same pattern as MASCAF:
+  `.readthedocs.yaml` uses `uv sync --group docs` and builds into `$READTHEDOCS_OUTPUT/html`.
+- Local: `uv sync --group docs && uv run mkdocs serve` (or `mkdocs build --strict`).
+- Keep the root `README.md` short (install + quick start + RTD link/badge).
+- Put long material under `docs/`. Do not grow the README monolith again.
+- API pages use `::: pymcfs...` directives; fix numpy-style docstrings if `--strict` fails.
+- Pin `mkdocs<2` until Material supports MkDocs 2.

@@ -31,6 +31,7 @@ htmlcov/
 
 # Local outputs and caches
 outputs/
+site/
 *.log
 
 # Starlab reference (clone locally; nested git repo — not vendored in pymcfs)

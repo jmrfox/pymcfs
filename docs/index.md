@@ -1,0 +1,39 @@
+# pymcfs
+
+Mean-curvature flow skeletonization (MCFS) of closed 3D triangle meshes in Python.
+Inspired by [CGAL Triangulated Surface Mesh Skeletonization](https://doc.cgal.org/latest/Surface_mesh_skeletonization/)
+and Tagliasacchi et al. (SGP 2012).
+
+Import and call — there is no CLI.
+
+```python
+import trimesh as tm
+from pymcfs import skeletonize
+
+mesh = tm.load("mesh.obj", force="mesh", process=False)
+skel = skeletonize(mesh)
+skel.write_polylines("skeleton.polylines.txt")
+```
+
+## What it does
+
+1. Contract the surface with a weighted mean-curvature solve (optional Voronoi-pole medial term).
+2. Remesh locally (collapse short edges, split obtuse faces).
+3. Pin formed branch tips.
+4. Convert the thin meso-surface into a 1D curve skeleton.
+
+## Where to go
+
+- [Install](getting-started/install.md) — core, CHOLMOD, viz, Embree
+- [Quick start](getting-started/quickstart.md) — first skeleton in a few lines
+- [Profiles and weights](guide/profiles.md) — `robust` / `starlab` / `auto`
+- [Parameter oracle](guide/oracle.md) — mesh-conditioned `w_H` / `w_M`, branching preference
+- [Algorithm](algorithm/index.md) — how MCFS is implemented here
+- [API reference](api/index.md) — public functions and classes
+
+## Design notes for biological meshes
+
+- Coordinates are **not** normalized; skeletons stay in the input frame.
+- Default profile (`robust`) targets complex TS-like surfaces with pole gating.
+- The oracle defaults to `branching="sparse"` (fewer junctions; neuroscience priority).
+- Exact float64 point-in-mesh gating is the default; Embree is opt-in only.

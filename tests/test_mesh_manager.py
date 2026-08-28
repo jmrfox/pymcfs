@@ -1,7 +1,11 @@
 import numpy as np
 import trimesh as tm
+from pathlib import Path
 
 from pymcfs.mesh import MeshManager
+from pymcfs.validate import validate_mcfs_mesh
+
+DATA = Path(__file__).resolve().parents[1] / "data" / "mesh"
 
 
 def test_mesh_manager_analyze_sphere():
@@ -31,3 +35,21 @@ def test_center_and_scale():
     mm.scale_mesh(2.0)
     after_extent = mm.to_trimesh().bounding_box.extents
     assert np.allclose(after_extent, before_extent * 2.0, rtol=1e-6, atol=1e-8)
+
+
+def test_load_mesh_process_false_preserves_watertight():
+    """Trimesh process=True can break closed TS OBJs; MeshManager must not."""
+    path = DATA / "TS3.obj"
+    if not path.is_file():
+        import pytest
+
+        pytest.skip("TS3.obj not present")
+
+    processed = tm.load(str(path), force="mesh", process=True)
+    assert processed.is_watertight is False
+
+    mm = MeshManager(verbose=False)
+    mesh = mm.load_mesh(str(path), validate_mcfs=True)
+    assert mesh.is_watertight is True
+    validate_mcfs_mesh(mesh)
+    assert len(mesh.vertices) == len(tm.load(str(path), force="mesh", process=False).vertices)

@@ -16,6 +16,17 @@ logger.addHandler(logging.NullHandler())
 
 @dataclass
 class MCFResult:
+    """Result of :func:`mean_curvature_flow`.
+
+    Attributes
+    ----------
+    vertices : (n, 3) float ndarray
+        Final vertex positions.
+    history :
+        Optional list of intermediate ``(n, 3)`` arrays when
+        ``record_history=True``.
+    """
+
     vertices: np.ndarray  # (n,3) final vertex positions
     history: Optional[Sequence[np.ndarray]] = None  # optional list of intermediate vertices
 
@@ -86,6 +97,12 @@ def mean_curvature_flow(
         Dataclass with
         - ``vertices``: (n,3) array of final vertex positions,
         - ``history``: optional list of intermediate (n,3) arrays when ``record_history`` is True.
+
+    Raises
+    ------
+    ValueError
+        If mesh vertices/faces have the wrong shape, or guidance arrays are
+        inconsistent with vertex count.
     """
     if mesh.vertices.ndim != 2 or mesh.vertices.shape[1] != 3:
         raise ValueError("mesh.vertices must have shape (n,3)")
