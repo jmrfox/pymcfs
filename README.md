@@ -6,6 +6,9 @@ Mean-curvature flow skeletonization (MCFS) of closed 3D triangle meshes in Pytho
 Inspired by CGAL Triangulated Surface Mesh Skeletonization and Tagliasacchi et al.
 (SGP 2012). Import and call — there is no CLI.
 
+**Version 0.1.0** — early preview for collaborators; API is mostly stable but not
+yet tagged v1.0.
+
 **Docs:** [pymcfs.readthedocs.io](https://pymcfs.readthedocs.io/en/latest/)
 (or locally: `uv sync --group docs && uv run mkdocs serve`).
 
