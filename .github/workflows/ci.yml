@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - name: Install SuiteSparse (CHOLMOD headers)
+        run: sudo apt-get update && sudo apt-get install -y libsuitesparse-dev
       - name: Sync and test
         run: |
           uv sync --extra cholmod --group dev --group docs
