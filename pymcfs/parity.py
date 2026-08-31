@@ -1,7 +1,8 @@
 """Stage-wise Starlab parity metrics and fixture loaders.
 
 Compares pymcfs dumps against Starlab reference dumps under
-``dev/fixtures/parity/<mesh>/{starlab,pymcfs}/``.
+``dev/fixtures/parity/<mesh>/{starlab,pymcfs}/`` (present on the ``main``
+branch; optional on ``release``).
 """
 from __future__ import annotations
 

@@ -87,10 +87,10 @@ use the sweep script below instead.
 
 ## Parameter sweep script
 
-Research sweeps live under `toric_spines/` on **`main` only** — not on the
-public `release` branch.
+Research sweeps live on **`main`** under `toric_spines/` (not on `release`).
 
 ```bash
+git checkout main
 uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2
 uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1 --top-k 3
 ```

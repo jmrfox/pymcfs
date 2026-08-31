@@ -50,10 +50,10 @@ print(feats.summary())
 
 ## Grid search
 
-For systematic tuning on a mesh (sweep script lives under `toric_spines/` on
-**`main` only** — not on public `release`):
+For systematic tuning on a mesh (sweep script on **`main`** under `toric_spines/`):
 
 ```bash
+git checkout main
 uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1
 ```
 

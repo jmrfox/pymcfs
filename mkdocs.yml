@@ -3,7 +3,7 @@ site_description: Mean-curvature-flow skeletonization for triangle meshes
 site_url: https://pymcfs.readthedocs.io/en/latest/
 repo_url: https://github.com/jmrfox/pymcfs
 repo_name: jmrfox/pymcfs
-edit_uri: edit/main/docs/
+edit_uri: edit/release/docs/
 
 theme:
   name: material
