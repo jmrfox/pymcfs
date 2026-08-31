@@ -9,6 +9,9 @@ Inspired by CGAL Triangulated Surface Mesh Skeletonization and Tagliasacchi et a
 **Version 0.1.0** — early preview for collaborators; API is mostly stable but not
 yet tagged v1.0.
 
+**Branches:** `main` holds this full tree including research (`toric_spines/`) and
+dev tooling (`dev/`). The public package branch is **`release`** (no research/dev).
+
 **Docs:** [pymcfs.readthedocs.io](https://pymcfs.readthedocs.io/en/latest/)
 (or locally: `uv sync --group docs && uv run mkdocs serve`).
 
