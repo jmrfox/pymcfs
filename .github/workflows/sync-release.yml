@@ -1,0 +1,72 @@
+# Sync the public `release` branch from `main` after every push to `main`.
+#
+# `release` is a filtered mirror of `main`: same package, docs, tests, and
+# packaging metadata, without research/dev editor trees.
+#
+# Exclude list (keep in sync with project docs):
+#   toric_spines/  research application
+#   dev/           parity fixtures, benches, dump scripts
+#   .cursor/       editor rules
+#   TODO.md        planning notes
+#   outputs/       local/demo artifacts (also gitignored)
+
+name: sync-release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mirror main onto release (strip private paths)
+        env:
+          # Paths removed from the public branch after copying main's tree.
+          RELEASE_EXCLUDE: |
+            toric_spines
+            dev
+            .cursor
+            TODO.md
+            outputs
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main release
+
+          git checkout -B release origin/release
+
+          # Replace index + worktree with main's tree, then drop private paths.
+          git read-tree -u --reset origin/main
+
+          while IFS= read -r path; do
+            path="${path#"${path%%[![:space:]]*}"}"
+            path="${path%"${path##*[![:space:]]}"}"
+            [[ -z "$path" || "$path" == \#* ]] && continue
+            git rm -rf --ignore-unmatch --quiet "$path" || true
+            rm -rf "$path"
+          done <<< "$RELEASE_EXCLUDE"
+
+          if git diff --cached --quiet; then
+            echo "release already matches filtered main; nothing to do"
+            exit 0
+          fi
+
+          git commit -m "chore: sync release from main"
+
+          git push origin release

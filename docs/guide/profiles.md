@@ -26,6 +26,24 @@ skeletonize(mesh, profile="auto")
 skeletonize(mesh, profile="auto", branching="dense")
 ```
 
+## Override order
+
+When several sources set the same knob, the winner is:
+
+1. Explicit keyword arguments on `skeletonize` / `contract_mesh`
+2. `params=` (`McfsParams`)
+3. `settings=` (`SkeletonizeSettings` / nested contraction + refine)
+4. Profile defaults (`robust` / `starlab` / `auto` proposal)
+
+```python
+from pymcfs import SkeletonizeSettings, ContractionSettings, skeletonize
+
+settings = SkeletonizeSettings(
+    contraction=ContractionSettings(profile="auto", branching="sparse"),
+)
+skel = skeletonize(mesh, settings=settings, attraction_weight=0.4)  # kwargs win
+```
+
 ## Pole gating
 
 With `gate_exterior_poles=True` (default for `robust` / `auto`), medial weights
@@ -33,8 +51,8 @@ apply only when the Voronoi pole lies **inside** the input mesh. Exterior poles
 get `medial_weight = 0` so they cannot pull branches outside the surface.
 
 Even with gating, a few meso vertices can still drift slightly outside during
-contraction. By default `:func:`~pymcfs.skeletonize`` /
-`:meth:`~pymcfs.MeanCurvatureFlowSkeletonization.convert_to_skeleton`` prune
+contraction. By default `skeletonize` /
+`MeanCurvatureFlowSkeletonization.convert_to_skeleton` prune
 **dangling exterior tips** (`prune_exterior=True`) so those leaks do not become
 long through-surface leaf branches. Set `prune_exterior=False` to keep the raw
 curve graph.

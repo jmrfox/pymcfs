@@ -1,16 +1,24 @@
 # Quick start
 
 ```python
-import trimesh as tm
-from pymcfs import skeletonize, analyze_skeleton
+from pymcfs import load_and_repair, skeletonize, analyze_skeleton
 
-mesh = tm.load("mesh.obj", force="mesh", process=False)
-# Optional: MeshManager.repair_mesh() if the surface is not watertight
-
-skel = skeletonize(mesh)  # robust defaults: attraction_weight=0.5, medial_weight=5.0, gated poles
+mesh = load_and_repair("mesh.obj")  # load + repair + validate
+skel = skeletonize(mesh)            # robust defaults
 print(analyze_skeleton(mesh, skel).summary())
 
 skel.write_polylines("skeleton.polylines.txt")
+skel.write_cg("skeleton.cg")
+```
+
+If the mesh is already closed and watertight, you can skip repair:
+
+```python
+import trimesh as tm
+from pymcfs import skeletonize
+
+mesh = tm.load("mesh.obj", force="mesh", process=False)
+skel = skeletonize(mesh)
 ```
 
 ## Common variants
@@ -18,6 +26,9 @@ skel.write_polylines("skeleton.polylines.txt")
 ```python
 # Mesh-conditioned weights (sparse branching by default)
 skel = skeletonize(mesh, profile="auto")
+
+# Try a few nearby weights + refine settings (~4× contraction cost)
+skel = skeletonize(mesh, profile="auto", parameter_search=True)
 
 # Starlab parity weights (ungated poles)
 skel = skeletonize(mesh, profile="starlab")
@@ -36,17 +47,15 @@ skel = driver.convert_to_skeleton(resample=False)
 ## Input requirements
 
 - Closed, manifold triangle mesh (watertight preferred)
+- Exactly one connected component
 - Coordinates stay in the **input frame** (no built-in normalize/rescale)
 - Default remesh length is `0.002 × bbox_diagonal`
 
-## Export
+See [Meshes and validation](../guide/meshes.md).
 
-```python
-# One polyline per chain (junction-to-leaf / cycle)
-skel.write_polylines("out.polylines.txt")
+## Next steps
 
-# Optional Plotly figure (needs pymcfs[viz])
-fig = skel.plot_3d(mesh=mesh, autoshow=False)
-```
-
-See [Profiles and weights](../guide/profiles.md) and the [API reference](../api/index.md).
+- [Profiles and weights](../guide/profiles.md)
+- [Parameter search](../guide/search.md)
+- [Export and I/O](../guide/export.md)
+- [API reference](../api/index.md)

@@ -10,7 +10,9 @@
 - `toric_spines/` — personal research (notebooks, TS workflows, meshes); **main only**
 - `dev/` — development tooling (parity fixtures, benches, dump scripts); **main only**
 
-The public `release` branch omits `toric_spines/` and `dev/`.
+The public `release` branch omits `toric_spines/`, `dev/`, `.cursor/`,
+`TODO.md`, and `outputs/`. It is auto-synced from `main` by
+`.github/workflows/sync-release.yml` (on every push to `main`).
 
 ## Design stance
 

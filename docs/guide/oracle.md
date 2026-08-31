@@ -48,15 +48,9 @@ feats = mesh_mcfs_features(mesh)
 print(feats.summary())
 ```
 
-## Grid search
+## Next: automatic search
 
-For systematic tuning on a mesh (sweep script lives under `toric_spines/` on
-**`main` only** — not on public `release`):
-
-```bash
-uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1
-```
-
-Results land under `outputs/sweeps/<name>/` (CSV + top-k polylines). Scoring
-favors topology match, containment, then compactness — see
-[Quality and sweeps](quality.md).
+If a single proposal is still off, try a small set of nearby weights and refine
+settings with [`parameter_search=True`](search.md) or
+[`search_mcfs_params`](search.md) (~4× contraction cost). For scoring and
+refine-phase knobs, see [Refine and quality](quality.md).

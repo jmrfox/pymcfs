@@ -61,11 +61,12 @@ nav:
       - Install: getting-started/install.md
       - Quick start: getting-started/quickstart.md
   - User guide:
+      - Meshes and validation: guide/meshes.md
       - Profiles and weights: guide/profiles.md
       - Parameter proposals: guide/oracle.md
-      - Quality and sweeps: guide/quality.md
-      - Notebooks: guide/notebooks.md
-      - Starlab parity: guide/parity.md
+      - Refine and quality: guide/quality.md
+      - Parameter search: guide/search.md
+      - Export and I/O: guide/export.md
   - Algorithm:
       - Overview: algorithm/index.md
       - Robustness: algorithm/robustness.md
@@ -73,10 +74,13 @@ nav:
       - Overview: api/index.md
       - skeletonize / Skeleton: api/skeleton.md
       - MCFS driver: api/mcfs.md
+      - Settings: api/config.md
       - Parameters: api/params.md
+      - Search: api/search.md
       - Quality: api/quality.md
-      - Medial / Laplacian: api/geometry.md
-  - Benchmarks: benchmarks.md
+      - Mesh utilities: api/mesh.md
+      - Curve I/O: api/io.md
+      - Geometry: api/geometry.md
 
 watch:
   - pymcfs
