@@ -9,8 +9,8 @@ Inspired by CGAL Triangulated Surface Mesh Skeletonization and Tagliasacchi et a
 **Version 0.1.0** — early preview for collaborators; API is mostly stable but not
 yet tagged v1.0.
 
-This is the public **`release`** branch (package, tests, docs). Research notebooks,
-TS meshes, and parity tooling live on **`main`** under `toric_spines/` and `dev/`.
+**Branches:** `main` is the full tree (including research/dev). The public
+`release` branch is auto-synced from `main` without those trees.
 
 **Docs:** [pymcfs.readthedocs.io](https://pymcfs.readthedocs.io/en/latest/)
 (or locally: `uv sync --group docs && uv run mkdocs serve`).
@@ -18,10 +18,13 @@ TS meshes, and parity tooling live on **`main`** under `toric_spines/` and `dev/
 ## Install
 
 ```bash
+pip install .
+pip install ".[cholmod,viz]"   # recommended extras
+
+# or with uv in this repo:
 uv sync                     # core
 uv sync --extra cholmod     # recommended on Linux/WSL
 uv sync --extra viz         # plotly / matplotlib
-uv sync --group dev         # pytest, jupytext, notebooks
 uv sync --group docs        # mkdocs + API autodoc
 ```
 
@@ -30,10 +33,9 @@ System dep for CHOLMOD: `sudo apt install libsuitesparse-dev`.
 ## Quick start
 
 ```python
-import trimesh as tm
-from pymcfs import skeletonize
+from pymcfs import load_and_repair, skeletonize
 
-mesh = tm.load("mesh.obj", force="mesh", process=False)
+mesh = load_and_repair("mesh.obj")
 skel = skeletonize(mesh)                    # robust defaults
 # skel = skeletonize(mesh, profile="auto")  # mesh-conditioned weights
 skel.write_polylines("skeleton.polylines.txt")

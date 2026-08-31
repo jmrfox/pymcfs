@@ -1,4 +1,4 @@
-# Quality and sweeps
+# Refine and quality
 
 ## Refine phase
 
@@ -39,7 +39,24 @@ skel = skeletonize(
 
 **Refine phase** = prune / extend / resample. **`resample`** controls curve
 density only (`resample=True` / `"uniform"` / `"compress"`); it does not change
-connectivity beyond node spacing.
+connectivity beyond node spacing. It is distinct from
+[parameter search](search.md), which re-contracts with nearby weights.
+
+You can also run refine helpers on an existing `Skeleton`:
+
+```python
+from pymcfs import (
+    prune_exterior_branches,
+    prune_short_leaves,
+    prune_thick_hubs,
+    extend_tips,
+    resample_skeleton,
+)
+
+skel = prune_exterior_branches(skel, mesh)
+skel = prune_thick_hubs(skel, mesh)
+skel = resample_skeleton(skel, mode="uniform")
+```
 
 ## Analyze a skeleton
 
@@ -61,40 +78,5 @@ print(score.summary())
 3. Containment — nodes/edges inside; exterior nodes heavily penalized
 4. Compactness — fewer junctions, then fewer nodes/leaves
 
-## Parameter search vs resample
-
-**`parameter_search`** re-contracts the mesh with a few nearby
-`(attraction_weight, medial_weight)` values and tries a small set of refine-phase
-settings, then returns the best skeleton (~4× contraction cost). **`resample`**
-only post-processes an already extracted curve (uniform spacing / compress); it
-does not change contraction weights.
-
-```python
-from pymcfs import skeletonize, search_mcfs_params
-
-# Convenience: same API, returns Skeleton
-skel = skeletonize(mesh, profile="auto", parameter_search=True)
-
-# Full result (weights, score, trial count)
-result = search_mcfs_params(mesh, profile="auto", extend_tips=True)
-print(result.attraction_weight, result.medial_weight, result.score.summary(), result.n_contracts)
-skel = result.skeleton
-```
-
-Search ranking starts from `score_skeleton`, then applies light penalties for
-deep tips and excess leaf arms at thick hubs. For a dense grid over weights,
-use the sweep script below instead.
-
-## Parameter sweep script
-
-Research sweeps live on **`main`** under `toric_spines/` (not on `release`).
-
-```bash
-git checkout main
-uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2
-uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1 --top-k 3
-```
-
-Sweeps `(attraction_weight, ratio)` with
-`medial_weight = ratio · attraction_weight`, early-aborts remesh blow-ups,
-writes CSV + top polylines under `outputs/sweeps/`.
+Bundle refine knobs with [`RefineSettings`](../api/config.md) when you want a
+reusable configuration object.

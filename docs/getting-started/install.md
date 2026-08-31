@@ -1,9 +1,21 @@
 # Install
 
-## Core library
+## Library install
+
+From a checkout of this repository:
 
 ```bash
-uv sync
+pip install .
+pip install ".[cholmod,viz]"   # recommended extras
+```
+
+Or with [uv](https://docs.astral.sh/uv/) in the repo:
+
+```bash
+uv sync                     # core
+uv sync --extra cholmod     # recommended on Linux/WSL
+uv sync --extra viz         # plotly / matplotlib
+uv sync --extra embree      # optional fast_gating
 ```
 
 Runtime dependencies: `numpy`, `scipy`, `trimesh`, `networkx`, `numba`, `rtree`.
@@ -14,7 +26,8 @@ Faster SPD solves for the contraction system (Linux/WSL):
 
 ```bash
 sudo apt install libsuitesparse-dev
-uv sync --extra cholmod
+pip install ".[cholmod]"
+# or: uv sync --extra cholmod
 ```
 
 Pass `use_cholmod=True|False|None` on `skeletonize` / `contract_mesh` / the driver
@@ -29,23 +42,18 @@ Pass `use_cholmod=True|False|None` on `skeletonize` / `contract_mesh` / the driv
 
 | Extra | Install | Purpose |
 |-------|---------|---------|
-| `cholmod` | `uv sync --extra cholmod` | SuiteSparse CHOLMOD via scikit-sparse |
-| `viz` | `uv sync --extra viz` | plotly / matplotlib for plot helpers |
-| `embree` | `uv sync --extra embree` | Fast pole gating with `fast_gating=True` |
-
-```bash
-uv sync --group dev    # pytest, jupytext, notebooks, viz libs
-```
+| `cholmod` | `pip install ".[cholmod]"` | SuiteSparse CHOLMOD via scikit-sparse |
+| `viz` | `pip install ".[viz]"` | plotly / matplotlib for plot helpers |
+| `embree` | `pip install ".[embree]"` | Fast pole gating with `fast_gating=True` |
 
 !!! warning "Embree / float32"
     Embree traces in single precision. Only enable `fast_gating=True` for
     unit-ish meshes near the origin. Large-coordinate meshes (e.g. µm-scale
-    neuron surfaces far from the origin) need the default exact float64
-    gating path.
+    surfaces far from the origin) need the default exact float64 gating path.
 
-## From a wheel / editable
+## Contributors
 
 ```bash
-pip install .
-pip install ".[cholmod,viz]"
+uv sync --group docs    # mkdocs + API autodoc
+uv sync --group dev     # pytest and related tooling
 ```

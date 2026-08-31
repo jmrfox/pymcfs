@@ -21,13 +21,18 @@ skel.write_polylines("skeleton.polylines.txt")
 2. Remesh locally (collapse short edges, split obtuse faces).
 3. Pin formed branch tips.
 4. Convert the thin meso-surface into a 1D curve skeleton.
+5. Optionally refine (prune / tip extension / resample) and score the result.
 
 ## Where to go
 
 - [Install](getting-started/install.md) — core, CHOLMOD, viz, Embree
 - [Quick start](getting-started/quickstart.md) — first skeleton in a few lines
+- [Meshes and validation](guide/meshes.md) — input requirements and repair
 - [Profiles and weights](guide/profiles.md) — `robust` / `starlab` / `auto`
-- [Parameter proposals](guide/oracle.md) — mesh-conditioned `attraction_weight` / `medial_weight`, branching preference
+- [Parameter proposals](guide/oracle.md) — mesh-conditioned weights
+- [Refine and quality](guide/quality.md) — prune, score, analyze
+- [Parameter search](guide/search.md) — automatic nearby-weight trials
+- [Export and I/O](guide/export.md) — polylines, `.cg`, plotting
 - [Algorithm](algorithm/index.md) — how MCFS is implemented here
 - [API reference](api/index.md) — public functions and classes
 
