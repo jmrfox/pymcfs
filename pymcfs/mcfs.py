@@ -1,5 +1,4 @@
-"""Mean curvature flow skeletonization driver.
-"""
+"""Mean-curvature-flow driver that contracts a closed mesh to a meso-skeleton."""
 from __future__ import annotations
 
 import logging
@@ -206,28 +205,35 @@ def meso_surface_to_curve_graph(
 
 @dataclass
 class MeanCurvatureFlowSkeletonization:
-    """Mean-curvature-flow skeletonization driver for closed triangle meshes.
+    """Step-through driver: contract a closed mesh, then convert to a curve skeleton.
+
+    Each iteration solves a linear system that blends mean-curvature flow with
+    attraction (stay put) and medial guidance (pull toward Voronoi poles —
+    approximate medial-axis targets inside the volume). The result is a thin
+    meso-skeleton surface; :meth:`convert_to_skeleton` collapses it to a 1D
+    curve and applies the refine phase.
+
+    Prefer :func:`pymcfs.skeletonize` / :func:`pymcfs.contract_mesh` for the
+    usual one-shot paths; use this class when you need per-iteration control.
 
     Parameters
     ----------
     mesh :
         Input ``trimesh.Trimesh``.
-    w_H :
-        Quality/speed tradeoff (default 0.5; CGAL-app / TS-tuned). Larger →
-        stronger attraction to current positions.
-    w_M :
-        Medial-centering tradeoff (default 5.0). ``0`` disables Voronoi poles.
+    attraction_weight :
+        Attraction weight (default 0.5). Larger → stronger pull toward current
+        positions (stability).
+    medial_weight :
+        Medial-centering weight (default 5.0). ``0`` disables Voronoi poles.
     gate_exterior_poles :
-        If True (default), apply ``w_M`` only when a pole lies inside the input
-        mesh — matching CGAL ``Side_of_triangle_mesh`` / ``ON_BOUNDED_SIDE``.
-        Set False for Starlab-style ungated medial pull.
+        If True (default), apply medial weight only when a pole lies inside the
+        input mesh. Set False for Starlab-style ungated medial pull.
     fast_gating :
         Use the mesh's own ray backend for pole containment (Embree when
         ``pymcfs[embree]`` is installed) instead of the exact float64
         traverser. Roughly 100x faster, but Embree traces in single precision:
-        on meshes far from the origin (TS neuron meshes span ~5.7e3 to ~8.0e3)
-        that flips most gating decisions. Only enable for meshes at unit-ish
-        scale near the origin.
+        on meshes with large absolute coordinates that flips most gating
+        decisions. Only enable for meshes at unit-ish scale near the origin.
     use_cholmod :
         If True, require scikit-sparse CHOLMOD for the ``AᵀA`` solve. If False,
         force SciPy SuperLU. If None (default), use CHOLMOD when importable.
@@ -241,10 +247,11 @@ class MeanCurvatureFlowSkeletonization:
     max_vertex_growth :
         Abort contraction when ``n > max_vertex_growth * n0`` (remesh blow-up).
         ``None`` or ``<= 0`` disables the guard. Default ``4.0`` (successful
-        TS runs often reach ~2×; catastrophic blow-ups are 10–100×).
-    zero_TH :
+        runs often reach ~2×; catastrophic blow-ups are 10–100×).
+    pinned_attraction_floor :
         Numerical floor used when pinning fixed vertices
-        (``w_H = 1 / zero_TH``) and as a short-edge epsilon in remesh.
+        (``attraction_weight = 1 / pinned_attraction_floor``) and as a
+        short-edge epsilon in remesh.
     validate, verbose, log :
         Validation and logging.
 
@@ -261,14 +268,14 @@ class MeanCurvatureFlowSkeletonization:
     -----
     Laplacian scale ``w_L`` is fixed at 1 (CGAL uses the same). Cotangent edge
     weights are recomputed each geometry step. When ``gate_exterior_poles`` is
-    on, exterior poles get ``w_M = 0`` so they cannot pull the surface outside.
-    High-level :func:`pymcfs.skeletonize` / :func:`pymcfs.thin_mesh` construct
+    on, exterior poles get medial weight 0 so they cannot pull the surface outside.
+    High-level :func:`pymcfs.skeletonize` / :func:`pymcfs.contract_mesh` construct
     this driver with the default ``max_vertex_growth=4.0``.
     """
 
     mesh: tm.Trimesh
-    w_H: float = 0.5
-    w_M: float = 5.0
+    attraction_weight: float = 0.5
+    medial_weight: float = 5.0
     gate_exterior_poles: bool = True
     fast_gating: bool = False
     use_cholmod: bool | None = None
@@ -278,7 +285,7 @@ class MeanCurvatureFlowSkeletonization:
     max_iterations: int = 500
     timeout_seconds: float | None = 120.0
     max_vertex_growth: float | None = 4.0
-    zero_TH: float = 1e-7
+    pinned_attraction_floor: float = 1e-7
     validate: bool = True
     verbose: bool = False
     log: logging.Logger | None = None
@@ -338,7 +345,7 @@ class MeanCurvatureFlowSkeletonization:
         self.aborted_remesh_growth = False
         self.area_overshoot_seen = False
         self.pole_valid = np.zeros(n, dtype=bool)
-        if float(self.w_M) > 0.0:
+        if float(self.medial_weight) > 0.0:
             try:
                 targets, _w = compute_voronoi_poles(self.mesh)
                 self.poles = np.asarray(targets, dtype=float)
@@ -347,7 +354,7 @@ class MeanCurvatureFlowSkeletonization:
                 n_valid = int(self.pole_valid.sum())
                 if self.gate_exterior_poles:
                     self._vinfo(
-                        "Voronoi poles: %d/%d inside mesh (gated; exterior w_M=0)",
+                        "Voronoi poles: %d/%d inside mesh (gated; exterior medial=0)",
                         n_valid,
                         n,
                     )
@@ -358,9 +365,9 @@ class MeanCurvatureFlowSkeletonization:
                         n,
                     )
             except Exception as e:
-                self._log.warning("Voronoi poles failed (%s); setting w_M effective 0", e)
+                self._log.warning("Voronoi poles failed (%s); setting medial_weight effective 0", e)
                 self.poles = self.V.copy()
-                self.w_M = 0.0
+                self.medial_weight = 0.0
                 self._pole_valid_dirty = False
         else:
             self.poles = self.V.copy()
@@ -371,14 +378,14 @@ class MeanCurvatureFlowSkeletonization:
         self._use_cholmod = resolve_use_cholmod(self.use_cholmod)
         self._vinfo(
             "MCFS init: n=%d f=%d min_edge=%.4g area0=%.4g bbox0=%s "
-            "w_H=%.3g w_M=%.3g gate_poles=%s spd=%s",
+            "attraction=%.3g medial=%.3g gate_poles=%s spd=%s",
             n,
             self.F.shape[0],
             self._min_edge,
             self._area0,
             np.array2string(self._bbox0, precision=4),
-            self.w_H,
-            self.w_M,
+            self.attraction_weight,
+            self.medial_weight,
             bool(self.gate_exterior_poles),
             "cholmod" if self._use_cholmod else "superlu",
         )
@@ -425,7 +432,7 @@ class MeanCurvatureFlowSkeletonization:
             return np.ones(n, dtype=bool)
 
     def _compute_pole_valid(self, poles: np.ndarray) -> np.ndarray:
-        """Return pole validity mask used for ``w_M`` gating / diagnostics.
+        """Return pole validity mask used for medial-weight gating / diagnostics.
 
         When ``gate_exterior_poles`` is True (CGAL-style), this is the true
         containment mask. When False (Starlab parity), all poles are treated as
@@ -456,7 +463,7 @@ class MeanCurvatureFlowSkeletonization:
         out of sync or something explicitly marked them dirty.
         """
         n = self.V.shape[0]
-        if float(self.w_M) <= 0.0 or self.poles.shape[0] != n:
+        if float(self.medial_weight) <= 0.0 or self.poles.shape[0] != n:
             self.pole_valid = np.zeros(n, dtype=bool)
             self._pole_valid_dirty = False
             return
@@ -473,7 +480,7 @@ class MeanCurvatureFlowSkeletonization:
         containment is not already known by index. One small batched test here
         replaces a whole-mesh ``contains`` call per remesh.
         """
-        if n_new <= 0 or float(self.w_M) <= 0.0:
+        if n_new <= 0 or float(self.medial_weight) <= 0.0:
             return
         n = self.V.shape[0]
         if self.poles.shape[0] != n or self.pole_valid.shape[0] != n or n_new > n:
@@ -504,7 +511,7 @@ class MeanCurvatureFlowSkeletonization:
                 finite,
             )
         )
-        if float(self.w_M) > 0.0 and self.poles.shape[0] == n and n > 0:
+        if float(self.medial_weight) > 0.0 and self.poles.shape[0] == n and n > 0:
             d = np.linalg.norm(self.V - self.poles, axis=1)
             valid = self.pole_valid if self.pole_valid.shape[0] == n else np.zeros(n, dtype=bool)
             msg += " pole_dist(mean/max)=%.4g/%.4g valid=%d/%d" % (
@@ -537,10 +544,10 @@ class MeanCurvatureFlowSkeletonization:
     def _update_constraint_weights(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         n = self.V.shape[0]
         wL = np.full(n, float(self._w_L), dtype=float)
-        wH = np.full(n, float(self.w_H), dtype=float)
-        wM = np.full(n, float(self.w_M), dtype=float)
+        wH = np.full(n, float(self.attraction_weight), dtype=float)
+        wM = np.full(n, float(self.medial_weight), dtype=float)
         wL[self._constraint_fixed] = 0.0
-        wH[self._constraint_fixed] = 1.0 / max(self.zero_TH, 1e-16)
+        wH[self._constraint_fixed] = 1.0 / max(self.pinned_attraction_floor, 1e-16)
         wM[self._constraint_fixed] = 0.0
         wM[self._constraint_split] = 0.0
         # CGAL: apply medial weight only when pole is inside the input mesh.
@@ -569,7 +576,7 @@ class MeanCurvatureFlowSkeletonization:
         # leaves the diagonal as the unweighted negative edge-weight sum.
         #
         # The lower two blocks are diagonal, so A.T @ A is
-        # L_w.T @ L_w + diag(w_H²) + diag(w_M²) and A.T @ B collapses to a
+        # L_w.T @ L_w + diag(attraction²) + diag(medial²) and A.T @ B collapses to a
         # dense scaling. Building those directly avoids materialising the
         # (3n, n) stack, its transpose and the big sparse product. The terms
         # are combined in the same order the stacked product would use, which
@@ -654,7 +661,7 @@ class MeanCurvatureFlowSkeletonization:
             self.V,
             self.F,
             max_angle_deg=self.max_triangle_angle,
-            short_edge=max(self.zero_TH, 1e-12),
+            short_edge=max(self.pinned_attraction_floor, 1e-12),
             fixed=self.fixed,
             poles=self.poles,
             pole_valid=valid_in,
@@ -761,6 +768,11 @@ class MeanCurvatureFlowSkeletonization:
         prev_area = self._surface_area()
         last_it = 0
         growth_cap = self.max_vertex_growth
+        self._log.info(
+            "contract_until_convergence: start (max_iters=%d, n0=%d)",
+            int(self.max_iterations),
+            int(self._n0),
+        )
         for it in range(1, int(self.max_iterations) + 1):
             last_it = it
             self._iter = it
@@ -813,6 +825,12 @@ class MeanCurvatureFlowSkeletonization:
             if self.F.shape[0] == 0:
                 break
         self._sanity_check_state(stage="final", prev_area=prev_area)
+        self._log.info(
+            "contract_until_convergence: done (iters=%d, n=%d, f=%d)",
+            last_it,
+            int(self.V.shape[0]),
+            int(self.F.shape[0]),
+        )
         return last_it
 
     def meso_skeleton_mesh(self) -> tm.Trimesh:
@@ -822,34 +840,58 @@ class MeanCurvatureFlowSkeletonization:
     def convert_to_skeleton(
         self,
         *,
-        refine: bool | str = False,
-        refine_spacing: float | None = None,
-        refine_spacing_frac: float | None = None,
-        compress_chains: bool = False,
+        resample: bool | str = False,
         resample_spacing: float | None = None,
+        resample_spacing_frac: float | None = None,
         keep_largest_component: bool = False,
         prune_exterior: bool = True,
+        prune_short_leaves: bool = True,
+        short_leaf_scale: float = 1.0,
+        prune_thick_hubs: bool = True,
+        keep_hub_branches: int = 2,
+        hub_degree_min: int = 4,
+        hub_radius_frac: float = 0.015,
+        extend_tips: bool = False,
+        tip_extend_scale: float = 1.0,
+        tip_clearance_frac: float = 0.01,
+        tip_cone_deg: float = 40.0,
     ):
         """Convert the meso-skeleton surface into a 1D curve ``Skeleton``.
 
         Parameters
         ----------
-        refine, refine_spacing, refine_spacing_frac, compress_chains, resample_spacing :
-            Optional curve refinement (see :func:`pymcfs.skeleton.skeletonize`).
+        resample, resample_spacing, resample_spacing_frac :
+            Optional curve-density resampling (see :func:`pymcfs.skeleton.skeletonize`).
         keep_largest_component :
             If True, keep only the largest connected component of the curve graph.
         prune_exterior :
             If True (default), remove dangling curve tips that lie outside the
-            original input mesh. Catches rare contraction leaks that become
-            long exterior leaf branches.
+            original input mesh.
+        prune_short_leaves :
+            If True (default), mild micro-spur prune
+            (``L < short_leaf_scale × junction thickness``).
+        short_leaf_scale :
+            Length threshold multiplier for short-leaf pruning (default 1.0).
+        prune_thick_hubs :
+            If True (default), at thick high-degree hubs keep only the longest
+            ``keep_hub_branches`` leaf arms (volume-star refine step).
+        keep_hub_branches, hub_degree_min, hub_radius_frac :
+            Thick-hub prune controls (see :func:`pymcfs.refine.prune_thick_hubs`).
+        extend_tips :
+            If True, grow unfinished leaf tips toward lobe ends (default False).
+        tip_extend_scale :
+            Max tip travel as a multiple of bbox diagonal when ``extend_tips``
+            is True (default 1.0).
+        tip_clearance_frac, tip_cone_deg :
+            Tip-extension stop clearance and cone search half-angle.
 
         Returns
         -------
         Skeleton
         """
         from .refine import (
-            resolve_refine_options,
-            refine_skeleton_graph,
+            resolve_resample_options,
+            resample_skeleton_graph,
             prune_exterior_graph,
         )
         from .skeleton import Skeleton
@@ -891,52 +933,88 @@ class MeanCurvatureFlowSkeletonization:
                     n_pruned,
                 )
 
-        mode, spacing, spacing_frac = resolve_refine_options(
-            refine=refine,
-            refine_spacing=refine_spacing,
-            refine_spacing_frac=refine_spacing_frac,
-            compress_chains=compress_chains,
+        if prune_short_leaves and G.number_of_nodes() > 0:
+            from .refine import prune_short_leaves_graph
+
+            G, n_short = prune_short_leaves_graph(
+                G, self.mesh, length_scale=float(short_leaf_scale)
+            )
+            if n_short:
+                self._vinfo(
+                    "convert_to_skeleton: pruned %d short-leaf node(s) "
+                    "(scale=%.3g)",
+                    n_short,
+                    float(short_leaf_scale),
+                )
+
+        if prune_thick_hubs and G.number_of_nodes() > 0:
+            from .refine import prune_thick_hubs_graph
+
+            G, n_hub = prune_thick_hubs_graph(
+                G,
+                self.mesh,
+                keep_hub_branches=int(keep_hub_branches),
+                hub_degree_min=int(hub_degree_min),
+                hub_radius_frac=float(hub_radius_frac),
+            )
+            if n_hub:
+                self._vinfo(
+                    "convert_to_skeleton: pruned %d thick-hub node(s) "
+                    "(keep=%d deg_min=%d)",
+                    n_hub,
+                    int(keep_hub_branches),
+                    int(hub_degree_min),
+                )
+
+        if extend_tips and G.number_of_nodes() > 0:
+            from .refine import extend_tips_graph
+
+            G, n_ext = extend_tips_graph(
+                G,
+                self.mesh,
+                tip_extend_scale=float(tip_extend_scale),
+                tip_clearance_frac=float(tip_clearance_frac),
+                tip_cone_deg=float(tip_cone_deg),
+            )
+            if n_ext:
+                self._vinfo(
+                    "convert_to_skeleton: extended tips by %d node(s) "
+                    "(tip_extend_scale=%.3g)",
+                    n_ext,
+                    float(tip_extend_scale),
+                )
+
+        mode, spacing, spacing_frac = resolve_resample_options(
+            resample=resample,
             resample_spacing=resample_spacing,
+            resample_spacing_frac=resample_spacing_frac,
         )
         if mode is not None and G.number_of_nodes() > 0:
             n_before = G.number_of_nodes()
-            G = refine_skeleton_graph(
+            G = resample_skeleton_graph(
                 G, mode=mode, spacing=spacing, spacing_frac=spacing_frac
             )
             self._vinfo(
-                "convert_to_skeleton: refine mode=%s %d -> %d nodes",
+                "convert_to_skeleton: resample mode=%s %d -> %d nodes",
                 mode,
                 n_before,
                 G.number_of_nodes(),
             )
 
-        # Dense relabel
-        mapping = {n: i for i, n in enumerate(G.nodes)}
-        if mapping:
-            G = nx.relabel_nodes(G, mapping, copy=True)
-        nodes_arr = (
-            np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
-            if G.number_of_nodes()
-            else np.zeros((0, 3))
-        )
-        edges_arr = (
-            np.array([[u, v] for u, v in G.edges], dtype=int)
-            if G.number_of_edges()
-            else np.zeros((0, 2), dtype=int)
-        )
-        if nodes_arr.shape[0] > 0 and edges_arr.shape[0] > 0:
+        skel = Skeleton.from_graph(G)
+        if skel.nodes.shape[0] > 0 and skel.edges.shape[0] > 0:
             total_len = float(
                 sum(
-                    np.linalg.norm(nodes_arr[int(u)] - nodes_arr[int(v)])
-                    for u, v in edges_arr
+                    np.linalg.norm(skel.nodes[int(u)] - skel.nodes[int(v)])
+                    for u, v in skel.edges
                 )
             )
             self._vinfo(
                 "convert_to_skeleton: final nodes=%d edges=%d total_length=%.4g",
-                nodes_arr.shape[0],
-                edges_arr.shape[0],
+                skel.nodes.shape[0],
+                skel.edges.shape[0],
                 total_len,
             )
         else:
             self._log.warning("convert_to_skeleton: empty skeleton")
-        return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)
+        return skel

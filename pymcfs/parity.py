@@ -1,7 +1,7 @@
 """Stage-wise Starlab parity metrics and fixture loaders.
 
 Compares pymcfs dumps against Starlab reference dumps under
-``fixtures/parity/<mesh>/{starlab,pymcfs}/``.
+``dev/fixtures/parity/<mesh>/{starlab,pymcfs}/``.
 """
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ import trimesh as tm
 from scipy.spatial import cKDTree
 
 from .cg_io import graph_from_cg
-from .refine import refine_skeleton_graph
+from .refine import resample_skeleton_graph
 
-FIXTURES_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "parity"
+FIXTURES_ROOT = Path(__file__).resolve().parents[1] / "dev" / "fixtures" / "parity"
 
 
 @dataclass(frozen=True)
@@ -214,7 +214,7 @@ def densify_skeleton_points(
     """Resample curve chains then return all node positions as a point cloud."""
     if G.number_of_nodes() == 0:
         return np.zeros((0, 3), dtype=float)
-    H = refine_skeleton_graph(G, mode="uniform", spacing_frac=float(spacing_frac))
+    H = resample_skeleton_graph(G, mode="uniform", spacing_frac=float(spacing_frac))
     return np.array([np.asarray(H.nodes[n]["pos"], dtype=float) for n in H.nodes], dtype=float)
 
 

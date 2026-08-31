@@ -1,61 +1,80 @@
-"""Curve-skeleton extraction; text export is polylines (``.polylines.txt``) only."""
+"""Public API for extracting a 1D curve skeleton from a closed triangle mesh.
+
+``skeletonize`` runs contraction → curve conversion → refine.
+``contract_mesh`` stops after the contracted meso-skeleton surface.
+Text export writes polylines (``.polylines.txt``) only.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Optional, Union
 
 import logging
 import networkx as nx
 import numpy as np
 import trimesh as tm
 
+from .config import (
+    ContractionSettings,
+    McfsProfile,
+    RefineSettings,
+    ResampleMode,
+    SkeletonizeSettings,
+)
+from .params import BranchingPreference, McfsParams
 from .refine import (
-    RefineMode,
-    refine_skeleton,
-    refine_skeleton_graph,
-    resolve_refine_options,
+    resample_skeleton,
+    resample_skeleton_graph,
+    resolve_resample_options,
     prune_exterior_branches,
     prune_exterior_graph,
-    _resample_polyline_arc_length,
+    prune_short_leaves,
+    prune_short_leaves_graph,
+    prune_thick_hubs,
+    prune_thick_hubs_graph,
+    extend_tips,
+    extend_tips_graph,
 )
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-McfsProfile = Literal["robust", "starlab", "auto"]
-
-# Application / CGAL-robust defaults (complex TS-like meshes).
-_ROBUST_W_H = 0.5
-_ROBUST_W_M = 5.0
-# Starlab mcfskel / published CGAL generic defaults (parity harness).
-_STARLAB_W_H = 0.1
-_STARLAB_W_M = 0.2
+# Application / robust defaults (complex tubular meshes).
+_ROBUST_ATTRACTION = 0.5
+_ROBUST_MEDIAL = 5.0
+# Starlab mcfskel defaults (parity harness).
+_STARLAB_ATTRACTION = 0.1
+_STARLAB_MEDIAL = 0.2
 
 
 def resolve_mcfs_profile(
     profile: McfsProfile | None,
     *,
-    w_H: float,
-    w_M: float,
+    attraction_weight: float,
+    medial_weight: float,
     gate_exterior_poles: bool | None,
-    quality_speed_tradeoff: float | None = None,
-    medially_centered_speed_tradeoff: float | None = None,
     mesh: tm.Trimesh | None = None,
     branching: str = "sparse",
 ) -> tuple[float, float, bool]:
-    """Resolve ``(w_H, w_M, gate_exterior_poles)`` from profile + explicit args.
+    """Pick contraction weights and pole-gating from a named profile.
 
-    - ``profile=\"starlab\"`` selects Starlab weights (0.1 / 0.2) and ungated poles
-      unless the caller already overrode weights via CGAL aliases or non-robust
-      ``w_H`` / ``w_M`` values, or set ``gate_exterior_poles`` explicitly.
-    - ``profile=None`` / ``\"robust\"`` uses application defaults (0.5 / 5.0) and
-      gated poles (CGAL-style), again unless overridden.
-    - ``profile=\"auto\"`` proposes weights from mesh features via
+    Attraction weight keeps vertices from sliding too far; medial weight pulls
+    toward interior Voronoi poles (approximate medial axis). Gating skips poles
+    that lie outside the mesh volume.
+
+    - ``profile=\"starlab\"`` — Starlab weights (0.1 / 0.2), ungated poles,
+      unless the caller overrode weights or set ``gate_exterior_poles``.
+    - ``profile=None`` / ``\"robust\"`` — defaults (0.5 / 5.0), gated poles,
+      unless overridden.
+    - ``profile=\"auto\"`` — mesh-conditioned proposal via
       :func:`pymcfs.params.propose_mcfs_params` (requires ``mesh``).
-      ``branching`` is forwarded (default ``\"sparse\"``). Explicit
-      ``quality_speed_tradeoff`` / ``medially_centered_speed_tradeoff`` still
-      override the proposal; ``gate_exterior_poles`` overrides when not ``None``.
+      ``branching`` is forwarded (default ``\"sparse\"``).
+      ``gate_exterior_poles`` overrides when not ``None``.
+
+    Returns
+    -------
+    attraction_weight, medial_weight, gate_exterior_poles
 
     Raises
     ------
@@ -73,16 +92,12 @@ def resolve_mcfs_profile(
         from .params import propose_mcfs_params
 
         proposed = propose_mcfs_params(mesh, branching=branching)  # type: ignore[arg-type]
-        wh = (
-            float(quality_speed_tradeoff)
-            if quality_speed_tradeoff is not None
-            else float(proposed.w_H)
-        )
-        wm = (
-            float(medially_centered_speed_tradeoff)
-            if medially_centered_speed_tradeoff is not None
-            else float(proposed.w_M)
-        )
+        wh = float(attraction_weight)
+        wm = float(medial_weight)
+        # When caller left robust defaults, take the proposal; otherwise keep overrides.
+        if float(attraction_weight) == _ROBUST_ATTRACTION and float(medial_weight) == _ROBUST_MEDIAL:
+            wh = float(proposed.attraction_weight)
+            wm = float(proposed.medial_weight)
         gate = (
             bool(gate_exterior_poles)
             if gate_exterior_poles is not None
@@ -91,32 +106,163 @@ def resolve_mcfs_profile(
         return wh, wm, gate
 
     if profile == "starlab":
-        default_wh, default_wm, default_gate = _STARLAB_W_H, _STARLAB_W_M, False
+        default_wh, default_wm, default_gate = (
+            _STARLAB_ATTRACTION,
+            _STARLAB_MEDIAL,
+            False,
+        )
     else:
-        default_wh, default_wm, default_gate = _ROBUST_W_H, _ROBUST_W_M, True
+        default_wh, default_wm, default_gate = (
+            _ROBUST_ATTRACTION,
+            _ROBUST_MEDIAL,
+            True,
+        )
 
-    if quality_speed_tradeoff is not None:
-        wh = float(quality_speed_tradeoff)
-    elif profile == "starlab" and float(w_H) == _ROBUST_W_H:
-        # Function signature default is robust; remap when requesting starlab profile.
+    if profile == "starlab" and float(attraction_weight) == _ROBUST_ATTRACTION:
+        # Function signature default is robust; remap when requesting starlab.
         wh = float(default_wh)
     else:
-        wh = float(w_H)
+        wh = float(attraction_weight)
 
-    if medially_centered_speed_tradeoff is not None:
-        wm = float(medially_centered_speed_tradeoff)
-    elif profile == "starlab" and float(w_M) == _ROBUST_W_M:
+    if profile == "starlab" and float(medial_weight) == _ROBUST_MEDIAL:
         wm = float(default_wm)
     else:
-        wm = float(w_M)
+        wm = float(medial_weight)
 
     gate = default_gate if gate_exterior_poles is None else bool(gate_exterior_poles)
     return wh, wm, gate
 
 
+def _merge_skeletonize_options(
+    *,
+    settings: SkeletonizeSettings | None,
+    params: McfsParams | None,
+    attraction_weight: float | None,
+    medial_weight: float | None,
+    gate_exterior_poles: bool | None,
+    fast_gating: bool | None,
+    use_cholmod: bool | None,
+    profile: McfsProfile | None,
+    branching: BranchingPreference | str | None,
+    max_iterations: int | None,
+    timeout_seconds: float | None,
+    min_edge_length: float | None,
+    max_triangle_angle: float | None,
+    area_variation_factor: float | None,
+    max_vertex_growth: float | None,
+    pinned_attraction_floor: float | None,
+    keep_largest_component: bool | None,
+    resample: bool | ResampleMode | None,
+    resample_spacing: float | None,
+    resample_spacing_frac: float | None,
+    prune_exterior: bool | None,
+    prune_short_leaves: bool | None,
+    short_leaf_scale: float | None,
+    prune_thick_hubs: bool | None,
+    keep_hub_branches: int | None,
+    hub_degree_min: int | None,
+    hub_radius_frac: float | None,
+    extend_tips: bool | None,
+    tip_extend_scale: float | None,
+    tip_clearance_frac: float | None,
+    tip_cone_deg: float | None,
+    validate: bool | None,
+    parameter_search: bool | None,
+    max_search_contracts: int | None,
+) -> tuple[ContractionSettings, RefineSettings, bool, bool, int]:
+    """Merge SkeletonizeSettings / McfsParams / thin kwargs (kwargs win)."""
+    s = settings if settings is not None else SkeletonizeSettings()
+    c = s.contraction
+    r = s.refine
+
+    aw = c.attraction_weight
+    mw = c.medial_weight
+    gate = c.gate_exterior_poles
+    br: BranchingPreference | str = c.branching
+    prof = c.profile
+    fg = c.fast_gating
+    chol = c.use_cholmod
+    max_it = c.max_iterations
+    timeout = c.timeout_seconds
+    min_el = c.min_edge_length
+    max_ang = c.max_triangle_angle
+    area_var = c.area_variation_factor
+    max_vg = c.max_vertex_growth
+    pin_floor = c.pinned_attraction_floor
+
+    if params is not None:
+        aw = params.attraction_weight
+        mw = params.medial_weight
+        gate = params.gate_exterior_poles
+        br = params.branching
+
+    def _pick(override, base):
+        return base if override is None else override
+
+    aw = _pick(attraction_weight, aw)
+    mw = _pick(medial_weight, mw)
+    gate = _pick(gate_exterior_poles, gate)
+    fg = bool(_pick(fast_gating, fg))
+    chol = _pick(use_cholmod, chol)
+    prof = _pick(profile, prof)
+    br = _pick(branching, br)
+    max_it = int(_pick(max_iterations, max_it))
+    timeout = _pick(timeout_seconds, timeout)
+    min_el = _pick(min_edge_length, min_el)
+    max_ang = float(_pick(max_triangle_angle, max_ang))
+    area_var = float(_pick(area_variation_factor, area_var))
+    max_vg = _pick(max_vertex_growth, max_vg)
+    pin_floor = float(_pick(pinned_attraction_floor, pin_floor))
+
+    contraction = ContractionSettings(
+        attraction_weight=float(aw),
+        medial_weight=float(mw),
+        profile=prof,
+        branching=br,  # type: ignore[arg-type]
+        gate_exterior_poles=gate,
+        fast_gating=fg,
+        use_cholmod=chol,
+        max_iterations=max_it,
+        timeout_seconds=timeout,
+        min_edge_length=min_el,
+        max_triangle_angle=max_ang,
+        area_variation_factor=area_var,
+        max_vertex_growth=max_vg,
+        pinned_attraction_floor=pin_floor,
+    )
+
+    refine = RefineSettings(
+        prune_exterior=bool(_pick(prune_exterior, r.prune_exterior)),
+        prune_short_leaves=bool(_pick(prune_short_leaves, r.prune_short_leaves)),
+        short_leaf_scale=float(_pick(short_leaf_scale, r.short_leaf_scale)),
+        prune_thick_hubs=bool(_pick(prune_thick_hubs, r.prune_thick_hubs)),
+        keep_hub_branches=int(_pick(keep_hub_branches, r.keep_hub_branches)),
+        hub_degree_min=int(_pick(hub_degree_min, r.hub_degree_min)),
+        hub_radius_frac=float(_pick(hub_radius_frac, r.hub_radius_frac)),
+        extend_tips=bool(_pick(extend_tips, r.extend_tips)),
+        tip_extend_scale=float(_pick(tip_extend_scale, r.tip_extend_scale)),
+        tip_clearance_frac=float(_pick(tip_clearance_frac, r.tip_clearance_frac)),
+        tip_cone_deg=float(_pick(tip_cone_deg, r.tip_cone_deg)),
+        keep_largest_component=bool(
+            _pick(keep_largest_component, r.keep_largest_component)
+        ),
+        resample=_pick(resample, r.resample),  # type: ignore[arg-type]
+        resample_spacing=_pick(resample_spacing, r.resample_spacing),
+        resample_spacing_frac=_pick(resample_spacing_frac, r.resample_spacing_frac),
+    )
+
+    do_validate = bool(_pick(validate, s.validate))
+    do_search = bool(_pick(parameter_search, s.parameter_search))
+    max_contracts = int(_pick(max_search_contracts, s.max_search_contracts))
+    return contraction, refine, do_validate, do_search, max_contracts
+
+
 @dataclass
 class Skeleton:
-    """1D curve skeleton extracted from a contracted meso-skeleton surface.
+    """1D curve skeleton: nodes and edges describing the medial centerline.
+
+    Produced by contracting the input surface to a thin meso-skeleton, then
+    collapsing that surface to a curve graph (optionally refined).
 
     Attributes
     ----------
@@ -131,6 +277,36 @@ class Skeleton:
     nodes: np.ndarray
     edges: np.ndarray
     graph: nx.Graph
+
+    @classmethod
+    def from_graph(cls, G: nx.Graph) -> "Skeleton":
+        """Build a densely indexed :class:`Skeleton` from a curve graph.
+
+        Parameters
+        ----------
+        G :
+            Undirected graph with node attribute ``pos`` (and optional edge
+            ``weight``). Nodes are relabeled to ``0..n-1``.
+
+        Returns
+        -------
+        Skeleton
+        """
+        H = G.copy()
+        mapping = {n: i for i, n in enumerate(H.nodes)}
+        if mapping:
+            H = nx.relabel_nodes(H, mapping, copy=True)
+        nodes_arr = (
+            np.array([H.nodes[n]["pos"] for n in H.nodes], dtype=float)
+            if H.number_of_nodes()
+            else np.zeros((0, 3))
+        )
+        edges_arr = (
+            np.array([[u, v] for u, v in H.edges], dtype=int)
+            if H.number_of_edges()
+            else np.zeros((0, 2), dtype=int)
+        )
+        return cls(nodes=nodes_arr, edges=edges_arr, graph=H)
 
     def to_polylines(self) -> list[np.ndarray]:
         """Split the skeleton into polylines at junctions (degree ≠ 2).
@@ -344,25 +520,25 @@ class Skeleton:
             fig.show()
         return fig
 
-    def refine(
+    def resample(
         self,
         *,
-        mode: RefineMode = "uniform",
+        mode: ResampleMode = "uniform",
         spacing: float | None = None,
         spacing_frac: float | None = None,
     ) -> "Skeleton":
-        """Return a copy with optional chain merge / arc-length resampling.
+        """Return a copy with arc-length resampling or chain compression.
 
         Parameters
         ----------
         mode, spacing, spacing_frac :
-            Forwarded to :func:`refine_skeleton`.
+            Forwarded to :func:`resample_skeleton`.
 
         Returns
         -------
         Skeleton
         """
-        return refine_skeleton(
+        return resample_skeleton(
             self, mode=mode, spacing=spacing, spacing_frac=spacing_frac
         )
 
@@ -383,44 +559,64 @@ def _coerce_mesh(mesh: Union[tm.Trimesh, object]) -> tm.Trimesh:
 def skeletonize(
     mesh: Union[tm.Trimesh, object],
     *,
-    w_H: float = 0.5,
-    w_M: float = 5.0,
-    quality_speed_tradeoff: float | None = None,
-    medially_centered_speed_tradeoff: float | None = None,
+    settings: SkeletonizeSettings | None = None,
+    params: McfsParams | None = None,
+    attraction_weight: float | None = None,
+    medial_weight: float | None = None,
     gate_exterior_poles: bool | None = None,
-    fast_gating: bool = False,
+    fast_gating: bool | None = None,
     use_cholmod: bool | None = None,
     profile: McfsProfile | None = None,
-    branching: str = "sparse",
-    max_iterations: int = 500,
-    timeout_seconds: float | None = 120.0,
+    branching: BranchingPreference | str | None = None,
+    max_iterations: int | None = None,
+    timeout_seconds: float | None = None,
     min_edge_length: float | None = None,
-    max_triangle_angle: float = 110.0,
-    area_variation_factor: float = 1e-4,
-    keep_largest_component: bool = False,
-    refine: bool | RefineMode = False,
-    refine_spacing: float | None = None,
-    refine_spacing_frac: float | None = None,
-    compress_chains: bool = False,
+    max_triangle_angle: float | None = None,
+    area_variation_factor: float | None = None,
+    max_vertex_growth: float | None = None,
+    pinned_attraction_floor: float | None = None,
+    keep_largest_component: bool | None = None,
+    resample: bool | ResampleMode | None = None,
     resample_spacing: float | None = None,
-    prune_exterior: bool = True,
-    validate: bool = True,
+    resample_spacing_frac: float | None = None,
+    prune_exterior: bool | None = None,
+    prune_short_leaves: bool | None = None,
+    short_leaf_scale: float | None = None,
+    prune_thick_hubs: bool | None = None,
+    keep_hub_branches: int | None = None,
+    hub_degree_min: int | None = None,
+    hub_radius_frac: float | None = None,
+    extend_tips: bool | None = None,
+    tip_extend_scale: float | None = None,
+    tip_clearance_frac: float | None = None,
+    tip_cone_deg: float | None = None,
+    validate: bool | None = None,
+    parameter_search: bool | None = None,
+    max_search_contracts: int | None = None,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
 ) -> Skeleton:
-    """Mean-curvature-flow skeletonization of a closed triangle mesh.
+    """Extract a 1D curve skeleton from a closed triangle mesh.
+
+    Contracts the surface with mean-curvature flow toward the medial axis
+    (Voronoi poles — approximate centerline targets inside the volume), then
+    converts the thin meso-skeleton surface into a curve graph and runs the
+    refine phase (prune / optional tip extension / resample for curve density).
 
     Parameters
     ----------
     mesh :
         Input closed triangle mesh (``trimesh.Trimesh`` or ``MeshManager``).
-    w_H, quality_speed_tradeoff :
-        Quality/speed tradeoff (default 0.5). Alias: ``quality_speed_tradeoff``.
-    w_M, medially_centered_speed_tradeoff :
-        Medial-centering tradeoff (default 5.0). Alias:
-        ``medially_centered_speed_tradeoff``. Used whenever ``w_M > 0``.
+    settings :
+        Optional :class:`~pymcfs.config.SkeletonizeSettings` bundle.
+    params :
+        Optional :class:`~pymcfs.params.McfsParams` (overrides settings weights).
+    attraction_weight, medial_weight :
+        Contraction weights. Attraction keeps vertices from sliding too far;
+        medial pulls toward interior Voronoi poles. Thin kwargs override
+        ``settings`` / ``params``.
     gate_exterior_poles :
-        If True, apply ``w_M`` only for poles inside the mesh (CGAL-style).
+        If True, apply medial weight only for poles inside the mesh.
         Default True for robust profile; False for ``profile=\"starlab\"``.
     fast_gating :
         Use the mesh's Embree ray backend (``pymcfs[embree]``) for pole
@@ -431,11 +627,11 @@ def skeletonize(
         If True, require scikit-sparse CHOLMOD. If False, force SuperLU.
         If None (default), use CHOLMOD when importable.
     profile :
-        ``None`` / ``\"robust\"`` — gated poles, defaults ``w_H=0.5``, ``w_M=5``.
-        ``\"starlab\"`` — ungated poles, ``w_H=0.1``, ``w_M=0.2`` (parity dumps).
+        ``None`` / ``\"robust\"`` — gated poles, defaults ``0.5`` / ``5``.
+        ``\"starlab\"`` — ungated poles, ``0.1`` / ``0.2`` (parity dumps).
         ``\"auto\"`` — mesh-conditioned proposal from :func:`pymcfs.params.propose_mcfs_params`.
     branching :
-        Oracle branching preference when ``profile=\"auto\"``: ``\"sparse\"``
+        Branching preference when ``profile=\"auto\"``: ``\"sparse\"``
         (default, fewest junctions), ``\"balanced\"``, or ``\"dense\"``.
     max_iterations, timeout_seconds :
         Contraction stop limits.
@@ -443,19 +639,47 @@ def skeletonize(
         Remesh thresholds during contraction.
     area_variation_factor :
         Relative area change for convergence (vs initial surface area).
+    max_vertex_growth :
+        Abort when vertex count exceeds ``max_vertex_growth * n0`` (default 4.0).
+    pinned_attraction_floor :
+        Numerical floor for pinned-vertex attraction and remesh short-edge epsilon.
     keep_largest_component :
         If True, keep only the largest connected component of the curve graph.
-    refine, refine_spacing, refine_spacing_frac :
-        Optional post-conversion curve refinement (off by default).
-        ``refine=True`` / ``\"uniform\"`` arc-length resamples chains;
-        ``refine=\"compress\"`` keeps only junctions/leaves.
-    compress_chains, resample_spacing :
-        Legacy aliases for refine when ``refine`` is left False.
+    resample, resample_spacing, resample_spacing_frac :
+        Optional curve-density resampling in the refine phase (off by default).
+        ``resample=True`` / ``\"uniform\"`` arc-length resamples chains;
+        ``resample=\"compress\"`` keeps only junctions/leaves.
+        Distinct from ``parameter_search`` (which re-contracts with nearby weights).
     prune_exterior :
         If True (default), remove dangling curve tips outside the input mesh
         after conversion (see :func:`pymcfs.refine.prune_exterior_branches`).
+    prune_short_leaves :
+        If True (default), mild micro-spur prune
+        (see :func:`pymcfs.refine.prune_short_leaves`).
+    short_leaf_scale :
+        Multiplier for short-leaf pruning (default 1.0).
+    prune_thick_hubs :
+        If True (default), cull extra leaf arms at thick high-degree hubs
+        (see :func:`pymcfs.refine.prune_thick_hubs`).
+    keep_hub_branches, hub_degree_min, hub_radius_frac :
+        Thick-hub prune controls.
+    extend_tips :
+        If True, grow unfinished leaf tips toward lobe ends (default False).
+        Useful for open-ended shapes without end-caps; leave off for general use.
+    tip_extend_scale :
+        Max tip travel as a multiple of bbox diagonal when ``extend_tips``
+        is True (default 1.0).
+    tip_clearance_frac, tip_cone_deg :
+        Tip-extension clearance and cone half-angle.
     validate :
         Run mesh validation before contraction.
+    parameter_search :
+        If True, try a small set of nearby weights and refine-phase settings
+        via :func:`pymcfs.search.search_mcfs_params` and return the best
+        skeleton (~4× contraction cost). Default False. Not the same as
+        ``resample`` (curve post-processing only).
+    max_search_contracts :
+        Cap on contraction trials when ``parameter_search`` is True (default 4).
     verbose, log :
         Progress logging.
 
@@ -473,103 +697,173 @@ def skeletonize(
         lacks a usable mesh.
     ImportError
         If ``use_cholmod=True`` but scikit-sparse CHOLMOD is unavailable.
-
-    Notes
-    -----
-    Contraction uses :class:`~pymcfs.mcfs.MeanCurvatureFlowSkeletonization`
-    with default ``max_vertex_growth=4.0`` (remesh blow-up abort). Tune that
-    guard via the driver class directly.
     """
     _log = log or logger
     m = _coerce_mesh(mesh)
 
+    contraction, refine, do_validate, do_search, max_contracts = (
+        _merge_skeletonize_options(
+            settings=settings,
+            params=params,
+            attraction_weight=attraction_weight,
+            medial_weight=medial_weight,
+            gate_exterior_poles=gate_exterior_poles,
+            fast_gating=fast_gating,
+            use_cholmod=use_cholmod,
+            profile=profile,
+            branching=branching,
+            max_iterations=max_iterations,
+            timeout_seconds=timeout_seconds,
+            min_edge_length=min_edge_length,
+            max_triangle_angle=max_triangle_angle,
+            area_variation_factor=area_variation_factor,
+            max_vertex_growth=max_vertex_growth,
+            pinned_attraction_floor=pinned_attraction_floor,
+            keep_largest_component=keep_largest_component,
+            resample=resample,
+            resample_spacing=resample_spacing,
+            resample_spacing_frac=resample_spacing_frac,
+            prune_exterior=prune_exterior,
+            prune_short_leaves=prune_short_leaves,
+            short_leaf_scale=short_leaf_scale,
+            prune_thick_hubs=prune_thick_hubs,
+            keep_hub_branches=keep_hub_branches,
+            hub_degree_min=hub_degree_min,
+            hub_radius_frac=hub_radius_frac,
+            extend_tips=extend_tips,
+            tip_extend_scale=tip_extend_scale,
+            tip_clearance_frac=tip_clearance_frac,
+            tip_cone_deg=tip_cone_deg,
+            validate=validate,
+            parameter_search=parameter_search,
+            max_search_contracts=max_search_contracts,
+        )
+    )
+
+    if do_search:
+        from .search import search_mcfs_params
+
+        return search_mcfs_params(
+            m,
+            settings=SkeletonizeSettings(
+                contraction=contraction,
+                refine=refine,
+                validate=do_validate,
+                parameter_search=False,
+                max_search_contracts=max_contracts,
+            ),
+            max_search_contracts=max_contracts,
+            verbose=verbose,
+            log=_log,
+        ).skeleton
+
     wh, wm, gate = resolve_mcfs_profile(
-        profile,
-        w_H=w_H,
-        w_M=w_M,
-        gate_exterior_poles=gate_exterior_poles,
-        quality_speed_tradeoff=quality_speed_tradeoff,
-        medially_centered_speed_tradeoff=medially_centered_speed_tradeoff,
+        contraction.profile,
+        attraction_weight=contraction.attraction_weight,
+        medial_weight=contraction.medial_weight,
+        gate_exterior_poles=contraction.gate_exterior_poles,
         mesh=m,
-        branching=branching,
+        branching=contraction.branching,
     )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
 
+    _log.info(
+        "skeletonize: start (max_iters=%d, attraction=%.3g, medial=%.3g, "
+        "gate_poles=%s, profile=%s)",
+        contraction.max_iterations,
+        wh,
+        wm,
+        gate,
+        contraction.profile,
+    )
     driver = MeanCurvatureFlowSkeletonization(
         m,
-        w_H=wh,
-        w_M=wm,
+        attraction_weight=wh,
+        medial_weight=wm,
         gate_exterior_poles=gate,
-        fast_gating=bool(fast_gating),
-        use_cholmod=use_cholmod,
-        min_edge_length=min_edge_length,
-        max_triangle_angle=float(max_triangle_angle),
-        area_variation_factor=float(area_variation_factor),
-        max_iterations=int(max_iterations),
-        timeout_seconds=timeout_seconds,
-        validate=bool(validate),
+        fast_gating=bool(contraction.fast_gating),
+        use_cholmod=contraction.use_cholmod,
+        min_edge_length=contraction.min_edge_length,
+        max_triangle_angle=float(contraction.max_triangle_angle),
+        area_variation_factor=float(contraction.area_variation_factor),
+        max_iterations=int(contraction.max_iterations),
+        timeout_seconds=contraction.timeout_seconds,
+        max_vertex_growth=contraction.max_vertex_growth,
+        pinned_attraction_floor=float(contraction.pinned_attraction_floor),
+        validate=bool(do_validate),
         verbose=verbose,
         log=_log,
     )
-    if verbose:
-        _log.info(
-            "Skeleton: MCFS (max_iters=%d, w_H=%.3g, w_M=%.3g, gate_poles=%s, profile=%s)",
-            max_iterations,
-            wh,
-            wm,
-            gate,
-            profile,
-        )
     driver.contract_until_convergence()
-    return driver.convert_to_skeleton(
-        refine=refine,
-        refine_spacing=refine_spacing,
-        refine_spacing_frac=refine_spacing_frac,
-        compress_chains=bool(compress_chains),
-        resample_spacing=resample_spacing,
-        keep_largest_component=bool(keep_largest_component),
-        prune_exterior=bool(prune_exterior),
+    skel = driver.convert_to_skeleton(
+        resample=refine.resample,
+        resample_spacing=refine.resample_spacing,
+        resample_spacing_frac=refine.resample_spacing_frac,
+        keep_largest_component=bool(refine.keep_largest_component),
+        prune_exterior=bool(refine.prune_exterior),
+        prune_short_leaves=bool(refine.prune_short_leaves),
+        short_leaf_scale=float(refine.short_leaf_scale),
+        prune_thick_hubs=bool(refine.prune_thick_hubs),
+        keep_hub_branches=int(refine.keep_hub_branches),
+        hub_degree_min=int(refine.hub_degree_min),
+        hub_radius_frac=float(refine.hub_radius_frac),
+        extend_tips=bool(refine.extend_tips),
+        tip_extend_scale=float(refine.tip_extend_scale),
+        tip_clearance_frac=float(refine.tip_clearance_frac),
+        tip_cone_deg=float(refine.tip_cone_deg),
     )
+    _log.info(
+        "skeletonize: done (nodes=%d, edges=%d)",
+        skel.nodes.shape[0],
+        skel.edges.shape[0],
+    )
+    return skel
 
 
-def thin_mesh(
+def contract_mesh(
     mesh: Union[tm.Trimesh, object],
     *,
-    w_H: float = 0.5,
-    w_M: float = 5.0,
-    quality_speed_tradeoff: float | None = None,
-    medially_centered_speed_tradeoff: float | None = None,
+    settings: ContractionSettings | SkeletonizeSettings | None = None,
+    params: McfsParams | None = None,
+    attraction_weight: float | None = None,
+    medial_weight: float | None = None,
     gate_exterior_poles: bool | None = None,
-    fast_gating: bool = False,
+    fast_gating: bool | None = None,
     use_cholmod: bool | None = None,
     profile: McfsProfile | None = None,
-    branching: str = "sparse",
-    max_iterations: int = 500,
-    timeout_seconds: float | None = 120.0,
+    branching: BranchingPreference | str | None = None,
+    max_iterations: int | None = None,
+    timeout_seconds: float | None = None,
     min_edge_length: float | None = None,
-    max_triangle_angle: float = 110.0,
-    area_variation_factor: float = 1e-4,
-    validate: bool = True,
+    max_triangle_angle: float | None = None,
+    area_variation_factor: float | None = None,
+    max_vertex_growth: float | None = None,
+    pinned_attraction_floor: float | None = None,
+    validate: bool | None = None,
     verbose: bool = False,
     log: Optional[logging.Logger] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Contract a mesh with MCFS; return the meso-skeleton surface ``(V, F)``.
+    """Contract a closed mesh toward its medial axis; return the meso-skeleton.
 
-    Parameters match :func:`skeletonize` contraction controls (no curve-graph
-    conversion / refine flags). Accepted keyword arguments:
+    The meso-skeleton is still a triangle surface — thinner and more
+    centerline-like than the input — before conversion to a 1D curve.
+    Same contraction controls as :func:`skeletonize` (no curve conversion or
+    refine-phase flags).
 
-    ``w_H``, ``w_M``, ``quality_speed_tradeoff``,
-    ``medially_centered_speed_tradeoff``, ``gate_exterior_poles``,
-    ``fast_gating``, ``use_cholmod``, ``profile``, ``branching``,
-    ``max_iterations``, ``timeout_seconds``, ``min_edge_length``,
-    ``max_triangle_angle``, ``area_variation_factor``, ``validate``,
-    ``verbose``, ``log``.
+    Parameters
+    ----------
+    mesh :
+        Input closed triangle mesh (``trimesh.Trimesh`` or ``MeshManager``).
+    settings, params, attraction_weight, medial_weight, ... :
+        Same contraction meaning as :func:`skeletonize`.
 
     Returns
     -------
     V : (n, 3) float ndarray
+        Contracted vertex positions.
     F : (m, 3) int ndarray
+        Triangle indices of the meso-skeleton surface.
 
     Raises
     ------
@@ -579,45 +873,95 @@ def thin_mesh(
         If validation fails or ``profile`` is invalid.
     ImportError
         If ``use_cholmod=True`` but CHOLMOD is unavailable.
-
-    Notes
-    -----
-    Uses the same remesh-growth abort default (``max_vertex_growth=4.0``) as
-    :func:`skeletonize`.
     """
     _log = log or logger
     m = _coerce_mesh(mesh)
 
-    wh, wm, gate = resolve_mcfs_profile(
-        profile,
-        w_H=w_H,
-        w_M=w_M,
+    if isinstance(settings, SkeletonizeSettings):
+        skel_settings = settings
+    elif isinstance(settings, ContractionSettings):
+        skel_settings = SkeletonizeSettings(contraction=settings)
+    else:
+        skel_settings = None
+
+    contraction, _refine, do_validate, _search, _mc = _merge_skeletonize_options(
+        settings=skel_settings,
+        params=params,
+        attraction_weight=attraction_weight,
+        medial_weight=medial_weight,
         gate_exterior_poles=gate_exterior_poles,
-        quality_speed_tradeoff=quality_speed_tradeoff,
-        medially_centered_speed_tradeoff=medially_centered_speed_tradeoff,
-        mesh=m,
+        fast_gating=fast_gating,
+        use_cholmod=use_cholmod,
+        profile=profile,
         branching=branching,
+        max_iterations=max_iterations,
+        timeout_seconds=timeout_seconds,
+        min_edge_length=min_edge_length,
+        max_triangle_angle=max_triangle_angle,
+        area_variation_factor=area_variation_factor,
+        max_vertex_growth=max_vertex_growth,
+        pinned_attraction_floor=pinned_attraction_floor,
+        keep_largest_component=None,
+        resample=None,
+        resample_spacing=None,
+        resample_spacing_frac=None,
+        prune_exterior=None,
+        prune_short_leaves=None,
+        short_leaf_scale=None,
+        prune_thick_hubs=None,
+        keep_hub_branches=None,
+        hub_degree_min=None,
+        hub_radius_frac=None,
+        extend_tips=None,
+        tip_extend_scale=None,
+        tip_clearance_frac=None,
+        tip_cone_deg=None,
+        validate=validate,
+        parameter_search=False,
+        max_search_contracts=None,
+    )
+
+    wh, wm, gate = resolve_mcfs_profile(
+        contraction.profile,
+        attraction_weight=contraction.attraction_weight,
+        medial_weight=contraction.medial_weight,
+        gate_exterior_poles=contraction.gate_exterior_poles,
+        mesh=m,
+        branching=contraction.branching,
     )
 
     from .mcfs import MeanCurvatureFlowSkeletonization
 
+    _log.info(
+        "contract_mesh: start (max_iters=%d, attraction=%.3g, medial=%.3g)",
+        contraction.max_iterations,
+        wh,
+        wm,
+    )
     driver = MeanCurvatureFlowSkeletonization(
         m,
-        w_H=wh,
-        w_M=wm,
+        attraction_weight=wh,
+        medial_weight=wm,
         gate_exterior_poles=gate,
-        fast_gating=bool(fast_gating),
-        use_cholmod=use_cholmod,
-        min_edge_length=min_edge_length,
-        max_triangle_angle=float(max_triangle_angle),
-        area_variation_factor=float(area_variation_factor),
-        max_iterations=int(max_iterations),
-        timeout_seconds=timeout_seconds,
-        validate=bool(validate),
+        fast_gating=bool(contraction.fast_gating),
+        use_cholmod=contraction.use_cholmod,
+        min_edge_length=contraction.min_edge_length,
+        max_triangle_angle=float(contraction.max_triangle_angle),
+        area_variation_factor=float(contraction.area_variation_factor),
+        max_iterations=int(contraction.max_iterations),
+        timeout_seconds=contraction.timeout_seconds,
+        max_vertex_growth=contraction.max_vertex_growth,
+        pinned_attraction_floor=float(contraction.pinned_attraction_floor),
+        validate=bool(do_validate),
         verbose=verbose,
         log=_log,
     )
     driver.contract_until_convergence()
+    _log.info(
+        "contract_mesh: done (n=%d, f=%d)",
+        driver.V.shape[0],
+        driver.F.shape[0],
+    )
     return driver.V.copy(), driver.F.copy()
 
 
@@ -626,38 +970,53 @@ def curve_skeleton_from_mesh(
     F: np.ndarray,
     *,
     mesh: tm.Trimesh | None = None,
-    refine: bool | RefineMode = False,
-    refine_spacing: float | None = None,
-    refine_spacing_frac: float | None = None,
-    compress_chains: bool = False,
+    resample: bool | ResampleMode = False,
     resample_spacing: float | None = None,
+    resample_spacing_frac: float | None = None,
     keep_largest_component: bool = False,
     prune_exterior: bool = True,
+    prune_short_leaves: bool = True,
+    short_leaf_scale: float = 1.0,
+    prune_thick_hubs: bool = True,
+    keep_hub_branches: int = 2,
+    hub_degree_min: int = 4,
+    hub_radius_frac: float = 0.015,
+    extend_tips: bool = False,
+    tip_extend_scale: float = 1.0,
+    tip_clearance_frac: float = 0.01,
+    tip_cone_deg: float = 40.0,
 ) -> Skeleton:
     """Convert a triangle mesh surface to a 1D curve-graph :class:`Skeleton`.
 
     Parameters
     ----------
     V : (n, 3) float
-        Vertex positions (typically a meso-skeleton from :func:`thin_mesh`).
+        Vertex positions (typically a meso-skeleton from :func:`contract_mesh`).
     F : (m, 3) int
         Triangle indices.
     mesh :
-        Original closed surface used when ``prune_exterior`` is True. If None,
-        exterior pruning is skipped.
-    refine, refine_spacing, refine_spacing_frac, compress_chains, resample_spacing :
+        Original closed surface used when pruning/extending. If None, mesh-based
+        post-steps are skipped.
+    resample, resample_spacing, resample_spacing_frac :
         Same meaning as in :func:`skeletonize`.
     keep_largest_component :
         If True, keep only the largest connected component.
     prune_exterior :
         If True (default) and ``mesh`` is provided, remove exterior dangling tips.
+    prune_short_leaves :
+        If True (default) and ``mesh`` is provided, mild micro-spur prune.
+    short_leaf_scale :
+        Multiplier for short_leaf pruning (default 1.0).
+    prune_thick_hubs, keep_hub_branches, hub_degree_min, hub_radius_frac :
+        Thick-hub principal-branch cull (default on).
+    extend_tips, tip_extend_scale, tip_clearance_frac, tip_cone_deg :
+        Tip extension (default off).
 
     Returns
     -------
     Skeleton
     """
     from .mcfs import meso_surface_to_curve_graph
-    from .refine import prune_exterior_graph
 
     G = meso_surface_to_curve_graph(V, F)
     if keep_largest_component and G.number_of_nodes() > 0:
@@ -666,46 +1025,56 @@ def curve_skeleton_from_mesh(
             G = G.subgraph(max(comps, key=len)).copy()
     if prune_exterior and mesh is not None and G.number_of_nodes() > 0:
         G, _n = prune_exterior_graph(G, mesh)
-    mode, spacing, spacing_frac = resolve_refine_options(
-        refine=refine,
-        refine_spacing=refine_spacing,
-        refine_spacing_frac=refine_spacing_frac,
-        compress_chains=compress_chains,
+    if prune_short_leaves and mesh is not None and G.number_of_nodes() > 0:
+        G, _n = prune_short_leaves_graph(
+            G, mesh, length_scale=float(short_leaf_scale)
+        )
+    if prune_thick_hubs and mesh is not None and G.number_of_nodes() > 0:
+        G, _n = prune_thick_hubs_graph(
+            G,
+            mesh,
+            keep_hub_branches=int(keep_hub_branches),
+            hub_degree_min=int(hub_degree_min),
+            hub_radius_frac=float(hub_radius_frac),
+        )
+    if extend_tips and mesh is not None and G.number_of_nodes() > 0:
+        G, _n = extend_tips_graph(
+            G,
+            mesh,
+            tip_extend_scale=float(tip_extend_scale),
+            tip_clearance_frac=float(tip_clearance_frac),
+            tip_cone_deg=float(tip_cone_deg),
+        )
+    mode, spacing, spacing_frac = resolve_resample_options(
+        resample=resample,
         resample_spacing=resample_spacing,
+        resample_spacing_frac=resample_spacing_frac,
     )
     if mode is not None:
-        G = refine_skeleton_graph(
+        G = resample_skeleton_graph(
             G, mode=mode, spacing=spacing, spacing_frac=spacing_frac
         )
-    mapping = {n: i for i, n in enumerate(G.nodes)}
-    if mapping:
-        G = nx.relabel_nodes(G, mapping, copy=True)
-    nodes_arr = (
-        np.array([G.nodes[n]["pos"] for n in G.nodes], dtype=float)
-        if G.number_of_nodes()
-        else np.zeros((0, 3))
-    )
-    edges_arr = (
-        np.array([[u, v] for u, v in G.edges], dtype=int)
-        if G.number_of_edges()
-        else np.zeros((0, 2), dtype=int)
-    )
-    return Skeleton(nodes=nodes_arr, edges=edges_arr, graph=G)
+    return Skeleton.from_graph(G)
 
 
-# Re-export refine API for stable ``from pymcfs.skeleton import …``
+# Re-export refine-phase API for stable ``from pymcfs.skeleton import …``
 __all__ = [
     "Skeleton",
     "skeletonize",
-    "thin_mesh",
+    "contract_mesh",
     "curve_skeleton_from_mesh",
-    "refine_skeleton",
-    "refine_skeleton_graph",
+    "resample_skeleton",
+    "resample_skeleton_graph",
     "prune_exterior_branches",
     "prune_exterior_graph",
-    "resolve_refine_options",
+    "prune_short_leaves",
+    "prune_short_leaves_graph",
+    "prune_thick_hubs",
+    "prune_thick_hubs_graph",
+    "extend_tips",
+    "extend_tips_graph",
+    "resolve_resample_options",
     "resolve_mcfs_profile",
-    "RefineMode",
+    "ResampleMode",
     "McfsProfile",
-    "_resample_polyline_arc_length",
 ]

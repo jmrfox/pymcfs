@@ -3,25 +3,29 @@
 Demo: load a closed mesh, run MCFS, export polylines, print quality report.
 
 Usage:
-  python scripts/demo_mcfs.py [--mesh PATH] [--outdir PATH] [--backend plotly|matplotlib]
+  uv run python toric_spines/scripts/demo_mcfs.py [--mesh PATH] [--out PATH] [--backend plotly|matplotlib]
 """
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 import trimesh as tm
 
-from pymcfs.mesh import MeshManager
-from pymcfs.skeleton import skeletonize, thin_mesh
-from pymcfs.quality import analyze_skeleton
+from pymcfs import MeshManager, analyze_skeleton, contract_mesh, load_and_repair, skeletonize
+
+logger = logging.getLogger(__name__)
 
 
 def find_default_mesh() -> str | None:
-    root = Path(__file__).resolve().parents[1]
-    search_dirs = [root / "data" / "mesh", root / "data" / "mesh" / "processed"]
+    root = Path(__file__).resolve().parents[2]
+    search_dirs = [
+        root / "toric_spines" / "data" / "mesh",
+        root / "toric_spines" / "data" / "mesh" / "processed",
+    ]
     exts = ("*.obj", "*.ply", "*.stl", "*.off")
     for search_root in search_dirs:
         if not search_root.is_dir():
@@ -72,65 +76,88 @@ def overlay_skeleton_plotly(fig, nodes: np.ndarray, edges: np.ndarray) -> None:
 def main():
     ap = argparse.ArgumentParser(description="pymcfs demo: MCFS + quality report")
     ap.add_argument("--mesh", type=str, default=None)
-    ap.add_argument("--outdir", type=str, default="outputs/demo")
+    ap.add_argument("--out", type=str, default="outputs/demo")
     ap.add_argument("--backend", type=str, default="auto", choices=["auto", "plotly", "matplotlib"])
-    ap.add_argument("--w_H", type=float, default=0.1, help="quality_speed_tradeoff")
-    ap.add_argument("--w_M", type=float, default=0.2, help="medially_centered_speed_tradeoff")
-    ap.add_argument("--iters", type=int, default=500)
+    ap.add_argument(
+        "--attraction-weight",
+        type=float,
+        default=0.1,
+        help="Attraction weight (legacy name: w_H)",
+    )
+    ap.add_argument(
+        "--medial-weight",
+        type=float,
+        default=0.2,
+        help="Medial-centering weight (legacy name: w_M)",
+    )
+    ap.add_argument("--max-iterations", type=int, default=500)
     ap.add_argument("--timeout", type=float, default=120.0, help="wall-clock seconds (0=unlimited)")
+    ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s",
+    )
 
     mesh_path = args.mesh or find_default_mesh()
     if mesh_path is None:
-        print("No mesh found under data/mesh/. Pass --mesh PATH.")
+        logger.error("No mesh found under toric_spines/data/mesh/. Pass --mesh PATH.")
         sys.exit(1)
 
-    outdir = ensure_outdir(args.outdir)
-    mm = MeshManager(verbose=True)
-    m = mm.load_mesh(mesh_path, validate_mcfs=True)
-    print(f"Loaded mesh: {len(m.vertices)} vertices, {len(m.faces)} faces")
+    outdir = ensure_outdir(args.out)
+    m = load_and_repair(mesh_path)
+    mm = MeshManager(m, verbose=args.verbose)
+    logger.info("Loaded mesh: %d vertices, %d faces", len(m.vertices), len(m.faces))
 
     fig = mm.visualize_mesh_3d(title=f"Input: {Path(mesh_path).name}", backend=args.backend)
 
     timeout = None if args.timeout <= 0 else float(args.timeout)
     skel = skeletonize(
         m,
-        w_H=args.w_H,
-        w_M=args.w_M,
-        max_iterations=args.iters,
+        attraction_weight=args.attraction_weight,
+        medial_weight=args.medial_weight,
+        max_iterations=args.max_iterations,
         timeout_seconds=timeout,
-        refine=True,
-        verbose=True,
+        resample=True,
+        validate=False,
+        verbose=args.verbose,
     )
-    print(f"Skeleton: {skel.nodes.shape[0]} nodes, {skel.edges.shape[0]} edges")
+    logger.info("Skeleton: %d nodes, %d edges", skel.nodes.shape[0], skel.edges.shape[0])
 
     report = analyze_skeleton(m, skel)
-    print("Quality:", report.summary())
+    logger.info("Quality: %s", report.summary())
 
     if fig is not None:
         if args.backend in ("auto", "plotly") and fig.__class__.__module__.startswith("plotly"):
             overlay_skeleton_plotly(fig, skel.nodes, skel.edges)
             out_html = outdir / "skeleton_plotly.html"
             fig.write_html(str(out_html))
-            print(f"Wrote {out_html}")
+            logger.info("Wrote %s", out_html)
         else:
             overlay_skeleton_matplotlib(fig, skel.nodes, skel.edges)
             out_png = outdir / "skeleton_matplotlib.png"
             fig.savefig(str(out_png), dpi=150)
-            print(f"Wrote {out_png}")
+            logger.info("Wrote %s", out_png)
 
     skel.write_polylines(str(outdir / "skeleton.polylines.txt"))
-    print(f"Wrote polylines under {outdir}")
+    logger.info("Wrote polylines under %s", outdir)
 
     try:
-        Vt, Ft = thin_mesh(m, w_H=args.w_H, w_M=args.w_M, max_iterations=min(40, args.iters))
+        Vt, Ft = contract_mesh(
+            m,
+            attraction_weight=args.attraction_weight,
+            medial_weight=args.medial_weight,
+            max_iterations=min(40, args.max_iterations),
+            validate=False,
+        )
         mt = tm.Trimesh(vertices=Vt, faces=Ft, process=False)
         mm_thin = MeshManager(mt, verbose=False)
         fig2 = mm_thin.visualize_mesh_3d(title="Meso-skeleton", backend=args.backend)
         if fig2 is not None and not fig2.__class__.__module__.startswith("plotly"):
             fig2.savefig(str(outdir / "thinned_matplotlib.png"), dpi=150)
     except Exception as e:
-        print(f"Thin-mesh viz skipped: {e}")
+        logger.warning("Contract-mesh viz skipped: %s", e)
 
 
 if __name__ == "__main__":

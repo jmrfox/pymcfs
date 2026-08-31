@@ -22,7 +22,8 @@ def example_mesh(
     # Cylinder params
     radius: float = 0.5,
     height: float = 2.0,
-    sections: int | None = 64,
+    sections: int | None = 32,
+    height_sections: int | None = 16,
     # Torus params
     major_radius: float = 1.0,
     minor_radius: float = 0.3,
@@ -32,7 +33,12 @@ def example_mesh(
     transform: np.ndarray | None = None,
     **kwargs,
 ) -> trimesh.Trimesh:
-    """Create a simple demo mesh using trimesh primitives.
+    """Create a simple demo mesh suitable for MCFS experiments.
+
+    The default cylinder is a closed (capped) tube with axial sampling so
+    mean-curvature contraction has enough resolution along the shaft.
+    ``trimesh.creation.cylinder`` alone only samples the end rings, which is
+    too coarse for skeletonization.
 
     Parameters
     ----------
@@ -43,7 +49,9 @@ def example_mesh(
     height : float
         Cylinder height (when kind="cylinder"). Default 2.0.
     sections : int or None
-        Cylinder radial resolution (pie wedges). Default 64.
+        Cylinder radial resolution (pie wedges). Default 32.
+    height_sections : int or None
+        Number of rings along the cylinder axis (including ends). Default 16.
     major_radius : float
         Torus major radius (center of hole to centerline of tube). Default 1.0.
     minor_radius : float
@@ -55,8 +63,7 @@ def example_mesh(
     transform : (4,4) float array, optional
         Transform applied after creation.
     **kwargs : dict
-        Passed through to Trimesh constructor via trimesh.creation.* helpers
-        (e.g., process=False).
+        Passed through to the Trimesh constructor (e.g., process=False).
 
     Returns
     -------
@@ -70,15 +77,17 @@ def example_mesh(
     """
     k = (kind or "cylinder").lower()
     if k == "cylinder":
-        return trimesh.creation.cylinder(
+        mesh = _closed_cylinder(
             radius=float(radius),
             height=float(height),
-            sections=None if sections is None else int(sections),
-            transform=transform,
+            radial_sections=32 if sections is None else int(sections),
+            height_sections=16 if height_sections is None else int(height_sections),
             **kwargs,
         )
+        if transform is not None:
+            mesh.apply_transform(np.asarray(transform, dtype=float))
+        return mesh
     elif k == "torus":
-        # trimesh.creation.torus parameters
         return trimesh.creation.torus(
             major_radius=float(major_radius),
             minor_radius=float(minor_radius),
@@ -89,6 +98,62 @@ def example_mesh(
         )
     else:
         raise ValueError("example_mesh kind must be 'cylinder' or 'torus'")
+
+
+def _closed_cylinder(
+    radius: float = 0.5,
+    height: float = 2.0,
+    *,
+    radial_sections: int = 32,
+    height_sections: int = 16,
+    **kwargs,
+) -> trimesh.Trimesh:
+    """Watertight cylinder with caps and multiple rings along the axis."""
+    rs = int(radial_sections)
+    hs = int(height_sections)
+    if rs < 3:
+        raise ValueError("radial_sections must be >= 3")
+    if hs < 2:
+        raise ValueError("height_sections must be >= 2")
+
+    angles = np.linspace(0.0, 2.0 * np.pi, rs, endpoint=False)
+    zs = np.linspace(-0.5 * height, 0.5 * height, hs)
+    ring = np.column_stack([radius * np.cos(angles), radius * np.sin(angles)])
+    verts: list[list[float]] = []
+    for z in zs:
+        for x, y in ring:
+            verts.append([float(x), float(y), float(z)])
+    top_c = len(verts)
+    verts.append([0.0, 0.0, 0.5 * height])
+    bot_c = len(verts)
+    verts.append([0.0, 0.0, -0.5 * height])
+    V = np.asarray(verts, dtype=float)
+
+    faces: list[list[int]] = []
+    for i in range(hs - 1):
+        for j in range(rs):
+            j2 = (j + 1) % rs
+            a = i * rs + j
+            b = i * rs + j2
+            c = (i + 1) * rs + j2
+            d = (i + 1) * rs + j
+            faces.append([a, b, c])
+            faces.append([a, c, d])
+    base_top = (hs - 1) * rs
+    for j in range(rs):
+        j2 = (j + 1) % rs
+        faces.append([base_top + j, base_top + j2, top_c])
+    for j in range(rs):
+        j2 = (j + 1) % rs
+        faces.append([j2, j, bot_c])
+
+    process = kwargs.pop("process", True)
+    mesh = trimesh.Trimesh(
+        vertices=V, faces=np.asarray(faces, dtype=int), process=process, **kwargs
+    )
+    if not mesh.is_watertight:
+        mesh.fix_normals()
+    return mesh
 
 
 class MeshManager:
@@ -132,13 +197,11 @@ class MeshManager:
     def log(self, message: str, level: str = "INFO"):
         """Compatibility shim: delegate to module logger respecting self.verbose.
 
-        Levels: INFO, SUCCESS (maps to INFO), WARNING, ERROR, PROCESSING (maps to INFO)
+        Levels: INFO, WARNING, ERROR (unknown levels map to INFO).
         """
         if not self.verbose:
             return
         lvl = level.upper()
-        if lvl in ("SUCCESS", "PROCESSING"):
-            lvl = "INFO"
         if lvl == "INFO":
             logger.info(message)
         elif lvl == "WARNING":
@@ -784,13 +847,13 @@ class MeshManager:
 
         return results
 
-    def print_mesh_analysis(self, verbose: bool = False) -> None:
-        """Analyze a mesh and print a formatted report of its properties.
+    def log_mesh_analysis(self, verbose: bool = False) -> None:
+        """Analyze a mesh and log a formatted report of its properties.
 
         Parameters
         ----------
         verbose :
-            Print additional detail when True.
+            Log additional detail when True.
         """
         analysis = self.analyze_mesh()
 
@@ -1161,10 +1224,10 @@ class MeshManager:
             return fig
 
         except ImportError:
-            print("Plotly not available")
+            logger.warning("Plotly not available")
             return None
         except Exception as e:
-            print(f"Plotly visualization failed: {e}")
+            logger.warning("Plotly visualization failed: %s", e)
             return None
 
     def _visualize_mesh_matplotlib(self, title, color, show_axes, show_wireframe):
@@ -1192,9 +1255,9 @@ class MeshManager:
             ax.set_ylim(vertices[:, 1].min(), vertices[:, 1].max())
             ax.set_zlim(vertices[:, 2].min(), vertices[:, 2].max())
 
-            ax.set_xlabel("X (µm)")
-            ax.set_ylabel("Y (µm)")
-            ax.set_zlabel("Z (µm)")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.set_zlabel("Z")
             ax.set_title(title)
 
             if not show_axes:
@@ -1204,10 +1267,10 @@ class MeshManager:
             return fig
 
         except ImportError:
-            print("Matplotlib not available")
+            logger.warning("Matplotlib not available")
             return None
         except Exception as e:
-            print(f"Matplotlib visualization failed: {e}")
+            logger.warning("Matplotlib visualization failed: %s", e)
             return None
 
     def visualize_mesh_slice_interactive(
@@ -1244,7 +1307,7 @@ class MeshManager:
         try:
             import plotly.graph_objects as go
         except ImportError:
-            print("Plotly is required for interactive visualization")
+            logger.warning("Plotly is required for interactive visualization")
             return None
 
         mesh = self.mesh
@@ -1480,7 +1543,7 @@ class MeshManager:
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
         except ImportError:
-            print("Plotly not available for slice grid visualization")
+            logger.warning("Plotly not available for slice grid visualization")
             return None
 
         mesh = self.mesh
@@ -1545,8 +1608,8 @@ class MeshManager:
 
                 # Set equal aspect ratio for each subplot
                 fig.update_xaxes(scaleanchor="y", scaleratio=1, row=row, col=col)
-                fig.update_xaxes(title_text="X (µm)", row=row, col=col)
-                fig.update_yaxes(title_text="Y (µm)", row=row, col=col)
+                fig.update_xaxes(title_text="X", row=row, col=col)
+                fig.update_yaxes(title_text="Y", row=row, col=col)
 
             except Exception as e:
                 # If slicing fails, just leave subplot empty

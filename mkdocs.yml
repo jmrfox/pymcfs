@@ -62,7 +62,7 @@ nav:
       - Quick start: getting-started/quickstart.md
   - User guide:
       - Profiles and weights: guide/profiles.md
-      - Parameter oracle: guide/oracle.md
+      - Parameter proposals: guide/oracle.md
       - Quality and sweeps: guide/quality.md
       - Notebooks: guide/notebooks.md
       - Starlab parity: guide/parity.md

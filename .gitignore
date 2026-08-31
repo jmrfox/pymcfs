@@ -36,7 +36,7 @@ site/
 
 # Starlab reference (clone locally; nested git repo — not vendored in pymcfs)
 _ref_starlab-mcfskel/
-fixtures/parity/**/_starlab_work/
+dev/fixtures/parity/**/_starlab_work/
 
 # Regenerated pymcfs meso dumps can be large; keep poles/skeleton when committed intentionally
 # (do not ignore fixtures/parity/**/pymcfs/poles.* — Stage 1 gate uses them)

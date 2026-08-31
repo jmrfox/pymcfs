@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Grid-search MCFS (w_H, w_M) and score skeletons.
+"""Grid-search MCFS (attraction_weight, medial_weight) and score skeletons.
 
-Sweeps in (scale, ratio) space with ``w_M = ratio * w_H`` to avoid the unstable
-low-``w_H`` / high-``w_M`` corner. Ranks trials with :func:`pymcfs.quality.score_skeleton`
-(topology match, containment, compactness) and early-aborts remesh blow-ups.
+Sweeps in (scale, ratio) space with ``medial_weight = ratio * attraction_weight``
+to avoid the unstable low-attraction / high-medial corner. Ranks trials with
+:func:`pymcfs.quality.score_skeleton` (topology match, containment, compactness)
+and early-aborts remesh blow-ups.
 
 Usage:
-  uv run python scripts/sweep_mcfs_params.py --mesh data/mesh/TS2.obj
-  uv run python scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1 --top-k 3
-  uv run python scripts/sweep_mcfs_params.py --mesh ts2 --w-H 0.5,1.0 --ratios 5,10
+  uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh toric_spines/data/mesh/TS2.obj
+  uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1 --top-k 3
+  uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2 --attraction-weight 0.5,1.0 --ratios 5,10
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import sys
 import time
 from pathlib import Path
@@ -21,21 +23,27 @@ from pathlib import Path
 import numpy as np
 import trimesh as tm
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
-from pymcfs.params import mesh_mcfs_features, propose_mcfs_params
-from pymcfs.quality import analyze_skeleton, score_skeleton
+from pymcfs import (
+    MeanCurvatureFlowSkeletonization,
+    analyze_skeleton,
+    mesh_mcfs_features,
+    propose_mcfs_params,
+    score_skeleton,
+)
+
+logger = logging.getLogger(__name__)
 
 MESH_PRESETS = {
-    "ts1": ROOT / "data" / "mesh" / "TS1.obj",
-    "ts2": ROOT / "data" / "mesh" / "TS2.obj",
-    "ts76": ROOT / "data" / "mesh" / "TS76.obj",
+    "ts1": ROOT / "toric_spines" / "data" / "mesh" / "TS1.obj",
+    "ts2": ROOT / "toric_spines" / "data" / "mesh" / "TS2.obj",
+    "ts76": ROOT / "toric_spines" / "data" / "mesh" / "TS76.obj",
 }
 
-DEFAULT_W_H = (0.25, 0.5, 1.0, 2.0)
+DEFAULT_ATTRACTION = (0.25, 0.5, 1.0, 2.0)
 DEFAULT_RATIOS = (2.0, 5.0, 10.0, 20.0)
 
 
@@ -63,8 +71,8 @@ def _load_mesh(path: Path) -> tm.Trimesh:
 def _run_trial(
     mesh: tm.Trimesh,
     *,
-    w_H: float,
-    w_M: float,
+    attraction_weight: float,
+    medial_weight: float,
     max_iterations: int,
     timeout_seconds: float | None,
     max_vertex_growth: float,
@@ -72,8 +80,8 @@ def _run_trial(
     t0 = time.perf_counter()
     driver = MeanCurvatureFlowSkeletonization(
         mesh,
-        w_H=float(w_H),
-        w_M=float(w_M),
+        attraction_weight=float(attraction_weight),
+        medial_weight=float(medial_weight),
         gate_exterior_poles=True,
         max_iterations=int(max_iterations),
         timeout_seconds=timeout_seconds,
@@ -92,7 +100,7 @@ def _run_trial(
     report = None
     score = None
     if not aborted and not nonfinite and driver.V.shape[0] > 0 and driver.F.shape[0] > 0:
-        skel = driver.convert_to_skeleton(refine=False)
+        skel = driver.convert_to_skeleton(resample=False)
         report = analyze_skeleton(mesh, skel)
         score = score_skeleton(
             report,
@@ -103,7 +111,7 @@ def _run_trial(
         )
     else:
         # Minimal empty report for reject scoring.
-        from pymcfs.quality import SkeletonQualityReport
+        from pymcfs import SkeletonQualityReport
 
         report = SkeletonQualityReport(
             n_nodes=0,
@@ -124,9 +132,9 @@ def _run_trial(
 
     elapsed = time.perf_counter() - t0
     row = {
-        "w_H": w_H,
-        "w_M": w_M,
-        "ratio": w_M / w_H if w_H else float("nan"),
+        "attraction_weight": attraction_weight,
+        "medial_weight": medial_weight,
+        "ratio": medial_weight / attraction_weight if attraction_weight else float("nan"),
         "iters": iters,
         "n0": n0,
         "n_final": int(driver.V.shape[0]),
@@ -156,8 +164,8 @@ def _run_trial(
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
     fields = [
-        "w_H",
-        "w_M",
+        "attraction_weight",
+        "medial_weight",
         "ratio",
         "iters",
         "n0",
@@ -190,7 +198,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 def sweep_mesh(
     mesh_path: Path,
     *,
-    w_H_values: list[float],
+    attraction_weights: list[float],
     ratios: list[float],
     max_iterations: int,
     timeout_seconds: float | None,
@@ -205,51 +213,64 @@ def sweep_mesh(
 
     feats = mesh_mcfs_features(mesh)
     proposed = propose_mcfs_params(mesh, features=feats)
-    print(f"=== {name} ===")
-    print(f"  features: {feats.summary()}")
-    print(f"  oracle:   {proposed.summary()}")
+    logger.info("=== %s ===", name)
+    logger.info("  features: %s", feats.summary())
+    logger.info("  oracle:   %s", proposed.summary())
 
     rows: list[dict] = []
-    for wh in w_H_values:
+    for aw in attraction_weights:
         for r in ratios:
-            wm = float(wh) * float(r)
-            print(f"  trial w_H={wh:g} w_M={wm:g} (r={r:g}) ...", flush=True)
+            mw = float(aw) * float(r)
+            logger.info(
+                "  trial attraction_weight=%g medial_weight=%g (r=%g) ...",
+                aw,
+                mw,
+                r,
+            )
             row = _run_trial(
                 mesh,
-                w_H=float(wh),
-                w_M=wm,
+                attraction_weight=float(aw),
+                medial_weight=mw,
                 max_iterations=max_iterations,
                 timeout_seconds=timeout_seconds,
                 max_vertex_growth=max_vertex_growth,
             )
-            print(
-                f"    score={row['score']:.4g} rejected={row['rejected']} "
-                f"growth={row['growth']:.2f} junctions={row['n_junctions']} "
-                f"outside={row['n_nodes_outside']} ({row['elapsed_s']:.1f}s)",
-                flush=True,
+            logger.info(
+                "    score=%.4g rejected=%s growth=%.2f junctions=%s "
+                "outside=%s (%.1fs)",
+                row["score"],
+                row["rejected"],
+                row["growth"],
+                row["n_junctions"],
+                row["n_nodes_outside"],
+                row["elapsed_s"],
             )
             rows.append(row)
 
     rows_sorted = sorted(rows, key=lambda r: float(r["score"]), reverse=True)
     csv_path = case_dir / "sweep.csv"
     _write_csv(csv_path, rows_sorted)
-    print(f"  wrote {csv_path}")
+    logger.info("  wrote %s", csv_path)
 
     for i, row in enumerate(rows_sorted[: max(0, top_k)]):
         skel = row.get("skel")
         if skel is None:
             continue
         out = case_dir / (
-            f"top{i + 1}_wH{row['w_H']:g}_wM{row['w_M']:g}.polylines.txt"
+            f"top{i + 1}_aw{row['attraction_weight']:g}_"
+            f"mw{row['medial_weight']:g}.polylines.txt"
         )
         skel.write_polylines(str(out))
-        print(f"  top-{i + 1} polylines -> {out} score={row['score']:.4g}")
+        logger.info("  top-%d polylines -> %s score=%.4g", i + 1, out, row["score"])
 
     if rows_sorted:
         best = rows_sorted[0]
-        print(
-            f"  BEST: w_H={best['w_H']:g} w_M={best['w_M']:g} "
-            f"score={best['score']:.4g} {best.get('reject_reason') or ''}"
+        logger.info(
+            "  BEST: attraction_weight=%g medial_weight=%g score=%.4g %s",
+            best["attraction_weight"],
+            best["medial_weight"],
+            best["score"],
+            best.get("reject_reason") or "",
         )
     return rows_sorted
 
@@ -263,16 +284,16 @@ def main() -> int:
         help="Mesh path or preset (ts1, ts2, ts76). Repeatable. Default: ts2",
     )
     ap.add_argument(
-        "--w-H",
+        "--attraction-weight",
         type=str,
-        default=",".join(str(x) for x in DEFAULT_W_H),
-        help="Comma-separated w_H scales",
+        default=",".join(str(x) for x in DEFAULT_ATTRACTION),
+        help="Comma-separated attraction_weight scales (legacy: w_H)",
     )
     ap.add_argument(
         "--ratios",
         type=str,
         default=",".join(str(x) for x in DEFAULT_RATIOS),
-        help="Comma-separated w_M/w_H ratios",
+        help="Comma-separated medial_weight/attraction_weight ratios",
     )
     ap.add_argument("--max-iterations", type=int, default=500)
     ap.add_argument("--timeout", type=float, default=180.0)
@@ -284,21 +305,27 @@ def main() -> int:
         default=ROOT / "outputs" / "sweeps",
         help="Output directory root",
     )
+    ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s",
+    )
+
     specs = args.mesh or ["ts2"]
-    w_H_values = _parse_floats(args.w_H)
+    attraction_weights = _parse_floats(args.attraction_weight)
     ratios = _parse_floats(args.ratios)
     timeout = args.timeout if args.timeout > 0 else None
 
     for spec in specs:
         path = _resolve_mesh(spec)
         if not path.exists():
-            print(f"missing mesh: {path}", file=sys.stderr)
+            logger.error("missing mesh: %s", path)
             return 1
         sweep_mesh(
             path,
-            w_H_values=w_H_values,
+            attraction_weights=attraction_weights,
             ratios=ratios,
             max_iterations=args.max_iterations,
             timeout_seconds=timeout,

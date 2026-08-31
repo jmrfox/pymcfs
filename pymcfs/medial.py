@@ -1,9 +1,18 @@
-"""Medial-axis / Voronoi pole helpers used by the MCFS driver (internal)."""
+"""Voronoi-pole (medial-axis target) helpers used during MCFS contraction.
+
+Poles are per-vertex points near the medial axis inside the volume; medial
+weight pulls surface vertices toward them so the meso-skeleton stays centered.
+"""
 from __future__ import annotations
+
+import logging
 
 import numpy as np
 import trimesh as tm
 from scipy.spatial import Voronoi
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def points_inside_mesh(
@@ -13,10 +22,9 @@ def points_inside_mesh(
 
     ``mesh.contains`` silently switches to Embree whenever ``embreex`` is
     importable, and Embree traces in single precision. On meshes whose
-    coordinates sit far from the origin (TS neuron meshes span ~5.7e3 to
-    ~8.0e3) that loses enough precision to flip the majority of pole gating
-    decisions, so the exact float64 traverser is the default and the fast
-    backend has to be requested explicitly.
+    coordinates sit far from the origin that loses enough precision to flip
+    the majority of pole gating decisions, so the exact float64 traverser is
+    the default and the fast backend has to be requested explicitly.
 
     Parameters
     ----------
@@ -45,12 +53,11 @@ def points_inside_mesh(
 
 
 def compute_voronoi_poles(mesh: tm.Trimesh, *, use_vertex_normals: bool = True) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-vertex medial (inner Voronoi) poles for guidance.
+    """Compute per-vertex medial (inner Voronoi) poles for contraction guidance.
 
-    Compatible with Starlab ``mcfskel`` / ``QhullVoronoiHelper``: retain finite
-    Voronoi loci inside the input bounding box, then choose the locus in each
-    vertex's Voronoi cell with the most negative projection along the surface
-    normal.
+    A Voronoi pole is a point in the vertex's Voronoi cell chosen as a
+    medial-axis target: the finite locus farthest inward along the surface
+    normal. Compatible with Starlab ``mcfskel`` / ``QhullVoronoiHelper``.
 
     Parameters
     ----------
@@ -143,4 +150,9 @@ def compute_voronoi_poles(mesh: tm.Trimesh, *, use_vertex_normals: bool = True) 
         if wmax > 0:
             weights = weights / wmax
 
+    logger.debug(
+        "compute_voronoi_poles: n=%d weighted=%d",
+        n,
+        int(np.count_nonzero(weights > 0)),
+    )
     return targets, weights

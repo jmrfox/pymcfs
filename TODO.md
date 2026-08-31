@@ -77,7 +77,7 @@ Pages under `docs/`; config in `mkdocs.yml`. README stays a short landing page.
 ## 5. Packaging / release
 
 - [x] Lean `pyproject.toml`, version `0.1.0`
-- [x] Wheel contains only `pymcfs/`; sdist excludes `data/`, `notebooks/`, fixtures
+- [x] Wheel contains only `pymcfs/`; sdist excludes `dev/`, `toric_spines/`, etc.
 - [x] CI workflow: `.github/workflows/ci.yml` (`pytest -m "not e2e"`)
 - [ ] Tag `v1.0.0` after §3 gates
 - [ ] Optional: publish to PyPI
@@ -101,7 +101,7 @@ Pages under `docs/`; config in `mkdocs.yml`. README stays a short landing page.
 uv sync --extra cholmod --group dev
 uv run pytest -m "not e2e" -q
 uv run pytest -m e2e -q
-uv run python scripts/bench_mcfs_iter.py --mesh ts1 --iters 5 --profile
-uv run python scripts/sweep_mcfs_params.py --mesh ts2
-uv run python scripts/compare_starlab_parity.py --case sindorelax
+uv run python dev/scripts/bench_mcfs_iter.py --mesh ts1 --iters 5 --profile
+uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2
+uv run python dev/scripts/compare_starlab_parity.py --case sindorelax
 ```

@@ -1,7 +1,10 @@
 # Benchmarks
 
-Recorded with `uv run python scripts/bench_mcfs_iter.py --profile` on Aug 2026.
+Recorded with `uv run python dev/scripts/bench_mcfs_iter.py --profile` on Aug 2026.
 Machine: WSL2, numba 0.66, CHOLMOD present, `embreex` absent.
+
+Bench and parity tooling under `dev/` (and TS meshes under `toric_spines/`) live
+on **`main` only** — not on the public `release` branch.
 
 ## Attribution fix (read this before trusting older numbers)
 
@@ -12,7 +15,7 @@ as "collapse" and "split" time, which is why the notes here previously claimed
 `contains` was "<1% of runtime" and why several rounds of optimization went
 into remeshing instead.
 
-Gating was in fact **74-80% of wall clock**. `scripts/bench_mcfs_iter.py` now
+Gating was in fact **74-80% of wall clock**. `dev/scripts/bench_mcfs_iter.py` now
 patches `pymcfs.mcfs.points_inside_mesh`, bills gating to its own phase, and
 reports collapse/split net of it. Do not remove that separation.
 
@@ -22,13 +25,13 @@ Mean ms per `contract()` iteration, 5-iteration run:
 
 | Mesh | Before | After | Speedup |
 |------|--------|-------|---------|
-| TS1 (`data/mesh/TS1.obj`, n≈2.4k) | 2033 | **287** | 7.1x |
-| sindorelax (`fixtures/parity/sindorelax/input.off`, n≈12k) | 16200 | **601** | 27x |
+| TS1 (`toric_spines/data/mesh/TS1.obj`, n≈2.4k) | 2033 | **287** | 7.1x |
+| sindorelax (`dev/fixtures/parity/sindorelax/input.off`, n≈12k) | 16200 | **601** | 27x |
 
 End-to-end TS1 `contract_until_convergence()`: **141 s -> 30 s** over the same
 49 iterations, producing a bit-identical meso surface (n=4794, f=9620) and
 curve graph (875 nodes, 881 edges). `tests/test_parity.py` and
-`scripts/compare_starlab_parity.py --case sindorelax` are unchanged.
+`dev/scripts/compare_starlab_parity.py --case sindorelax` are unchanged.
 
 ### Phase breakdown, after
 
@@ -88,13 +91,14 @@ asserts exact equality against the Python pass across 4 meshes x 3 thresholds;
 the Python helpers in `remesh.py` are kept as that reference.
 
 **Smaller, exact wins.** `AtA` is assembled directly as
-`L_w.T @ L_w + diag(w_H²) + diag(w_M²)` instead of building a `(3n, n)` stack
-and transposing it, with terms combined in the stacked product's order so the
-result is bit-identical; the Laplacian is row-scaled through CSR `data` instead
-of three sparse ops; the `detect_degeneracies` length prefilter is vectorized;
-and the duplicate `select_obtuse_split_batch` / `split_face_on_edge_numba`
-definitions in `topology.py` (each defined twice, the second shadowing the
-first) are gone, with the kernel now actually wired into `split_obtuse_faces`.
+`L_w.T @ L_w + diag(attraction_weight²) + diag(medial_weight²)` instead of
+building a `(3n, n)` stack and transposing it, with terms combined in the
+stacked product's order so the result is bit-identical; the Laplacian is
+row-scaled through CSR `data` instead of three sparse ops; the
+`detect_degeneracies` length prefilter is vectorized; and the duplicate
+`select_obtuse_split_batch` / `split_face_on_edge_numba` definitions in
+`topology.py` (each defined twice, the second shadowing the first) are gone,
+with the kernel now actually wired into `split_obtuse_faces`.
 
 ## The remaining bottleneck: pole containment
 
@@ -119,7 +123,7 @@ poles and is **165x** faster.
 So `pymcfs` no longer routes gating through `mesh.contains`. `points_inside_mesh`
 in `pymcfs/medial.py` uses the exact float64 traverser by default, and the fast
 backend is opt-in via `fast_gating=True` on the driver, `skeletonize` and
-`thin_mesh`, with `pymcfs[embree]` installed. Only enable it for meshes at
+`contract_mesh`, with `pymcfs[embree]` installed. Only enable it for meshes at
 unit-ish scale near the origin.
 `test_gating_defaults_to_exact_float64_backend` guards the default.
 
@@ -132,13 +136,14 @@ cannot be deduplicated.
 ## Out of scope
 
 CHOLMOD reports `rcond ~ 2.5e-15` "nearly singular" on TS1. That comes from
-pinned vertices getting `w_H = 1/zero_TH = 1e7`, which becomes `1e14` in `AtA`.
-It is a conditioning issue, not a performance one, and predates this work.
+pinned vertices getting
+`attraction_weight = 1/pinned_attraction_floor = 1e7`, which becomes `1e14` in
+`AtA`. It is a conditioning issue, not a performance one, and predates this work.
 
 ## Commands
 
 ```bash
-uv run python scripts/bench_mcfs_iter.py --profile --iters 5
-uv run python scripts/bench_mcfs_iter.py --mesh ts1 --profile --iters 5
-uv run python scripts/bench_mcfs_iter.py --iters 5 --no-cholmod
+uv run python dev/scripts/bench_mcfs_iter.py --profile --iters 5
+uv run python dev/scripts/bench_mcfs_iter.py --mesh ts1 --profile --iters 5
+uv run python dev/scripts/bench_mcfs_iter.py --iters 5 --no-cholmod
 ```

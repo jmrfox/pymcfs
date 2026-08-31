@@ -16,13 +16,13 @@
 # %% [markdown]
 # # TS mesh MCFS skeletonization
 #
-# Skeletonize one `TS*.obj` mesh from `data/mesh/` and inspect intermediate stages:
+# Skeletonize one `TS*.obj` mesh from `toric_spines/data/mesh/` and inspect intermediate stages:
 #
 # 1. choose / load / validate (repair if needed)
 # 2. Voronoi medial poles
 # 3. MCFS contraction with progress curves + meso snapshots
 # 4. raw curve skeleton + topology stats
-# 5. optional refinement
+# 5. optional resample (curve density); refine phase also includes prune/extend
 # 6. quality report and export
 #
 # Change `TS_NAME` below (e.g. `"TS2"`, `"TS24"`).
@@ -44,30 +44,30 @@ from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
 from pymcfs.medial import compute_voronoi_poles
 from pymcfs.mesh import MeshManager
 from pymcfs.quality import analyze_skeleton
-from pymcfs.skeleton import Skeleton, refine_skeleton
+from pymcfs.skeleton import Skeleton, resample_skeleton
 from pymcfs.validate import validate_mcfs_mesh
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("pymcfs.ts_skeleton")
 
-ROOT = Path("..").resolve() if Path.cwd().name == "notebooks" else Path.cwd()
-DATA = ROOT / "data" / "mesh"
+ROOT = Path("../..").resolve() if Path.cwd().name == "notebooks" else Path.cwd()
+DATA = ROOT / "toric_spines" / "data" / "mesh"
 OUT = ROOT / "outputs" / "polylines"
 OUT.mkdir(parents=True, exist_ok=True)
 
 # --- choose mesh ---
-TS_NAME = "TS3" 
+TS_NAME = "TS4" 
 REPAIR_IF_NEEDED = True
 
 # MCFS weights: robust defaults (0.5 / 5.0), or set USE_ORACLE=True for
 # mesh-conditioned proposals (see pymcfs.params.propose_mcfs_params).
 # branching="sparse" (default) snaps TS1-like meshes to robust and prefers
 # fewer junctions on thick fragments — best for neuroscience centerlines.
-USE_ORACLE = True
+USE_ORACLE = True    # mesh-conditioned proposals for attraction_weight / medial_weight
 ORACLE_BRANCHING = "sparse"  # "sparse" | "balanced" | "dense"
-W_H = 0.5
-W_M = 5.0
-GATE_EXTERIOR_POLES = True  # CGAL: w_M only when pole is inside the mesh
+ATTRACTION_WEIGHT = 0.1
+MEDIAL_WEIGHT = 0.1
+GATE_EXTERIOR_POLES = True  # CGAL: medial_weight only when pole is inside the mesh
 MAX_ITERS = 500
 TIMEOUT_S = 180.0
 SNAPSHOT_EVERY = 10  # print + keep meso mesh every N iters (and always iter 1)
@@ -157,7 +157,7 @@ fig_input
 # %% [markdown]
 # ## 2. Voronoi medial poles
 #
-# Inner Voronoi poles feed the `w_M` attraction term (set `W_M=0` to disable).
+# Inner Voronoi poles feed the `medial_weight` attraction term (set `MEDIAL_WEIGHT=0` to disable).
 
 # %%
 poles, pole_weights = compute_voronoi_poles(mesh)
@@ -238,7 +238,7 @@ fig_off
 #
 # `contract_geometry → collapse_edges → split_faces → detect_degeneracies`
 #
-# Exterior Voronoi poles get `w_M = 0` when `GATE_EXTERIOR_POLES` is True
+# Exterior Voronoi poles get `medial_weight = 0` when `GATE_EXTERIOR_POLES` is True
 # (CGAL `Side_of_triangle_mesh` / `ON_BOUNDED_SIDE`). That prevents medial
 # attraction from pulling branches outside the surface on complex TS meshes.
 #
@@ -250,14 +250,17 @@ if USE_ORACLE:
     from pymcfs import propose_mcfs_params
 
     _proposed = propose_mcfs_params(mesh, branching=ORACLE_BRANCHING)
-    W_H, W_M = float(_proposed.w_H), float(_proposed.w_M)
+    ATTRACTION_WEIGHT, MEDIAL_WEIGHT = (
+        float(_proposed.attraction_weight),
+        float(_proposed.medial_weight),
+    )
     GATE_EXTERIOR_POLES = bool(_proposed.gate_exterior_poles)
     print(f"oracle: {_proposed.summary()}")
 
 driver = MeanCurvatureFlowSkeletonization(
     mesh,
-    w_H=W_H,
-    w_M=W_M,
+    attraction_weight=ATTRACTION_WEIGHT,
+    medial_weight=MEDIAL_WEIGHT,
     gate_exterior_poles=GATE_EXTERIOR_POLES,
     max_iterations=MAX_ITERS,
     timeout_seconds=TIMEOUT_S,
@@ -273,7 +276,8 @@ n_poles_valid = int(driver.pole_valid.sum()) if driver.pole_valid.size else 0
 print(
     f"start: n={driver.V.shape[0]} f={driver.F.shape[0]} "
     f"area0={area0:.4g} min_edge={driver._min_edge:.4g} "
-    f"w_H={W_H} w_M={W_M} gate_poles={GATE_EXTERIOR_POLES} "
+    f"attraction_weight={ATTRACTION_WEIGHT} medial_weight={MEDIAL_WEIGHT} "
+    f"gate_poles={GATE_EXTERIOR_POLES} "
     f"poles_valid={n_poles_valid}/{driver.V.shape[0]}"
 )
 
@@ -466,7 +470,7 @@ def _summarize_skeleton(skel: Skeleton, label: str) -> dict:
     return info
 
 
-skel_raw = driver.convert_to_skeleton(refine=False)
+skel_raw = driver.convert_to_skeleton(resample=False)
 raw_info = _summarize_skeleton(skel_raw, "raw")
 skel_raw.write_cg(str(case_out / "skeleton_raw.cg"))
 skel_raw.write_polylines(str(case_out / "skeleton_raw.polylines.txt"))
@@ -483,19 +487,21 @@ fig_raw = skel_raw.plot_3d(
 fig_raw
 
 # %% [markdown]
-# ## 6. Optional refinement
+# ## 6. Optional resample
 #
-# Non-core post-step (`refine=False` by default on `skeletonize`). Useful for
-# evenly spaced samples along chains; junctions/leaves stay fixed.
+# **Resample** is the curve-density step (`resample=False` by default on
+# `skeletonize` / conversion). The broader **refine phase** also includes prune
+# and extend; here we only show evenly spaced samples along chains (junctions /
+# leaves stay fixed).
 
 # %%
-skel_uniform = refine_skeleton(skel_raw, mode="uniform")
+skel_uniform = resample_skeleton(skel_raw, mode="uniform")
 uniform_info = _summarize_skeleton(skel_uniform, "uniform (default spacing)")
 
-skel_frac = refine_skeleton(skel_raw, mode="uniform", spacing_frac=0.02)
+skel_frac = resample_skeleton(skel_raw, mode="uniform", spacing_frac=0.02)
 frac_info = _summarize_skeleton(skel_frac, "uniform (spacing_frac=0.02)")
 
-skel_compress = refine_skeleton(skel_raw, mode="compress")
+skel_compress = resample_skeleton(skel_raw, mode="compress")
 compress_info = _summarize_skeleton(skel_compress, "compress")
 
 skel = skel_uniform
@@ -522,7 +528,7 @@ for info, color in (
     )
 fig_len.update_layout(
     barmode="overlay",
-    title="Edge length distribution: raw vs refined",
+    title="Edge length distribution: raw vs resampled",
     xaxis_title="edge length",
     yaxis_title="count",
     legend=dict(orientation="h"),
@@ -593,7 +599,7 @@ fig_compare = _overlay_skeletons(
         (skel_uniform, "uniform", "#d62728"),
         (skel_compress, "compress", "#2ca02c"),
     ],
-    title=f"Skeleton refine compare — {mesh_name}",
+    title=f"Skeleton resample compare — {mesh_name}",
 )
 fig_compare
 
@@ -604,7 +610,7 @@ fig_compare
 report = analyze_skeleton(mesh, skel)
 print(report.summary())
 
-# Degree / component table for the chosen refined skeleton
+# Degree / component table for the chosen resampled skeleton
 G = skel.graph
 print(
     f"\nchosen skeleton: nodes={skel.nodes.shape[0]} edges={skel.edges.shape[0]} "
@@ -618,7 +624,7 @@ fig_final = skel.plot_3d(
     show_nodes=True,
     node_size=3,
     mesh_opacity=0.12,
-    title=f"Final (uniform refine) — {mesh_name}",
+    title=f"Final (uniform resample) — {mesh_name}",
     autoshow=False,
 )
 fig_final

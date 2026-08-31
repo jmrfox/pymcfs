@@ -6,7 +6,7 @@ import them explicitly.
 ```python
 from pymcfs import (
     skeletonize,
-    thin_mesh,
+    contract_mesh,
     MeanCurvatureFlowSkeletonization,
     Skeleton,
     propose_mcfs_params,
@@ -20,6 +20,6 @@ from pymcfs import (
 |--------|------|
 | High-level skeletonization | [skeletonize / Skeleton](skeleton.md) |
 | Step-through driver | [MCFS driver](mcfs.md) |
-| Weight oracle | [Parameters](params.md) |
+| Parameter proposals | [Parameters](params.md) |
 | Quality scoring | [Quality](quality.md) |
 | Poles, Laplacians, MCF | [Geometry](geometry.md) |

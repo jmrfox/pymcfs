@@ -7,7 +7,7 @@ from pymcfs import skeletonize, analyze_skeleton
 mesh = tm.load("mesh.obj", force="mesh", process=False)
 # Optional: MeshManager.repair_mesh() if the surface is not watertight
 
-skel = skeletonize(mesh)  # robust defaults: w_H=0.5, w_M=5.0, gated poles
+skel = skeletonize(mesh)  # robust defaults: attraction_weight=0.5, medial_weight=5.0, gated poles
 print(analyze_skeleton(mesh, skel).summary())
 
 skel.write_polylines("skeleton.polylines.txt")
@@ -23,14 +23,14 @@ skel = skeletonize(mesh, profile="auto")
 skel = skeletonize(mesh, profile="starlab")
 
 # Meso-surface only (no curve conversion)
-from pymcfs import thin_mesh
-V, F = thin_mesh(mesh, max_iterations=100)
+from pymcfs import contract_mesh
+V, F = contract_mesh(mesh, max_iterations=100)
 
 # Step-through driver
 from pymcfs import MeanCurvatureFlowSkeletonization
 driver = MeanCurvatureFlowSkeletonization(mesh, verbose=True)
 driver.contract_until_convergence()
-skel = driver.convert_to_skeleton(refine=False)
+skel = driver.convert_to_skeleton(resample=False)
 ```
 
 ## Input requirements

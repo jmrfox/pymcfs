@@ -7,7 +7,7 @@ missing CHOLMOD runtime deps). This script still automates what works and
 documents the expected layout for hand-copied meso/curve dumps.
 
 Usage:
-  uv run python scripts/dump_starlab_parity.py --case sindorelax
+  uv run python dev/scripts/dump_starlab_parity.py --case sindorelax
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STARTERM = (
     ROOT
     / "_ref_starlab-mcfskel"
@@ -45,7 +45,7 @@ def main() -> int:
     ap.add_argument(
         "--fixtures-root",
         type=Path,
-        default=ROOT / "fixtures" / "parity",
+        default=ROOT / "dev" / "fixtures" / "parity",
     )
     ap.add_argument(
         "--mcf-iters",

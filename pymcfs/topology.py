@@ -1,4 +1,9 @@
-"""Array-backed mesh topology with Numba kernels (internal; used by remesh)."""
+"""Array-backed mesh topology and Numba kernels for remesh collapse/split.
+
+Maintainer module: stores neighbors, edges, and face incidence in fixed-capacity
+int32 arrays so the contraction remesher can run link-condition checks and
+edge operations without Python adjacency dicts on the hot path.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass

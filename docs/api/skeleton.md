@@ -2,11 +2,11 @@
 
 ::: pymcfs.skeleton.skeletonize
 
-::: pymcfs.skeleton.thin_mesh
+::: pymcfs.skeleton.contract_mesh
 
 ::: pymcfs.skeleton.Skeleton
 
-::: pymcfs.skeleton.refine_skeleton
+::: pymcfs.skeleton.resample_skeleton
 
 ::: pymcfs.refine.prune_exterior_branches
 

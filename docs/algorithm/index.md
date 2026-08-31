@@ -67,10 +67,10 @@ min_X ‖ [  W_H  ] X - [ W_H V_t ] ‖²
 via normal equations `(AᵀA)X = AᵀB`.
 
 - `ω_L` — fixed at 1
-- `ω_H` / `w_H` — attraction to current positions (default 0.5)
-- `ω_P` / `w_M` — attraction to Voronoi poles (default 5.0)
+- `ω_H` / `attraction_weight` — attraction to current positions (default 0.5)
+- `ω_P` / `medial_weight` — attraction to Voronoi poles (default 5.0)
 
-Pinned vertices: `ω_L = 0`, `ω_H = 1/zero_TH`, `ω_P = 0`.
+Pinned vertices: `ω_L = 0`, `ω_H = 1/pinned_attraction_floor`, `ω_P = 0`.
 Split vertices (one step): `ω_P = 0`.
 
 ### Local remeshing
@@ -85,16 +85,18 @@ When ≥2 incident ultra-short edges fail the link condition, the vertex is
 
 ### Convert to curve
 
-Collapse face-bearing edges in length-priority order. Optional `refine` on
-`skeletonize` / `convert_to_skeleton`:
+Collapse face-bearing edges in length-priority order. The **refine phase**
+(prune / optional tip extension / resample) runs after conversion. Curve density
+only is controlled by `resample` on `skeletonize` / `convert_to_skeleton`:
 
-- `refine=True` / `"uniform"` — arc-length resample chains
-- `refine="compress"` — keep only junctions and leaves
+- `resample=True` / `"uniform"` — arc-length resample chains
+- `resample="compress"` — keep only junctions and leaves
 
 ## Voronoi medial guidance
 
-`compute_voronoi_poles(mesh)` supplies per-vertex medial targets for `w_M`.
-With gating on, only poles inside the input mesh receive medial weight.
+`compute_voronoi_poles(mesh)` supplies per-vertex medial targets for
+`medial_weight`. With gating on, only poles inside the input mesh receive medial
+weight.
 
 ## Relationship to Starlab / CGAL
 

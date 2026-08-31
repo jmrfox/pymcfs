@@ -2,10 +2,10 @@
 """Micro-benchmark for MCFS iteration cost.
 
 Usage:
-  uv run python scripts/bench_mcfs_iter.py
-  uv run python scripts/bench_mcfs_iter.py --mesh fixtures/parity/sindorelax/input.off --iters 5
-  uv run python scripts/bench_mcfs_iter.py --profile --iters 1
-  uv run python scripts/bench_mcfs_iter.py --mesh data/mesh/TS1.obj --profile --iters 3
+  uv run python dev/scripts/bench_mcfs_iter.py
+  uv run python dev/scripts/bench_mcfs_iter.py --mesh dev/fixtures/parity/sindorelax/input.off --iters 5
+  uv run python dev/scripts/bench_mcfs_iter.py --profile --iters 1
+  uv run python dev/scripts/bench_mcfs_iter.py --mesh toric_spines/data/mesh/TS1.obj --profile --iters 3
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -28,8 +28,8 @@ from pymcfs.parity import load_mesh
 from pymcfs.spd_solve import cholmod_available, solve_spd_ata
 
 MESH_PRESETS = {
-    "sindorelax": ROOT / "fixtures" / "parity" / "sindorelax" / "input.off",
-    "ts1": ROOT / "data" / "mesh" / "TS1.obj",
+    "sindorelax": ROOT / "dev" / "fixtures" / "parity" / "sindorelax" / "input.off",
+    "ts1": ROOT / "toric_spines" / "data" / "mesh" / "TS1.obj",
 }
 
 
@@ -178,12 +178,22 @@ def main() -> int:
     ap.add_argument(
         "--mesh",
         type=Path,
-        default=ROOT / "fixtures" / "parity" / "sindorelax" / "input.off",
+        default=ROOT / "dev" / "fixtures" / "parity" / "sindorelax" / "input.off",
         help="Mesh path, or preset name: sindorelax, ts1",
     )
     ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument("--w_H", type=float, default=0.5)
-    ap.add_argument("--w_M", type=float, default=5.0)
+    ap.add_argument(
+        "--attraction-weight",
+        type=float,
+        default=0.5,
+        help="Attraction weight (legacy name: w_H)",
+    )
+    ap.add_argument(
+        "--medial-weight",
+        type=float,
+        default=5.0,
+        help="Medial-centering weight (legacy name: w_M)",
+    )
     ap.add_argument(
         "--no-cholmod",
         action="store_true",
@@ -207,8 +217,8 @@ def main() -> int:
     t_init = time.perf_counter()
     driver = MeanCurvatureFlowSkeletonization(
         mesh,
-        w_H=args.w_H,
-        w_M=args.w_M,
+        attraction_weight=args.attraction_weight,
+        medial_weight=args.medial_weight,
         gate_exterior_poles=True,
         use_cholmod=False if args.no_cholmod else None,
         max_iterations=args.iters,

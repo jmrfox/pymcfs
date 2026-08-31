@@ -133,8 +133,8 @@ def test_stage2_meso_n1_within_tolerance():
         # Generate N=1 meso on the fly for the gate
         driver = MeanCurvatureFlowSkeletonization(
             mesh,
-            w_H=0.1,
-            w_M=0.2,
+            attraction_weight=0.1,
+            medial_weight=0.2,
             gate_exterior_poles=False,  # Starlab parity profile
             max_iterations=1,
             timeout_seconds=120.0,

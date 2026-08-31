@@ -1,6 +1,7 @@
-"""Skeleton quality analysis relative to the input surface mesh."""
+"""Evaluate how well a curve skeleton fits its source surface mesh."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import networkx as nx
@@ -8,6 +9,9 @@ import numpy as np
 import trimesh as tm
 
 from .skeleton import Skeleton
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # Hard-reject floor used when remesh growth / numerical failure aborts a run.
 _REJECT_SCORE = -1.0e9
@@ -90,7 +94,7 @@ class SkeletonQualityReport:
 
 @dataclass
 class SkeletonScore:
-    """Ordered fitness for parameter sweeps and the MCFS oracle.
+    """Ordered fitness for ranking skeletons during parameter search.
 
     Higher ``value`` is better. Rejected runs sit near ``_REJECT_SCORE``.
     Ranking priorities (largest influence first):
@@ -159,7 +163,10 @@ def analyze_skeleton(
     edge_samples: int = 8,
     check_contains: bool = True,
 ) -> SkeletonQualityReport:
-    """Compare a skeleton to its source mesh.
+    """Measure how well a curve skeleton describes its source mesh.
+
+    Reports containment (nodes/edges inside the volume), soft topology
+    consistency (mesh genus vs skeleton cycles), and distance to the surface.
 
     Checks:
     - fraction of nodes inside the mesh volume
@@ -256,6 +263,16 @@ def analyze_skeleton(
         edges_inside_frac = None
         n_edges_out = None
 
+    logger.info(
+        "analyze_skeleton: nodes=%d edges=%d junctions=%d leaves=%d "
+        "inside_frac=%s topo_ok=%s",
+        n_nodes,
+        n_edges,
+        int(n_junctions),
+        int(n_leaves),
+        None if nodes_inside_frac is None else f"{nodes_inside_frac:.3f}",
+        topo_ok,
+    )
     return SkeletonQualityReport(
         n_nodes=n_nodes,
         n_edges=n_edges,
@@ -285,7 +302,7 @@ def score_skeleton(
     nonfinite: bool = False,
     area_overshoot: bool = False,
 ) -> SkeletonScore:
-    """Rank a skeleton for parameter selection.
+    """Rank a skeleton for choosing among contraction / refine candidates.
 
     Hard rejects (remesh blow-up, non-finite verts, area overshoot) score near
     ``_REJECT_SCORE``. Otherwise favors, in order:
@@ -376,6 +393,12 @@ def score_skeleton(
     value -= 0.1 * float(report.n_nodes)
     value -= 1.0 * float(report.n_leaves)
 
+    logger.debug(
+        "score_skeleton: value=%.4g rejected=False junctions=%d nodes=%d",
+        float(value),
+        int(report.n_junctions),
+        int(report.n_nodes),
+    )
     return SkeletonScore(
         value=float(value),
         rejected=False,

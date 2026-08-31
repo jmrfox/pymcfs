@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Generate simple closed primitive meshes for MCFS development and save to data/mesh/.
+Generate simple closed primitive meshes for MCFS development and save to toric_spines/data/mesh/.
 
 Usage:
-  uv run python scripts/make_test_meshes.py
-  uv run python scripts/make_test_meshes.py --outdir data/mesh
+  uv run python dev/scripts/make_test_meshes.py
+  uv run python dev/scripts/make_test_meshes.py --outdir toric_spines/data/mesh
 """
 from __future__ import annotations
 
@@ -89,13 +89,15 @@ def build_primitives() -> dict[str, tm.Trimesh]:
 
 
 def main() -> None:
-    root = Path(__file__).resolve().parents[1]
-    ap = argparse.ArgumentParser(description="Write primitive test meshes under data/mesh/")
+    root = Path(__file__).resolve().parents[2]
+    ap = argparse.ArgumentParser(
+        description="Write primitive test meshes under toric_spines/data/mesh/"
+    )
     ap.add_argument(
         "--outdir",
         type=Path,
-        default=root / "data" / "mesh",
-        help="Output directory (default: data/mesh)",
+        default=root / "toric_spines" / "data" / "mesh",
+        help="Output directory (default: toric_spines/data/mesh)",
     )
     args = ap.parse_args()
 

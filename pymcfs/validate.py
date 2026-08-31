@@ -1,8 +1,14 @@
-"""Input mesh validation for MCF skeletonization."""
+"""Validate (and optionally load/repair) meshes before MCFS contraction."""
 from __future__ import annotations
+
+import logging
+from typing import Any
 
 import numpy as np
 import trimesh as tm
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def validate_mcfs_mesh(mesh: tm.Trimesh, *, require_watertight: bool = True) -> tm.Trimesh:
@@ -45,7 +51,8 @@ def validate_mcfs_mesh(mesh: tm.Trimesh, *, require_watertight: bool = True) -> 
     if require_watertight and not bool(mesh.is_watertight):
         raise ValueError(
             "mesh must be watertight (closed, no holes). "
-            "Repair it first (e.g. MeshManager.repair_mesh) or fix the source mesh."
+            "Repair it first (e.g. load_and_repair / MeshManager.repair_mesh) "
+            "or fix the source mesh."
         )
 
     # Boundary edges: edges with multiplicity 1
@@ -70,3 +77,63 @@ def validate_mcfs_mesh(mesh: tm.Trimesh, *, require_watertight: bool = True) -> 
         )
 
     return mesh
+
+
+def load_and_repair(
+    mesh: tm.Trimesh | str,
+    *,
+    repair_kwargs: dict[str, Any] | None = None,
+    file_format: str | None = None,
+) -> tm.Trimesh:
+    """Load (if needed) and prepare an MCFS-ready mesh via validate → repair → re-validate.
+
+    Soft-validates without requiring watertightness, attempts common repairs,
+    then re-validates with full MCFS preconditions.
+
+    Parameters
+    ----------
+    mesh :
+        A ``trimesh.Trimesh`` or a filesystem path to load.
+    repair_kwargs :
+        Forwarded to :meth:`pymcfs.mesh.MeshManager.repair_mesh`.
+    file_format :
+        Optional format hint when ``mesh`` is a path.
+
+    Returns
+    -------
+    trimesh.Trimesh
+        Repaired mesh that passes :func:`validate_mcfs_mesh`.
+
+    Raises
+    ------
+    TypeError
+        If ``mesh`` is neither a path nor a ``trimesh.Trimesh``.
+    ValueError
+        If the mesh still fails MCFS validation after repair.
+    """
+    from .mesh import MeshManager
+
+    if isinstance(mesh, str):
+        mgr = MeshManager()
+        logger.info("load_and_repair: loading %s", mesh)
+        mgr.load_mesh(mesh, file_format=file_format, validate_mcfs=False)
+        tri = mgr.mesh
+    elif isinstance(mesh, tm.Trimesh):
+        mgr = MeshManager(mesh)
+        tri = mesh
+    else:
+        raise TypeError("mesh must be a trimesh.Trimesh or a filesystem path string")
+
+    validate_mcfs_mesh(tri, require_watertight=False)
+    kwargs = dict(repair_kwargs or {})
+    kwargs.setdefault("verbose", False)
+    logger.info("load_and_repair: repairing mesh (n=%d f=%d)", len(tri.vertices), len(tri.faces))
+    repaired = mgr.repair_mesh(**kwargs)
+    validate_mcfs_mesh(repaired, require_watertight=True)
+    logger.info(
+        "load_and_repair: ready (n=%d f=%d watertight=%s)",
+        len(repaired.vertices),
+        len(repaired.faces),
+        repaired.is_watertight,
+    )
+    return repaired

@@ -1,6 +1,7 @@
 # ---
 # jupyter:
 #   jupytext:
+#     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
 #       format_name: percent
@@ -21,7 +22,7 @@
 # 2. inspect Voronoi medial poles
 # 3. contract with the Starlab-style MCFS driver (geometry + remesh + pinning)
 # 4. convert the meso-skeleton surface to a curve graph
-# 5. optional curve-graph refinement (downsample / even spacing)
+# 5. optional curve resample (density); refine phase also includes prune/extend
 # 6. quality check and export
 #
 # Change `MESH_PATH` (or use `example_mesh`) below to try another shape.
@@ -42,24 +43,24 @@ from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
 from pymcfs.medial import compute_voronoi_poles
 from pymcfs.mesh import MeshManager, example_mesh
 from pymcfs.quality import analyze_skeleton
-from pymcfs.skeleton import Skeleton, refine_skeleton, skeletonize
+from pymcfs.skeleton import Skeleton, resample_skeleton, skeletonize
 from pymcfs.validate import validate_mcfs_mesh
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("pymcfs.demo")
 
-ROOT = Path("..").resolve() if Path.cwd().name == "notebooks" else Path.cwd()
-DATA = ROOT / "data" / "mesh"
+ROOT = Path("../..").resolve() if Path.cwd().name == "notebooks" else Path.cwd()
+DATA = ROOT / "toric_spines" / "data" / "mesh"
 OUT = ROOT / "outputs" / "demo"
 OUT.mkdir(parents=True, exist_ok=True)
 
-# Pick one mesh: a file under data/mesh/, or set MESH_PATH = None and use EXAMPLE.
+# Pick one mesh: a file under toric_spines/data/mesh/, or set MESH_PATH = None and use EXAMPLE.
 MESH_PATH: Path | None = DATA / "cylinder.obj"
 EXAMPLE: str | None = None  # e.g. "cylinder" / "torus" when MESH_PATH is None
 
 # MCFS weights (Starlab / CGAL defaults)
-W_H = 0.1   # attraction to current positions
-W_M = 0.2   # attraction to Voronoi poles (0 disables medial term)
+ATTRACTION_WEIGHT = 0.1   # attraction to current positions
+MEDIAL_WEIGHT = 0.2       # attraction to Voronoi poles (0 disables medial term)
 MAX_ITERS = 500
 TIMEOUT_S = 120.0
 SNAPSHOT_EVERY = 25  # save meso-surface every N contraction iterations
@@ -100,8 +101,8 @@ fig_input
 # %% [markdown]
 # ## 2. Voronoi medial poles
 #
-# Each vertex gets an inner Voronoi pole used by the `w_M` term. MCFS stores these
-# on the driver; here we compute them once for visualization.
+# Each vertex gets an inner Voronoi pole used by the `medial_weight` term. MCFS stores
+# these on the driver; here we compute them once for visualization.
 
 # %%
 poles, pole_weights = compute_voronoi_poles(mesh)
@@ -159,8 +160,8 @@ fig_poles
 # %%
 driver = MeanCurvatureFlowSkeletonization(
     mesh,
-    w_H=W_H,
-    w_M=W_M,
+    attraction_weight=ATTRACTION_WEIGHT,
+    medial_weight=MEDIAL_WEIGHT,
     max_iterations=MAX_ITERS,
     timeout_seconds=TIMEOUT_S,
     verbose=True,
@@ -173,7 +174,7 @@ area0 = float(driver._area0)
 print(
     f"start: n={driver.V.shape[0]} f={driver.F.shape[0]} "
     f"area0={area0:.4g} min_edge={driver._min_edge:.4g} "
-    f"w_H={W_H} w_M={W_M}"
+    f"attraction_weight={ATTRACTION_WEIGHT} medial_weight={MEDIAL_WEIGHT}"
 )
 
 if driver.timeout_seconds is not None and driver.timeout_seconds > 0:
@@ -295,7 +296,7 @@ def _summarize_skeleton(skel: Skeleton, label: str) -> dict:
     return info
 
 
-skel_raw = driver.convert_to_skeleton(refine=False)
+skel_raw = driver.convert_to_skeleton(resample=False)
 raw_info = _summarize_skeleton(skel_raw, "raw")
 
 # %%
@@ -310,39 +311,41 @@ fig_raw = skel_raw.plot_3d(
 fig_raw
 
 # %% [markdown]
-# ## 6. Optional refinement
+# ## 6. Optional resample
 #
 # MCFS often produces more sample points than needed, with uneven spacing along the
-# medial axis. Refinement is a **non-core** post-step (`refine=False` by default):
+# medial axis. **Resample** is the curve-density step (`resample=False` by default on
+# conversion / `skeletonize`). The broader **refine phase** also includes prune and
+# extend; this section only shows resampling:
 #
 # | option | behavior |
 # |---|---|
-# | `refine=True` / `"uniform"` | arc-length resample chains between junctions/leaves |
-# | `refine_spacing=...` | absolute target segment length |
-# | `refine_spacing_frac=...` | spacing as a fraction of skeleton bbox diagonal |
-# | `refine="compress"` | keep only junctions and leaves (drop all degree-2 nodes) |
+# | `resample=True` / `"uniform"` | arc-length resample chains between junctions/leaves |
+# | `resample_spacing=...` | absolute target segment length |
+# | `resample_spacing_frac=...` | spacing as a fraction of skeleton bbox diagonal |
+# | `resample="compress"` | keep only junctions and leaves (drop all degree-2 nodes) |
 #
 # Default uniform spacing is `2 × median edge length` (mild downsample + evening).
 # Junctions/leaves stay fixed; curvature along chains is preserved.
 
 # %%
-# Mild default refine (also available as skeletonize(..., refine=True)).
-skel_uniform = refine_skeleton(skel_raw, mode="uniform")
+# Mild default resample (also available as skeletonize(..., resample=True)).
+skel_uniform = resample_skeleton(skel_raw, mode="uniform")
 uniform_info = _summarize_skeleton(skel_uniform, "uniform (default spacing)")
 
 # Explicit spacing relative to bbox diagonal (~2% → coarser).
-skel_frac = refine_skeleton(skel_raw, mode="uniform", spacing_frac=0.02)
+skel_frac = resample_skeleton(skel_raw, mode="uniform", spacing_frac=0.02)
 frac_info = _summarize_skeleton(skel_frac, "uniform (spacing_frac=0.02)")
 
 # Junction-only compress (aggressive).
-skel_compress = refine_skeleton(skel_raw, mode="compress")
+skel_compress = resample_skeleton(skel_raw, mode="compress")
 compress_info = _summarize_skeleton(skel_compress, "compress")
 
-# Use the default uniform refine for the rest of the notebook.
+# Use the default uniform resample for the rest of the notebook.
 skel = skel_uniform
 
 # %%
-# Edge-length histograms: raw vs refined.
+# Edge-length histograms: raw vs resampled.
 fig_len = go.Figure()
 for info, color in (
     (raw_info, "#1f77b4"),
@@ -362,7 +365,7 @@ for info, color in (
     )
 fig_len.update_layout(
     barmode="overlay",
-    title="Edge length distribution: raw vs refined",
+    title="Edge length distribution: raw vs resampled",
     xaxis_title="edge length",
     yaxis_title="count",
     legend=dict(orientation="h"),
@@ -418,7 +421,7 @@ fig_compare = _overlay_skeletons(
         (skel_raw, "raw", "#1f77b4"),
         (skel_uniform, "uniform", "#2ca02c"),
     ],
-    title=f"Raw vs uniform refine: {mesh_name}",
+    title=f"Raw vs uniform resample: {mesh_name}",
 )
 fig_compare
 
@@ -437,7 +440,7 @@ fig_compress
 # %% [markdown]
 # ## 7. Quality report and export
 #
-# Exports use the default **uniform** refined skeleton from above.
+# Exports use the default **uniform** resampled skeleton from above.
 
 # %%
 report = analyze_skeleton(mesh, skel)
@@ -448,33 +451,33 @@ out_dir.mkdir(parents=True, exist_ok=True)
 skel_raw.write_polylines(str(out_dir / "skeleton_raw.polylines.txt"))
 skel.write_polylines(str(out_dir / "skeleton.polylines.txt"))
 meso.export(str(out_dir / "meso_skeleton.obj"))
-fig_compare.write_html(str(out_dir / "skeleton_refine_compare.html"))
+fig_compare.write_html(str(out_dir / "skeleton_resample_compare.html"))
 print(f"wrote outputs under {out_dir}")
 
 # %% [markdown]
 # ## 8. One-liner equivalent
 #
-# `skeletonize(..., refine=True)` runs contraction + conversion + default uniform
-# refine in one call.
+# `skeletonize(..., resample=True)` runs contraction + conversion + default uniform
+# resample in one call.
 
 # %%
 skel_quick = skeletonize(
     mesh,
-    w_H=W_H,
-    w_M=W_M,
+    attraction_weight=ATTRACTION_WEIGHT,
+    medial_weight=MEDIAL_WEIGHT,
     max_iterations=MAX_ITERS,
     timeout_seconds=TIMEOUT_S,
-    refine=True,
+    resample=True,
     verbose=False,
 )
 print(
-    f"skeletonize(refine=True): nodes={skel_quick.nodes.shape[0]} edges={skel_quick.edges.shape[0]} "
+    f"skeletonize(resample=True): nodes={skel_quick.nodes.shape[0]} edges={skel_quick.edges.shape[0]} "
     f"(notebook uniform: {skel.nodes.shape[0]} / {skel.edges.shape[0]}; "
     f"raw: {skel_raw.nodes.shape[0]} / {skel_raw.edges.shape[0]})"
 )
 skel_quick.plot_3d(
     mesh,
     show_nodes=True,
-    title=f"skeletonize(refine=True): {mesh_name}",
+    title=f"skeletonize(resample=True): {mesh_name}",
     autoshow=False,
 )

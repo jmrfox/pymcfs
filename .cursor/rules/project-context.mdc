@@ -1,8 +1,3 @@
----
-description: pymcfs project purpose, layout, and package design
-alwaysApply: true
----
-
 # pymcfs Project Context
 
 `pymcfs` is a Python package for mean-curvature flow (MCF) skeletonization of 3D surface meshes. Users import and call it from scripts and notebooks; there is no CLI.
@@ -11,22 +6,24 @@ alwaysApply: true
 
 - `pymcfs/` — package source
 - `tests/` — pytest suite
-- `notebooks/` — Jupyter notebooks (Jupytext)
-- `data/` — input meshes and datasets
-- `scripts/` — demos and one-off scripts
-- `third_party/` — reference / vendored material (not active package code)
+- `docs/` — MkDocs documentation
+- `toric_spines/` — personal research (notebooks, TS workflows, meshes); **main only**
+- `dev/` — development tooling (parity fixtures, benches, dump scripts); **main only**
+
+The public `release` branch omits `toric_spines/` and `dev/`.
 
 ## Design stance
 
 - Prefer a clean importable API over ad-hoc scripts.
 - No legacy compatibility burden: change APIs when that improves the library.
 - Algorithmic context lives in `README.md`; keep implementation aligned with that design.
+- Package code is application-agnostic (no TS/research commentary in `pymcfs/`).
 
 ## Tooling
 
-- Package manager: **uv**. Run Python via `uv run …` (e.g. `uv run pytest`, `uv run python scripts/demo_mcfs.py`).
+- Package manager: **uv**. Run Python via `uv run …` (e.g. `uv run pytest`, `uv run python toric_spines/scripts/demo_mcfs.py`).
 - Tests: **pytest** (`uv run pytest`).
-- Notebooks: **Jupytext** under `notebooks/`.
+- Research notebooks: **Jupytext** under `toric_spines/notebooks/`.
 
 ## Terminal commands
 

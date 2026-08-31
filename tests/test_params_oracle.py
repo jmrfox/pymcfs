@@ -10,7 +10,8 @@ from pymcfs.quality import SkeletonQualityReport, score_skeleton
 from pymcfs.skeleton import resolve_mcfs_profile, skeletonize
 
 
-def _ts1_like() -> MeshMcfsFeatures:
+def _thin_elongated_like() -> MeshMcfsFeatures:
+    """Thin / elongated geometry: small relative pole offset and char radius."""
     return MeshMcfsFeatures(
         n_vertices=1000,
         bbox_diag=1000.0,
@@ -23,7 +24,8 @@ def _ts1_like() -> MeshMcfsFeatures:
     )
 
 
-def _ts2_like() -> MeshMcfsFeatures:
+def _compact_like() -> MeshMcfsFeatures:
+    """More compact geometry: larger relative pole offset and char radius."""
     return MeshMcfsFeatures(
         n_vertices=500,
         bbox_diag=600.0,
@@ -123,16 +125,16 @@ def test_mesh_mcfs_features_sphere():
 def test_propose_params_higher_rho_not_weaker():
     """Higher relative pole offset must propose a lower (or equal) medial ratio."""
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    p_low = propose_mcfs_params(mesh, features=_ts1_like())
-    p_high = propose_mcfs_params(mesh, features=_ts2_like())
+    p_low = propose_mcfs_params(mesh, features=_thin_elongated_like())
+    p_high = propose_mcfs_params(mesh, features=_compact_like())
     assert p_high.ratio <= p_low.ratio + 1e-9
     assert p_high.gate_exterior_poles is True
     assert p_low.gate_exterior_poles is True
-    assert p_high.w_M <= p_low.w_M + 1e-9
+    assert p_high.medial_weight <= p_low.medial_weight + 1e-9
 
 
-def _ts3_like_bulky() -> MeshMcfsFeatures:
-    """Mean ρ near-ref but elevated char_r (TS3-style thick compartment)."""
+def _bulky_like() -> MeshMcfsFeatures:
+    """Mean ρ near-ref but elevated char_r (thick / bulky compartment)."""
     return MeshMcfsFeatures(
         n_vertices=8000,
         bbox_diag=1900.0,
@@ -146,35 +148,35 @@ def _ts3_like_bulky() -> MeshMcfsFeatures:
 
 
 def test_propose_sparse_snaps_near_ref_to_robust():
-    """TS1-like ρ + sparse/balanced must match usual robust (0.5, 5.0)."""
+    """Thin-elongated ρ + sparse/balanced must match usual robust (0.5, 5.0)."""
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
     for mode in ("sparse", "balanced"):
-        p = propose_mcfs_params(mesh, features=_ts1_like(), branching=mode)
-        assert p.w_H == pytest.approx(0.5)
-        assert p.w_M == pytest.approx(5.0)
+        p = propose_mcfs_params(mesh, features=_thin_elongated_like(), branching=mode)
+        assert p.attraction_weight == pytest.approx(0.5)
+        assert p.medial_weight == pytest.approx(5.0)
         assert p.ratio == pytest.approx(10.0)
 
 
 def test_propose_sparse_uses_char_r_when_mean_rho_near_ref():
     """Bulky compartments must not snap to robust just because mean ρ is mild."""
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    p = propose_mcfs_params(mesh, features=_ts3_like_bulky(), branching="sparse")
+    p = propose_mcfs_params(mesh, features=_bulky_like(), branching="sparse")
     assert p.ratio < 10.0 - 1e-9
-    assert p.w_M < 5.0 - 1e-9
+    assert p.medial_weight < 5.0 - 1e-9
     assert "thick" in p.rationale
 
 
 def test_propose_branching_orders_medial_strength():
-    """sparse ≤ balanced ≤ dense in medial ratio / w_M on thick meshes."""
+    """sparse ≤ balanced ≤ dense in medial ratio / medial_weight on thick meshes."""
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    feats = _ts2_like()
+    feats = _compact_like()
     sparse = propose_mcfs_params(mesh, features=feats, branching="sparse")
     balanced = propose_mcfs_params(mesh, features=feats, branching="balanced")
     dense = propose_mcfs_params(mesh, features=feats, branching="dense")
     assert sparse.ratio <= balanced.ratio + 1e-9
     assert balanced.ratio <= dense.ratio + 1e-9
-    assert sparse.w_M <= balanced.w_M + 1e-9
-    assert balanced.w_M <= dense.w_M + 1e-9
+    assert sparse.medial_weight <= balanced.medial_weight + 1e-9
+    assert balanced.medial_weight <= dense.medial_weight + 1e-9
     assert sparse.ratio <= 3.0 + 1e-9
 
 
@@ -186,29 +188,33 @@ def test_propose_rejects_bad_branching():
 
 def test_resolve_profile_auto_requires_mesh():
     with pytest.raises(ValueError, match="requires a mesh"):
-        resolve_mcfs_profile("auto", w_H=0.5, w_M=5.0, gate_exterior_poles=None)
+        resolve_mcfs_profile(
+            "auto", attraction_weight=0.5, medial_weight=5.0, gate_exterior_poles=None
+        )
 
 
 def test_resolve_profile_auto_proposes():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
     wh, wm, gate = resolve_mcfs_profile(
-        "auto", w_H=0.5, w_M=5.0, gate_exterior_poles=None, mesh=mesh
+        "auto",
+        attraction_weight=0.5,
+        medial_weight=5.0,
+        gate_exterior_poles=None,
+        mesh=mesh,
     )
     proposed = propose_mcfs_params(mesh)
-    assert wh == pytest.approx(proposed.w_H)
-    assert wm == pytest.approx(proposed.w_M)
+    assert wh == pytest.approx(proposed.attraction_weight)
+    assert wm == pytest.approx(proposed.medial_weight)
     assert gate is True
 
 
-def test_resolve_profile_auto_alias_override():
+def test_resolve_profile_auto_weight_override():
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
     wh, wm, gate = resolve_mcfs_profile(
         "auto",
-        w_H=0.5,
-        w_M=5.0,
+        attraction_weight=0.8,
+        medial_weight=2.0,
         gate_exterior_poles=False,
-        quality_speed_tradeoff=0.8,
-        medially_centered_speed_tradeoff=2.0,
         mesh=mesh,
     )
     assert wh == pytest.approx(0.8)
@@ -218,7 +224,7 @@ def test_resolve_profile_auto_alias_override():
 
 def test_skeletonize_profile_auto_runs():
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    skel = skeletonize(mesh, profile="auto", max_iterations=10, refine=False)
+    skel = skeletonize(mesh, profile="auto", max_iterations=10, resample=False)
     assert skel.nodes.shape[0] > 0
 
 
@@ -229,8 +235,8 @@ def test_remesh_growth_abort():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
     driver = MeanCurvatureFlowSkeletonization(
         mesh,
-        w_H=0.1,
-        w_M=10.0,
+        attraction_weight=0.1,
+        medial_weight=10.0,
         gate_exterior_poles=True,
         max_iterations=50,
         timeout_seconds=30.0,

@@ -1,6 +1,8 @@
-"""Local remeshing helpers used by the MCFS driver (internal).
+"""Local remeshing during MCFS contraction: short-edge collapse and obtuse splits.
 
-Implements short-edge collapse and obtuse-triangle splits on (V, F) triangle meshes.
+As the surface shrinks toward the medial axis, edges can bunch or triangles
+become obtuse; remeshing keeps the mesh well-shaped so the linear solves stay
+stable and the meso-skeleton remains usable for curve conversion.
 """
 from __future__ import annotations
 
@@ -519,6 +521,12 @@ def collapse_short_edges(
     if vertex_flags is not None:
         vertex_flags.clear()
         vertex_flags.update(flags)
+    logger.debug(
+        "collapse_short_edges: collapsed=%d -> n=%d f=%d",
+        int(total),
+        int(V.shape[0]),
+        int(F.shape[0]),
+    )
     return V, F, total, fixed, poles, pole_valid
 
 
@@ -782,6 +790,12 @@ def split_obtuse_faces(
             pole_valid = pole_valid_out
         F = F_out[:f_write]
 
+    logger.debug(
+        "split_obtuse_faces: splits=%d -> n=%d f=%d",
+        int(total),
+        int(V.shape[0]),
+        int(F.shape[0]),
+    )
     return V, F, total, fixed, poles, pole_valid, is_split
 
 

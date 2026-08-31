@@ -1,23 +1,28 @@
-# Notebooks
+# Research notebooks (main branch)
 
-Notebooks live under `notebooks/` as **Jupytext** percent scripts (reviewable in git).
+Notebooks live under `toric_spines/notebooks/` as **Jupytext** percent scripts
+(reviewable in git). This tree is on **`main` only** — not on `release`.
 
 ```bash
-# Edit the .py source
-uv run jupytext --sync notebooks/ts_skeleton.py
-
-# Dev stack (jupyter + viz)
-uv sync --group dev
+uv run jupytext --sync toric_spines/notebooks/ts_skeleton.py
 ```
 
 ## `ts_skeleton`
 
-Interactive MCFS on one `data/mesh/TS*.obj`:
+Interactive MCFS on one `toric_spines/data/mesh/TS*.obj` (application example):
 
-- Set `TS_NAME`, weights (`W_H` / `W_M`), or `USE_ORACLE = True`
-- `ORACLE_BRANCHING = "sparse"` | `"balanced"` | `"dense"`
+```bash
+uv run python toric_spines/scripts/batch_ts_skeletonize.py --mesh TS1
+```
+
 - Writes under `outputs/polylines/<case>/` (gitignored)
 
-## Outputs
+## `view_skeletons`
+
+- Reads `.cg` under `outputs/polylines/<CASE>/`
+
+## `demo`
+
+Package walkthrough with optional mesh under `toric_spines/data/mesh/`.
 
 Keep generated meshes, polylines, and sweeps out of git (`outputs/` is ignored).

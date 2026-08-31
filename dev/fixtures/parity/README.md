@@ -1,9 +1,9 @@
 # Starlab ↔ pymcfs parity fixtures
 
-Layout per case:
+Layout per case (`dev/` is on **`main` only** — not on public `release`):
 
 ```
-fixtures/parity/<case>/
+dev/fixtures/parity/<case>/
   input.off|obj
   starlab/
     poles.off          # Starlab medial nOFF (x y z angle radius) or plain OFF
@@ -26,16 +26,16 @@ defaults (`w_H=0.5`, `w_M=5.0`, gated poles).
 
 ```bash
 # pymcfs side (Starlab profile by default)
-uv run python scripts/dump_pymcfs_parity.py --case sindorelax --iters 1,final
+uv run python dev/scripts/dump_pymcfs_parity.py --case sindorelax --iters 1,final
 
 # Starlab side (Windows demo starterm)
-uv run python scripts/dump_starlab_parity.py --case sindorelax --mcf-iters 1
+uv run python dev/scripts/dump_starlab_parity.py --case sindorelax --mcf-iters 1
 ```
 
 Compare:
 
 ```bash
-uv run python scripts/compare_starlab_parity.py --case sindorelax
+uv run python dev/scripts/compare_starlab_parity.py --case sindorelax
 ```
 
 ## Notes

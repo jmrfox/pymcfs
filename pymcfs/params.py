@@ -1,4 +1,4 @@
-"""Mesh-conditioned MCFS parameter proposals (parameter oracle)."""
+"""Mesh-conditioned MCFS parameter proposals from geometry features."""
 
 from __future__ import annotations
 
@@ -14,23 +14,23 @@ from .medial import compute_voronoi_poles, points_inside_mesh
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-# Anchor band from TS1-like meshes where robust (0.5, 5.0) works well.
+# Anchor band from slender tubular meshes where robust (0.5, 5.0) works well.
 _RHO_REF = 0.016
-# Characteristic radius / diag for the same TS1-like band. Thick compartments
-# (e.g. TS3 soma) can keep mean ρ near-ref while char_r is elevated — using
-# only mean ρ then snaps to robust and fills the volume with spurious branches.
+# Characteristic radius / diag for the same slender-tube band. Bulky regions
+# can keep mean ρ near-ref while char_r is elevated — using only mean ρ then
+# snaps to robust and fills the volume with spurious branches.
 _CHAR_REF = 0.025
-_ROBUST_W_H = 0.5
-_ROBUST_W_M = 5.0
+_ROBUST_ATTRACTION = 0.5
+_ROBUST_MEDIAL = 5.0
 _ROBUST_RATIO = 10.0
-# Below this relative scale, treat as TS1-like and prefer exact robust weights
-# under sparse/balanced (avoids tiny oracle drift → extra junctions).
+# Below this relative scale, treat as near-reference and prefer exact robust
+# weights under sparse/balanced (avoids tiny proposal drift → extra junctions).
 _NEAR_REF_SCALE = 1.2
 
 BranchingPreference = Literal["sparse", "balanced", "dense"]
 
 # Multipliers on the medial ratio after the geometry base proposal.
-# Sparse errs toward fewer junctions (neuroscience default).
+# Sparse errs toward fewer junctions.
 _BRANCHING_RATIO_SCALE: dict[BranchingPreference, float] = {
     "sparse": 0.70,
     "balanced": 1.00,
@@ -41,6 +41,9 @@ _BRANCHING_RATIO_SCALE: dict[BranchingPreference, float] = {
 @dataclass(frozen=True)
 class MeshMcfsFeatures:
     """Preflight geometry features used by :func:`propose_mcfs_params`.
+
+    Pole offsets measure distance from each vertex to its Voronoi pole
+    (medial-axis target); larger relative offsets typically mean thicker shapes.
 
     Attributes
     ----------
@@ -53,7 +56,7 @@ class MeshMcfsFeatures:
     p95_pole_offset :
         95th percentile of those offsets.
     mean_pole_offset_over_diag :
-        ``mean_pole_offset / bbox_diag`` (dominant oracle signal ``ρ``).
+        ``mean_pole_offset / bbox_diag`` (relative thickness signal ``ρ``).
     p95_pole_offset_over_diag :
         ``p95_pole_offset / bbox_diag``.
     poles_inside_frac :
@@ -89,14 +92,15 @@ class McfsParams:
 
     Attributes
     ----------
-    w_H :
-        Quality/speed (attraction) weight.
-    w_M :
-        Medial-centering weight.
+    attraction_weight :
+        Attraction weight — how strongly vertices stay near their current
+        positions during contraction (stability / quality).
+    medial_weight :
+        Medial-centering weight — pull toward Voronoi poles inside the volume.
     gate_exterior_poles :
-        Whether to gate exterior Voronoi poles (always True from the oracle).
+        Whether to gate exterior Voronoi poles (always True from proposals).
     ratio :
-        ``w_M / w_H`` after proposal.
+        ``medial_weight / attraction_weight`` after proposal.
     branching :
         Branching preference used to produce this proposal.
     features :
@@ -105,8 +109,8 @@ class McfsParams:
         Short human-readable explanation of the choice.
     """
 
-    w_H: float
-    w_M: float
+    attraction_weight: float
+    medial_weight: float
     gate_exterior_poles: bool = True
     ratio: float = 10.0
     branching: BranchingPreference = "sparse"
@@ -116,8 +120,8 @@ class McfsParams:
     def summary(self) -> str:
         """One-line parameter summary for logs."""
         bits = [
-            f"w_H={self.w_H:.4g}",
-            f"w_M={self.w_M:.4g}",
+            f"attraction={self.attraction_weight:.4g}",
+            f"medial={self.medial_weight:.4g}",
             f"r={self.ratio:.3g}",
             f"branching={self.branching}",
             f"gate={self.gate_exterior_poles}",
@@ -132,11 +136,11 @@ def mesh_mcfs_features(
     *,
     fast_gating: bool = False,
 ) -> MeshMcfsFeatures:
-    """Extract scale-free features that correlate with good ``(w_H, w_M)``.
+    """Extract scale-free features that correlate with good contraction weights.
 
     The dominant signal is mean Voronoi-pole offset over bbox diagonal: thick /
-    compact fragments (e.g. TS2) have larger relative medial targets and need
-    a milder medial ratio than thin elongated meshes (e.g. TS1).
+    compact shapes have larger relative medial targets (poles farther from the
+    surface) and need a milder medial ratio than thin elongated tubes.
 
     Parameters
     ----------
@@ -204,14 +208,14 @@ def propose_mcfs_params(
     fast_gating: bool = False,
     branching: BranchingPreference = "sparse",
 ) -> McfsParams:
-    """Propose ``(w_H, w_M)`` from mesh features.
+    """Propose attraction and medial weights from mesh geometry features.
 
     Defaults to ``branching=\"sparse\"``: prefer fewer junctions / less spurious
-    volume branching (priority for neuroscience centerlines). Near the TS1
-    relative-pole *and* characteristic-radius band this returns exact robust
-    ``(0.5, 5.0)``. Thick meshes (high ``ρ`` or high ``char_r``) get a low
-    medial ratio for remesh stability / fewer volume junctions, with
-    ``sparse`` pushing that ratio further down than ``balanced`` / ``dense``.
+    volume branching. Near the slender-tube relative-pole *and*
+    characteristic-radius band this returns exact robust ``(0.5, 5.0)``. Thick
+    meshes (high ``ρ`` or high ``char_r``) get a low medial ratio for remesh
+    stability / fewer volume junctions, with ``sparse`` pushing that ratio
+    further down than ``balanced`` / ``dense``.
 
     Parameters
     ----------
@@ -223,8 +227,8 @@ def propose_mcfs_params(
     fast_gating :
         Passed to :func:`mesh_mcfs_features` when features are computed here.
     branching :
-        ``\"sparse\"`` (default) — fewest junctions; snap to robust on TS1-like
-        meshes; lowest medial ratio on thick meshes.
+        ``\"sparse\"`` (default) — fewest junctions; snap to robust on
+        near-reference meshes; lowest medial ratio on thick meshes.
         ``\"balanced\"`` — geometry base proposal (robust near ref; mild ratio
         cut when thick).
         ``\"dense\"`` — stronger medial pull / higher ratio (more branching;
@@ -263,34 +267,36 @@ def propose_mcfs_params(
     scale = float(max(rho_scale, char_scale))
     bscale = float(_BRANCHING_RATIO_SCALE[branching])
 
-    # Near-reference: exact robust for sparse/balanced so TS1 matches "usual"
-    # values. Dense may raise medial strength slightly.
+    # Near-reference: exact robust for sparse/balanced so slender tubes match
+    # usual values. Dense may raise medial strength slightly.
     if scale <= _NEAR_REF_SCALE:
-        w_H = _ROBUST_W_H
+        attraction_weight = _ROBUST_ATTRACTION
         if branching == "dense":
             ratio = float(np.clip(_ROBUST_RATIO * bscale, 2.0, 20.0))
         else:
             ratio = _ROBUST_RATIO
-        w_M = float(w_H * ratio)
+        medial_weight = float(attraction_weight * ratio)
         rationale = (
             f"rho={100.0 * rho:.2f}%diag char={100.0 * char:.2f}%diag "
             f"scale={scale:.2f} near-ref; branching={branching}"
         )
     else:
-        # Thick / high-ρ or bulky char_r: sweep winners used low ratio (~2).
+        # Thick / high-ρ or bulky char_r: prefer a low ratio (~2).
         # Sparse goes to the floor; dense allows a bit more medial pull but
         # stays remesh-safe.
-        w_H = float(np.clip(_ROBUST_W_H / (scale**0.35), 0.25, 1.0))
+        attraction_weight = float(
+            np.clip(_ROBUST_ATTRACTION / (scale**0.35), 0.25, 1.0)
+        )
         base_ratio = float(np.clip(_ROBUST_RATIO / (scale**1.5), 2.0, 10.0))
         ratio = float(np.clip(base_ratio * bscale, 2.0, 12.0))
         if branching == "sparse":
-            # Prefer the sweep-best low-ratio band for thick fragments.
+            # Prefer the low-ratio band for thick fragments.
             ratio = float(min(ratio, 3.0))
-        w_M = float(w_H * ratio)
+        medial_weight = float(attraction_weight * ratio)
         # Never exceed robust absolute medial under sparse (extra conservatism).
         if branching == "sparse":
-            w_M = float(min(w_M, _ROBUST_W_M))
-            ratio = float(w_M / max(w_H, 1e-12))
+            medial_weight = float(min(medial_weight, _ROBUST_MEDIAL))
+            ratio = float(medial_weight / max(attraction_weight, 1e-12))
         rationale = (
             f"rho={100.0 * rho:.2f}%diag char={100.0 * char:.2f}%diag "
             f"scale={scale:.2f} thick; branching={branching} "
@@ -298,15 +304,15 @@ def propose_mcfs_params(
         )
 
     logger.debug(
-        "propose_mcfs_params: %s branching=%s -> w_H=%.3g w_M=%.3g",
+        "propose_mcfs_params: %s branching=%s -> attraction=%.3g medial=%.3g",
         feats.summary(),
         branching,
-        w_H,
-        w_M,
+        attraction_weight,
+        medial_weight,
     )
     return McfsParams(
-        w_H=w_H,
-        w_M=w_M,
+        attraction_weight=attraction_weight,
+        medial_weight=medial_weight,
         gate_exterior_poles=True,
         ratio=ratio,
         branching=branching,

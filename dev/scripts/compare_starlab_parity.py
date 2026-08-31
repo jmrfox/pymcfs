@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Compare pymcfs vs Starlab stage dumps under fixtures/parity/<case>/.
+"""Compare pymcfs vs Starlab stage dumps under dev/fixtures/parity/<case>/.
 
 Usage:
-  uv run python scripts/compare_starlab_parity.py --case sindorelax
-  uv run python scripts/compare_starlab_parity.py --case sindorelax --stage poles
+  uv run python dev/scripts/compare_starlab_parity.py --case sindorelax
+  uv run python dev/scripts/compare_starlab_parity.py --case sindorelax --stage poles
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

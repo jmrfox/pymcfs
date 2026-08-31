@@ -1,7 +1,7 @@
-# Parameter oracle
+# Parameter proposals
 
-`propose_mcfs_params(mesh)` suggests `(w_H, w_M)` from mesh features. Used by
-`profile="auto"`.
+`propose_mcfs_params(mesh)` suggests `(attraction_weight, medial_weight)` from
+mesh features. Used by `profile="auto"`.
 
 ## Features
 
@@ -10,22 +10,22 @@ Two thickness signals (both normalized by bbox diagonal):
 - `ρ` = mean Voronoi-pole offset / bbox diagonal
 - `r_char` = characteristic radius / bbox diagonal
 
-The oracle scale is `max(ρ/ρ_ref, r_char/r_ref)` with refs from the TS1 band
-(`ρ ≈ 1.6%`, `r_char ≈ 2.5%`). Using only mean `ρ` mis-classifies meshes like
-**TS3**: thin processes keep mean `ρ` near-ref while a bulky compartment has
-elevated `r_char`, and robust `(0.5, 5)` then fills that volume with spurious
+The proposal scale is `max(ρ/ρ_ref, r_char/r_ref)` with refs from a slender-tube
+band (`ρ ≈ 1.6%`, `r_char ≈ 2.5%`). Using only mean `ρ` mis-classifies meshes
+with thin processes but a bulky compartment: mean `ρ` stays near-ref while
+`r_char` is elevated, and robust `(0.5, 5)` then fills that volume with spurious
 junctions.
 
-Thick / compact fragments (e.g. TS2, high `ρ`) need a **lower medial ratio** or
-remesh growth blows up under robust weights.
+Thick / compact fragments (high `ρ`) need a **lower medial ratio** or remesh
+growth blows up under robust weights.
 
 ## Branching preference
 
 Default is **`branching="sparse"`** — prefer fewer junctions and no spurious
-volume branches (neuroscience priority).
+volume branches.
 
-| Mode | Near TS1 band (both signals) | Thick (high `ρ` or `r_char`) |
-|------|------------------------------|------------------------------|
+| Mode | Near slender-tube band (both signals) | Thick (high `ρ` or `r_char`) |
+|------|---------------------------------------|------------------------------|
 | `sparse` (default) | Exact robust `(0.5, 5.0)` | Lowest safe medial ratio |
 | `balanced` | Exact robust `(0.5, 5.0)` | Geometry base ratio |
 | `dense` | Slightly stronger medial | Higher ratio (still capped) |
@@ -50,10 +50,11 @@ print(feats.summary())
 
 ## Grid search
 
-For systematic tuning on a mesh:
+For systematic tuning on a mesh (sweep script lives under `toric_spines/` on
+**`main` only** — not on public `release`):
 
 ```bash
-uv run python scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1
+uv run python toric_spines/scripts/sweep_mcfs_params.py --mesh ts2 --mesh ts1
 ```
 
 Results land under `outputs/sweeps/<name>/` (CSV + top-k polylines). Scoring

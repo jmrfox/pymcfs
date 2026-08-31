@@ -5,14 +5,14 @@
 - Prefer closed, manifold, watertight meshes
 - Use `MeshManager.repair_mesh` when needed
 - No built-in coordinate normalization — skeletons remain in the input frame
-- `min_edge_length` scales with bbox diagonal, so µm-scale neuron meshes work
+- `min_edge_length` scales with bbox diagonal, so large-coordinate meshes work
   without hand-tuning a time step
 
 ## Pole gating and ray backends
 
 Exterior-pole gating needs a point-in-mesh test. `trimesh` may switch
 `mesh.contains` to Embree when `embreex` is installed; **Embree is float32**.
-On TS meshes far from the origin that flips many containment answers.
+On meshes far from the origin that flips many containment answers.
 
 `pymcfs` therefore uses an exact float64 traverser by default
 (`points_inside_mesh`). Opt into Embree only with `fast_gating=True` and
@@ -28,12 +28,13 @@ collapses and vertex count explodes. The driver stops when
 
 `n > max_vertex_growth × n0` (default `4.0`).
 
-Successful TS runs often reach ~2×; catastrophic blow-ups are 10–100×.
+Successful runs on complex tubular meshes often reach ~2×; catastrophic blow-ups
+are 10–100×.
 
 ## CHOLMOD conditioning
 
-Pinned tips use huge `w_H`, so `AᵀA` looks nearly singular. The solve usually
-still succeeds; treat the warning as expected.
+Pinned tips use huge `attraction_weight`, so `AᵀA` looks nearly singular. The
+solve usually still succeeds; treat the warning as expected.
 
 ## Performance (same discrete algorithm)
 

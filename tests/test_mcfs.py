@@ -9,8 +9,9 @@ import pytest
 
 from pymcfs.laplacian import mcfs_cotangent_laplacian
 from pymcfs.mcfs import MeanCurvatureFlowSkeletonization
+from pymcfs.mesh import example_mesh
 from pymcfs.remesh import collapse_short_edges, split_obtuse_faces
-from pymcfs.skeleton import skeletonize, thin_mesh
+from pymcfs.skeleton import skeletonize, contract_mesh
 from pymcfs.validate import validate_mcfs_mesh
 
 
@@ -112,8 +113,8 @@ def test_mcfs_contract_reduces_area_and_vertices():
     n0, a0 = len(mesh.vertices), float(mesh.area)
     mcs = MeanCurvatureFlowSkeletonization(
         mesh,
-        w_H=0.1,
-        w_M=0.0,
+        attraction_weight=0.1,
+        medial_weight=0.0,
         max_iterations=25,
         area_variation_factor=1e-5,
         verbose=False,
@@ -139,7 +140,11 @@ def test_contract_geometry_uses_starlab_stacked_least_squares():
     """
     mesh = tm.creation.icosphere(subdivisions=1, radius=1.0)
     mcs = MeanCurvatureFlowSkeletonization(
-        mesh, w_H=0.1, w_M=0.2, gate_exterior_poles=False, verbose=False
+        mesh,
+        attraction_weight=0.1,
+        medial_weight=0.2,
+        gate_exterior_poles=False,
+        verbose=False,
     )
     V0 = mcs.V.copy()
     wL, wH, wM = mcs._update_constraint_weights()
@@ -166,7 +171,13 @@ def test_contract_geometry_uses_starlab_stacked_least_squares():
 def test_skeletonize_sphere_is_sparse():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
     n0 = len(mesh.vertices)
-    skel = skeletonize(mesh, max_iterations=30, w_H=0.1, w_M=0.0, compress_chains=True)
+    skel = skeletonize(
+        mesh,
+        max_iterations=30,
+        attraction_weight=0.1,
+        medial_weight=0.0,
+        resample="compress",
+    )
     assert skel.nodes.shape[0] > 0
     assert skel.edges.shape[0] > 0
     assert skel.nodes.shape[0] < n0
@@ -175,9 +186,9 @@ def test_skeletonize_sphere_is_sparse():
     assert cycles <= 5
 
 
-def test_thin_mesh_reduces_complexity():
+def test_contract_mesh_reduces_complexity():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
-    Vt, Ft = thin_mesh(mesh, max_iterations=20, w_M=0.0)
+    Vt, Ft = contract_mesh(mesh, max_iterations=20, medial_weight=0.0)
     assert Vt.shape[0] <= mesh.vertices.shape[0]
     assert Ft.shape[0] <= mesh.faces.shape[0]
     assert Vt.shape[0] < mesh.vertices.shape[0] or Ft.shape[0] < mesh.faces.shape[0]
@@ -187,8 +198,8 @@ def test_mcfs_timeout_stops():
     mesh = tm.creation.icosphere(subdivisions=2, radius=1.0)
     mcs = MeanCurvatureFlowSkeletonization(
         mesh,
-        w_H=0.1,
-        w_M=0.0,
+        attraction_weight=0.1,
+        medial_weight=0.0,
         max_iterations=500,
         timeout_seconds=0.05,
         verbose=False,
@@ -221,35 +232,8 @@ def test_validate_rejects_open_mesh():
         validate_mcfs_mesh(mesh)
 
 
-def _closed_cylinder(radius=0.5, height=2.0, radial=24, stacks=12):
-    """Axially sampled watertight cylinder (trimesh's only has end rings)."""
-    angles = np.linspace(0.0, 2.0 * np.pi, radial, endpoint=False)
-    zs = np.linspace(-0.5 * height, 0.5 * height, stacks)
-    ring = np.column_stack([radius * np.cos(angles), radius * np.sin(angles)])
-    verts = [[float(x), float(y), float(z)] for z in zs for x, y in ring]
-    top_c, bot_c = len(verts), len(verts) + 1
-    verts.append([0.0, 0.0, 0.5 * height])
-    verts.append([0.0, 0.0, -0.5 * height])
-    faces: list[list[int]] = []
-    for i in range(stacks - 1):
-        for j in range(radial):
-            j2 = (j + 1) % radial
-            a, b = i * radial + j, i * radial + j2
-            c, d = (i + 1) * radial + j2, (i + 1) * radial + j
-            faces.extend([[a, b, c], [a, c, d]])
-    base = (stacks - 1) * radial
-    for j in range(radial):
-        j2 = (j + 1) % radial
-        faces.append([base + j, base + j2, top_c])
-        faces.append([j2, j, bot_c])
-    mesh = tm.Trimesh(vertices=np.asarray(verts, float), faces=np.asarray(faces, int), process=True)
-    if not mesh.is_watertight:
-        mesh.fix_normals()
-    return mesh
-
-
 def test_cylinder_skeleton_is_long_and_centered():
-    mesh = _closed_cylinder()
+    mesh = example_mesh("cylinder", radius=0.5, height=2.0, sections=24, height_sections=12)
     assert mesh.is_watertight
     skel = skeletonize(
         mesh,

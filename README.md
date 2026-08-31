@@ -32,20 +32,27 @@ from pymcfs import skeletonize
 
 mesh = tm.load("mesh.obj", force="mesh", process=False)
 skel = skeletonize(mesh)                    # robust defaults
-# skel = skeletonize(mesh, profile="auto")  # mesh-conditioned w_H / w_M
+# skel = skeletonize(mesh, profile="auto")  # mesh-conditioned weights
 skel.write_polylines("skeleton.polylines.txt")
 ```
 
+Input meshes should be closed and watertight. Defaults already run a refine phase
+(prune exterior tips, short leaves, and thick hubs). Use `profile="auto"` to
+propose contraction weights from mesh shape.
+
 ## Profiles
 
-| Profile | `w_H` | `w_M` | Gate poles | Use |
-|---------|-------|-------|------------|-----|
-| `robust` (default) | 0.5 | 5.0 | yes | Complex / TS-like meshes |
+| Profile | `attraction_weight` | `medial_weight` | Gate poles | Use |
+|---------|---------------------|-----------------|------------|-----|
+| `robust` (default) | 0.5 | 5.0 | yes | Complex tubular meshes |
 | `starlab` | 0.1 | 0.2 | no | Starlab parity |
-| `auto` | from mesh | from mesh | yes | Oracle (`branching="sparse"` by default) |
+| `auto` | from mesh | from mesh | yes | Proposed (`branching="sparse"` by default) |
 
-Coordinates are **not** normalized. See the docs for the oracle, quality scoring,
-CHOLMOD warnings, and Embree caveats.
+`attraction_weight` resists moving vertices from their current positions;
+`medial_weight` pulls toward interior centerline targets (medial poles).
+
+Coordinates are **not** normalized. See the docs for parameter proposals, quality
+scoring, CHOLMOD warnings, and Embree caveats.
 
 ## Tests
 

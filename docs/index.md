@@ -27,13 +27,13 @@ skel.write_polylines("skeleton.polylines.txt")
 - [Install](getting-started/install.md) — core, CHOLMOD, viz, Embree
 - [Quick start](getting-started/quickstart.md) — first skeleton in a few lines
 - [Profiles and weights](guide/profiles.md) — `robust` / `starlab` / `auto`
-- [Parameter oracle](guide/oracle.md) — mesh-conditioned `w_H` / `w_M`, branching preference
+- [Parameter proposals](guide/oracle.md) — mesh-conditioned `attraction_weight` / `medial_weight`, branching preference
 - [Algorithm](algorithm/index.md) — how MCFS is implemented here
 - [API reference](api/index.md) — public functions and classes
 
-## Design notes for biological meshes
+## Design notes
 
 - Coordinates are **not** normalized; skeletons stay in the input frame.
-- Default profile (`robust`) targets complex TS-like surfaces with pole gating.
-- The oracle defaults to `branching="sparse"` (fewer junctions; neuroscience priority).
+- Default profile (`robust`) targets complex tubular surfaces with pole gating.
+- `propose_mcfs_params` / `profile="auto"` defaults to `branching="sparse"` (fewer junctions).
 - Exact float64 point-in-mesh gating is the default; Embree is opt-in only.
