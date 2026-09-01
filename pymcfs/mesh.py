@@ -942,20 +942,27 @@ class MeshManager:
         Operates on ``self.mesh`` via :meth:`to_trimesh` (same object when a mesh
         is already loaded). Updates ``self.mesh`` in place and returns it.
 
+        Already-watertight meshes skip face dedupe / hole fill / component
+        isolation. Proximity vertex welding (``Trimesh.process`` /
+        ``merge_vertices``) is never applied: it can turn a closed manifold
+        into a non-manifold mesh when coincident-but-distinct vertices are
+        welded at pinch or contact seams.
+
         Parameters
         ----------
         fix_holes :
-            Attempt to fill holes.
+            Attempt to fill holes (only if the mesh is not already watertight).
         remove_duplicates :
-            Remove duplicate faces/vertices.
+            Remove duplicate faces (skipped when already watertight).
         fix_normals :
             Fix face normal consistency.
         remove_degenerate :
-            Remove degenerate faces.
+            Remove degenerate faces (skipped when already watertight).
         fix_negative_volume :
             Invert faces if the mesh volume is negative.
         keep_largest_component :
-            Keep only the largest connected component.
+            Keep only the largest connected component (skipped when already
+            watertight).
         verbose :
             Print a repair summary when True.
 
@@ -969,6 +976,8 @@ class MeshManager:
         mesh = self.to_trimesh()
 
         repair_log = []
+        n0 = int(len(mesh.vertices))
+        already_watertight = bool(mesh.is_watertight)
 
         # Fix negative volume by inverting faces if needed
         if fix_negative_volume:
@@ -983,28 +992,7 @@ class MeshManager:
             except Exception as e:
                 repair_log.append(f"Failed to fix negative volume: {e}")
 
-        # Remove duplicate and degenerate faces
-        if remove_duplicates:
-            try:
-                initial_faces = len(mesh.faces)
-                mesh.remove_duplicate_faces()
-                removed_faces = initial_faces - len(mesh.faces)
-                if removed_faces > 0:
-                    repair_log.append(f"Removed {removed_faces} duplicate faces")
-            except Exception as e:
-                repair_log.append(f"Failed to remove duplicate faces: {e}")
-
-        if remove_degenerate:
-            try:
-                initial_faces = len(mesh.faces)
-                mesh.remove_degenerate_faces()
-                removed_faces = initial_faces - len(mesh.faces)
-                if removed_faces > 0:
-                    repair_log.append(f"Removed {removed_faces} degenerate faces")
-            except Exception as e:
-                repair_log.append(f"Failed to remove degenerate faces: {e}")
-
-        # Fix winding consistency
+        # Fix winding consistency (safe: does not merge vertices)
         if fix_normals:
             try:
                 if not mesh.is_winding_consistent:
@@ -1018,49 +1006,81 @@ class MeshManager:
             except Exception as e:
                 repair_log.append(f"Failed to fix normals: {e}")
 
-        # Attempt to fill holes
-        if fix_holes:
-            try:
-                if not mesh.is_watertight:
-                    initial_watertight = mesh.is_watertight
-                    mesh.fill_holes()
-                    if mesh.is_watertight and not initial_watertight:
-                        repair_log.append(
-                            "Successfully filled holes - mesh is now watertight"
-                        )
-                    elif mesh.is_watertight:
-                        repair_log.append("Mesh was already watertight")
-                    else:
-                        repair_log.append(
-                            "Attempted to fill holes but mesh still not watertight"
-                        )
-            except Exception as e:
-                repair_log.append(f"Failed to fill holes: {e}")
+        # Closed manifold meshes may still have spatially coincident but
+        # topologically distinct vertices (pinch / contact / export seams).
+        # Trimesh process()/merge_vertices() welds those and creates
+        # non-manifold edges, flipping is_watertight to False. Do not run
+        # merge-prone steps on an already-watertight input.
+        if already_watertight and bool(mesh.is_watertight):
+            repair_log.append(
+                "Mesh already watertight; skipped merge/dedupe/process "
+                "(proximity welding can create non-manifold edges)"
+            )
+        else:
+            # Remove duplicate and degenerate faces
+            if remove_duplicates:
+                try:
+                    initial_faces = len(mesh.faces)
+                    mesh.remove_duplicate_faces()
+                    removed_faces = initial_faces - len(mesh.faces)
+                    if removed_faces > 0:
+                        repair_log.append(f"Removed {removed_faces} duplicate faces")
+                except Exception as e:
+                    repair_log.append(f"Failed to remove duplicate faces: {e}")
 
-        # Keep only the largest component if requested
-        if keep_largest_component:
-            try:
-                components = mesh.split(only_watertight=False)
-                if len(components) > 1:
-                    # Keep the largest component by volume or face count
-                    volumes = [
-                        abs(c.volume) if hasattr(c, "volume") else len(c.faces)
-                        for c in components
-                    ]
-                    largest_idx = np.argmax(volumes)
-                    mesh = components[largest_idx]
-                    repair_log.append(
-                        f"Kept largest of {len(components)} components (volume: {volumes[largest_idx]:.2f})"
-                    )
-            except Exception as e:
-                repair_log.append(f"Failed to isolate largest component: {e}")
+            if remove_degenerate:
+                try:
+                    initial_faces = len(mesh.faces)
+                    mesh.remove_degenerate_faces()
+                    removed_faces = initial_faces - len(mesh.faces)
+                    if removed_faces > 0:
+                        repair_log.append(f"Removed {removed_faces} degenerate faces")
+                except Exception as e:
+                    repair_log.append(f"Failed to remove degenerate faces: {e}")
 
-        # Final processing to ensure consistency
-        try:
-            mesh.process(validate=True)
-            repair_log.append("Applied final mesh processing and validation")
-        except Exception as e:
-            repair_log.append(f"Final processing failed: {e}")
+            # Attempt to fill holes
+            if fix_holes:
+                try:
+                    if not mesh.is_watertight:
+                        mesh.fill_holes()
+                        if mesh.is_watertight:
+                            repair_log.append(
+                                "Successfully filled holes - mesh is now watertight"
+                            )
+                        else:
+                            repair_log.append(
+                                "Attempted to fill holes but mesh still not watertight"
+                            )
+                except Exception as e:
+                    repair_log.append(f"Failed to fill holes: {e}")
+
+            # Keep only the largest component if requested
+            if keep_largest_component:
+                try:
+                    components = mesh.split(only_watertight=False)
+                    if len(components) > 1:
+                        # Keep the largest component by volume or face count
+                        volumes = [
+                            abs(c.volume) if hasattr(c, "volume") else len(c.faces)
+                            for c in components
+                        ]
+                        largest_idx = np.argmax(volumes)
+                        mesh = components[largest_idx]
+                        repair_log.append(
+                            f"Kept largest of {len(components)} components "
+                            f"(volume: {volumes[largest_idx]:.2f})"
+                        )
+                except Exception as e:
+                    repair_log.append(f"Failed to isolate largest component: {e}")
+
+            # Intentionally no mesh.process()/merge_vertices(): welding
+            # near-coincident vertices often destroys manifold topology.
+
+        if int(len(mesh.vertices)) != n0 and already_watertight:
+            repair_log.append(
+                f"WARNING: vertex count changed on watertight input "
+                f"({n0} → {len(mesh.vertices)})"
+            )
 
         # Store repair log as mesh metadata
         if not hasattr(mesh, "metadata"):

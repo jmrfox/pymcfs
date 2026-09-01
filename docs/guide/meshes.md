@@ -28,9 +28,11 @@ mesh = load_and_repair("mesh.obj")
 validate_mcfs_mesh(mesh)  # raises ValueError on failure
 ```
 
-`load_and_repair` uses `MeshManager.repair_mesh` under the hood, then enforces
-full MCFS preconditions. Prefer fixing the source mesh when possible; repair
-is a convenience for common holes and non-manifold issues.
+`load_and_repair` loads with `process=False`, validates, and **only repairs
+when needed**. Already-watertight MCFS inputs are returned unchanged.
+`repair_mesh` never runs proximity vertex welding (`Trimesh.process` /
+`merge_vertices`), which can create non-manifold edges at pinch/contact
+seams. Prefer fixing the source mesh when possible.
 
 ## MeshManager (optional)
 
