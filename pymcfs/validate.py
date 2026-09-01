@@ -85,24 +85,26 @@ def load_and_repair(
     repair_kwargs: dict[str, Any] | None = None,
     file_format: str | None = None,
 ) -> tm.Trimesh:
-    """Load (if needed) and prepare an MCFS-ready mesh via validate → repair → re-validate.
+    """Load (if needed) and prepare an MCFS-ready mesh.
 
-    Soft-validates without requiring watertightness, attempts common repairs,
-    then re-validates with full MCFS preconditions.
+    Soft-validates without requiring watertightness. If the mesh already meets
+    full MCFS preconditions, returns it unchanged. Otherwise attempts common
+    repairs and re-validates.
 
     Parameters
     ----------
     mesh :
         A ``trimesh.Trimesh`` or a filesystem path to load.
     repair_kwargs :
-        Forwarded to :meth:`pymcfs.mesh.MeshManager.repair_mesh`.
+        Forwarded to :meth:`pymcfs.mesh.MeshManager.repair_mesh` when repair
+        runs.
     file_format :
         Optional format hint when ``mesh`` is a path.
 
     Returns
     -------
     trimesh.Trimesh
-        Repaired mesh that passes :func:`validate_mcfs_mesh`.
+        Mesh that passes :func:`validate_mcfs_mesh`.
 
     Raises
     ------
@@ -125,15 +127,29 @@ def load_and_repair(
         raise TypeError("mesh must be a trimesh.Trimesh or a filesystem path string")
 
     validate_mcfs_mesh(tri, require_watertight=False)
-    kwargs = dict(repair_kwargs or {})
-    kwargs.setdefault("verbose", False)
-    logger.info("load_and_repair: repairing mesh (n=%d f=%d)", len(tri.vertices), len(tri.faces))
-    repaired = mgr.repair_mesh(**kwargs)
-    validate_mcfs_mesh(repaired, require_watertight=True)
+    try:
+        validate_mcfs_mesh(tri, require_watertight=True)
+    except ValueError:
+        kwargs = dict(repair_kwargs or {})
+        kwargs.setdefault("verbose", False)
+        logger.info(
+            "load_and_repair: repairing mesh (n=%d f=%d)",
+            len(tri.vertices),
+            len(tri.faces),
+        )
+        tri = mgr.repair_mesh(**kwargs)
+        validate_mcfs_mesh(tri, require_watertight=True)
+    else:
+        logger.info(
+            "load_and_repair: already MCFS-ready (n=%d f=%d); skipped repair",
+            len(tri.vertices),
+            len(tri.faces),
+        )
+
     logger.info(
         "load_and_repair: ready (n=%d f=%d watertight=%s)",
-        len(repaired.vertices),
-        len(repaired.faces),
-        repaired.is_watertight,
+        len(tri.vertices),
+        len(tri.faces),
+        tri.is_watertight,
     )
-    return repaired
+    return tri

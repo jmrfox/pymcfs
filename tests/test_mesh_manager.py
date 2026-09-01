@@ -3,9 +3,20 @@ import trimesh as tm
 from pathlib import Path
 
 from pymcfs.mesh import MeshManager
-from pymcfs.validate import validate_mcfs_mesh
+from pymcfs.validate import load_and_repair, validate_mcfs_mesh
 
-DATA = Path(__file__).resolve().parents[1] / "data" / "mesh"
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "toric_spines" / "data" / "mesh"
+# Legacy path used by older checkouts / optional local copies.
+LEGACY_DATA = ROOT / "data" / "mesh"
+
+
+def _ts_path(name: str) -> Path:
+    for base in (DATA, LEGACY_DATA):
+        path = base / name
+        if path.is_file():
+            return path
+    return DATA / name
 
 
 def test_mesh_manager_analyze_sphere():
@@ -39,7 +50,7 @@ def test_center_and_scale():
 
 def test_load_mesh_process_false_preserves_watertight():
     """Trimesh process=True can break closed TS OBJs; MeshManager must not."""
-    path = DATA / "TS3.obj"
+    path = _ts_path("TS3.obj")
     if not path.is_file():
         import pytest
 
@@ -53,3 +64,40 @@ def test_load_mesh_process_false_preserves_watertight():
     assert mesh.is_watertight is True
     validate_mcfs_mesh(mesh)
     assert len(mesh.vertices) == len(tm.load(str(path), force="mesh", process=False).vertices)
+
+
+def test_repair_mesh_preserves_watertight_ts():
+    """repair_mesh must not weld coincident verts and destroy manifold topology."""
+    import pytest
+
+    path = _ts_path("TS21.obj")
+    if not path.is_file():
+        pytest.skip("TS21.obj not present")
+
+    processed = tm.load(str(path), force="mesh", process=True)
+    assert processed.is_watertight is False
+
+    mm = MeshManager(verbose=False)
+    mesh = mm.load_mesh(str(path), validate_mcfs=True)
+    n0 = len(mesh.vertices)
+    repaired = mm.repair_mesh(verbose=False)
+    assert repaired.is_watertight is True
+    assert len(repaired.vertices) == n0
+    validate_mcfs_mesh(repaired)
+
+
+def test_load_and_repair_skips_ready_mesh():
+    """Already-valid meshes must not be mutated by load_and_repair."""
+    import pytest
+
+    path = _ts_path("TS3.obj")
+    if not path.is_file():
+        pytest.skip("TS3.obj not present")
+
+    raw = tm.load(str(path), force="mesh", process=False)
+    n0, f0 = len(raw.vertices), len(raw.faces)
+    out = load_and_repair(str(path))
+    assert out.is_watertight is True
+    assert len(out.vertices) == n0
+    assert len(out.faces) == f0
+    validate_mcfs_mesh(out)
